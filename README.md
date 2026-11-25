@@ -51,9 +51,16 @@ orca-ide plugin dev watch .                  # загрузить папку в 
 `make test` проходит три шага: `orca plugin validate .` (манифест так, как его загружает Orca), `orca plugin types .`
 и `tsc -p .` (типы для этой версии Orca пишутся в `.orca/`, который git игнорирует), `orca plugin test .` (тесты
 `src/` и `tests/`). Тесты поставки берут чистую выгрузку закоммиченного HEAD, поэтому перед прогоном изменения надо
-закоммитить; npm в них работает без сети, из кэша, который заполнила подготовка. CLI Orca — `ORCA_CLI_COMMAND` (его
-задают терминалы Orca), иначе `orca-ide` на Linux и `orca` на macOS и Windows; голый `orca` на Linux вне Orca —
-экранный диктор GNOME. Для `make test` нужны make и bash. Фильтра по имени теста у `orca plugin test` нет: прогон с
+закоммитить; npm в них работает без сети, из кэша, который заполнила подготовка.
+
+CLI Orca — `ORCA_CLI_COMMAND` (его задают терминалы Orca), иначе `orca-ide` на Linux и `orca` на macOS и Windows;
+другой задают так: `make test ORCA=<путь к CLI>`. Выбранный CLI получают все шаги и тесты, путь с пробелами
+работает. Голый `orca` на Linux вне Orca — экранный диктор GNOME: `make test` и `setup` его не принимают, нужен
+`orca-ide` или полный путь CLI.
+
+Для `make test` нужны make и bash 4.4 или новее: этим bash идёт запись итога (`docker/test-result.sh`). На macOS штатный
+bash 3.2 — поставьте новый (например `brew install bash`) раньше в PATH; со старым bash `make test` останавливается
+до тестов, а не проходит без записи. Фильтра по имени теста у `orca plugin test` нет: прогон с
 `test_args="--compact --filter=…"` запускает все тесты и записывается как отфильтрованный.
 
 ## Очередь агентов

@@ -49,7 +49,32 @@ test('setup: CLI Orca — ORCA_CLI_COMMAND, иначе orca-ide на Linux и or
     const env = fakeEnv(bin.dir, join(bin.dir, 'log'))
     assert.deepEqual(missingTools(env, 'linux'), ['Orca CLI (orca-ide)'])
     assert.deepEqual(missingTools(env, 'darwin'), [])
+    // ORCA_CLI_COMMAND=orca without a directory on Linux: the screen reader, although an `orca` is on PATH.
+    const [screenReader, ...others] = missingTools({ ...env, ORCA_CLI_COMMAND: 'orca' }, 'linux')
+    assert.match(screenReader, /^Orca CLI \(a bare orca is GNOME's screen reader on Linux/)
+    assert.deepEqual(others, [])
+    assert.deepEqual(missingTools({ ...env, ORCA_CLI_COMMAND: 'orca' }, 'darwin'), [])
+    assert.deepEqual(missingTools({ ...env, ORCA_CLI_COMMAND: 'orca' }, 'win32'), [])
+    // A path whose last part is orca (the CLI of Orca's terminals on Linux) is Orca's CLI.
     assert.deepEqual(missingTools({ ...env, ORCA_CLI_COMMAND: join(bin.dir, windows ? 'orca.cmd' : 'orca') }, 'linux'), [])
+  } finally {
+    bin.remove()
+  }
+})
+
+test('setup: ORCA_CLI_COMMAND=orca на Linux — выход 1 (экранный диктор GNOME), установка не запускается', (t) => {
+  if (process.platform !== 'linux') {
+    t.skip('голый orca — экранный диктор только на Linux; на macOS и Windows это CLI Orca')
+    return
+  }
+  const bin = tempDir('setup-bin')
+  try {
+    const log = join(bin.dir, 'npm.log')
+    for (const tool of ['git', 'node', 'npm', 'orca']) fakeTool(bin.dir, tool)
+    const result = runSetupScript({ ...fakeEnv(bin.dir, log), ORCA_CLI_COMMAND: 'orca' })
+    assert.equal(result.status, 1, result.output)
+    assert.match(result.stderr, /missing tools: Orca CLI \(a bare orca is GNOME's screen reader on Linux/)
+    assert.equal(existsSync(log), false, 'npm запускался с экранным диктором вместо CLI Orca')
   } finally {
     bin.remove()
   }

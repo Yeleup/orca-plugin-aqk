@@ -2,7 +2,17 @@
 // hooks of orca.yaml run the way Orca runs them. Plain JavaScript: these tests use Node's own modules, and the plugin's
 // tsconfig has only Orca's typings.
 import { spawnSync } from 'node:child_process'
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -104,6 +114,42 @@ export function exportHead(parent) {
   })
   if (untar.status !== 0) throw new Error(`tar -x failed (${untar.status}): ${untar.stderr ?? untar.error?.message}`)
   return dir
+}
+
+// Makes `dir` a local git repository with everything in it committed, as a worktree of that commit; returns its SHA.
+// Git runs without the user's and the system's config (no hooks, signing or templates of theirs), with a test author.
+export function commitAll(dir) {
+  const config = join(dir, '..', 'gitconfig')
+  writeFileSync(config, '')
+  const env = testEnv({ GIT_CONFIG_GLOBAL: config, GIT_CONFIG_NOSYSTEM: '1' })
+  const author = ['-c', 'user.name=Delivery Test', '-c', 'user.email=delivery-test@example.invalid']
+  for (const args of [['init', '-q'], ['add', '-A'], [...author, 'commit', '-q', '-m', 'export of HEAD']]) {
+    const result = run('git', args, { cwd: dir, env })
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')} in ${dir}:\n${result.output}`)
+  }
+  return run('git', ['rev-parse', 'HEAD'], { cwd: dir, env }).stdout.trim()
+}
+
+// An executable `name` in `dir` for this system: the POSIX shell script `sh`, or on Windows `name.cmd` with `cmd`.
+export function writeExecutable(dir, name, { sh, cmd }) {
+  if (process.platform === 'win32') {
+    const file = join(dir, `${name}.cmd`)
+    writeFileSync(file, cmd.replaceAll('\n', '\r\n'))
+    return file
+  }
+  const file = join(dir, name)
+  writeFileSync(file, sh)
+  chmodSync(file, 0o755)
+  return file
+}
+
+// The records docker/test-result.sh wrote for commit `sha` under `resultsDir`, parsed.
+export function recordsOf(resultsDir, sha) {
+  const dir = join(resultsDir, sha)
+  if (!existsSync(dir)) return []
+  return readdirSync(dir)
+    .filter((name) => name.endsWith('.json'))
+    .map((name) => JSON.parse(readFileSync(join(dir, name), 'utf8')))
 }
 
 // Every symbolic link (a junction on Windows too) under `dir`, as paths relative to it, without following them.

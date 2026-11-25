@@ -16,7 +16,17 @@ export const REQUIRED_TOOLS = ['git', 'node', 'npm']
 export function orcaCliCommand(env = process.env, platform = process.platform) {
   const named = envValue(env, 'ORCA_CLI_COMMAND', platform)?.trim()
   if (named) return named
+  return orcaCliDefault(platform)
+}
+
+function orcaCliDefault(platform) {
   return platform === 'darwin' || platform === 'win32' ? 'orca' : 'orca-ide'
+}
+
+// Whether `command` names GNOME's screen reader rather than Orca's CLI: exactly the bare name `orca` where Orca's CLI is
+// `orca-ide` (Linux). A path whose last part is `orca`, like the CLI of Orca's terminals on Linux, is Orca's CLI.
+export function isScreenReader(command, platform = process.platform) {
+  return command === 'orca' && orcaCliDefault(platform) === 'orca-ide'
 }
 
 // The file a shell of this system runs for `command`, or null: a command with a directory in it is that path; a bare
@@ -39,7 +49,11 @@ export function findCommand(command, env = process.env) {
 export function missingTools(env = process.env, platform = process.platform) {
   const missing = REQUIRED_TOOLS.filter((tool) => findCommand(tool, env) === null)
   const cli = orcaCliCommand(env, platform)
-  if (findCommand(cli, env) === null) missing.push(`Orca CLI (${cli})`)
+  if (isScreenReader(cli, platform)) {
+    missing.push("Orca CLI (a bare orca is GNOME's screen reader on Linux: set ORCA_CLI_COMMAND to orca-ide or the CLI's path)")
+  } else if (findCommand(cli, env) === null) {
+    missing.push(`Orca CLI (${cli})`)
+  }
   return missing
 }
 
