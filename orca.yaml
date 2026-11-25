@@ -1,0 +1,19 @@
+# Orca (https://github.com/stablyai/orca) hooks for git worktrees of this plugin, a project of the agent queue
+# (agent-queue-kit).
+#
+# setup checks that the host has the tools `make test` needs and installs the development tools of the worktree
+# (TypeScript, package-lock.json) into its own node_modules/. Orca loads src/ itself, with no build and no runtime
+# dependencies. archive has nothing to clean up: node_modules/ and .orca/ go with the worktree. The repository setting
+# "Command source" must include orca.yaml.
+scripts:
+  setup: |
+    missing=""
+    for tool in bash git make node npm; do
+      command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+    done
+    command -v "${ORCA_CLI_COMMAND:-orca-ide}" >/dev/null 2>&1 || missing="$missing orca-cli"
+    if [ -n "$missing" ]; then echo "orca-plugin-aqk worktree: missing tools:$missing" >&2; exit 1; fi
+    npm ci --no-audit --no-fund
+  archive: |
+    exit 0
+setupAgentStartupPolicy: wait-for-setup

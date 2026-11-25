@@ -1,0 +1,11 @@
+{
+  "name": "orca-plugin-aqk",
+  "private": true,
+  "description": "Development tools of the plugin: Orca loads src/ itself, with no build and no runtime dependencies.",
+  "scripts": {
+    "test": "make test"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}
