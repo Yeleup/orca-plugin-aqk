@@ -8,8 +8,8 @@
 // directory. npm runs offline, from the cache the worktree's own preparation filled: no network. The inner `make test`
 // skips these tests (NESTED_RUN), so it runs every other step and test once.
 import { assert, test } from 'orca/testing'
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs'
-import { isAbsolute, join, resolve } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { findCommand } from '../scripts/tools.mjs'
 import {
@@ -207,13 +207,26 @@ deliveryTest('make test: выбранный CLI Orca (ORCA=…, относите
   const log = join(temp, 'orca-calls.log')
   const wrapper = cliWrapper(temp, toolsDir, 'orca-ide')
 
-  const relative = windows ? '..\\Orca Tools\\orca-ide' : '../Orca Tools/orca-ide'
-  const make = makeTest(dir, ['TEST_RESULT_DIR=', `ORCA=${relative}`], {
+  // The path make gets: relative to the directory it runs in, to the file as it was created (orca-ide.cmd on Windows).
+  const relativeCli = relative(dir, wrapper)
+  assert.ok(!isAbsolute(relativeCli) && relativeCli.includes(' '), relativeCli)
+  // On macOS and Linux make runs in the tree through a symlink, as a shell's logical PWD has it: the relative path
+  // counts from the physical directory, where the kernel counts it from.
+  let cwd = dir
+  const logical = {}
+  if (!windows) {
+    mkdirSync(join(temp, 'deep'))
+    cwd = join(temp, 'deep', 'tree')
+    symlinkSync(dir, cwd)
+    logical.PWD = cwd
+  }
+  const make = makeTest(cwd, ['TEST_RESULT_DIR=', `ORCA=${relativeCli}`], {
+    ...logical,
     ORCA_CLI_COMMAND: real,
     REAL_ORCA_CLI: real,
     ORCA_CALLS_LOG: log,
   })
-  assertGreenRun(make, `ORCA=${relative}`)
+  assertGreenRun(make, `ORCA=${relativeCli}`)
   const calls = loggedCalls(log)
   const argLists = calls.map((call) => JSON.stringify(call.args))
   for (const args of [['plugin', 'validate', '.'], ['plugin', 'types', '.'], ['plugin', 'test', '.']]) {
@@ -222,11 +235,15 @@ deliveryTest('make test: выбранный CLI Orca (ORCA=…, относите
   // The manifest test of the inner run, in its own process: the folder by the path Node loaded it from.
   const validate = calls.find((call) => call.args.length === 4 && call.args[1] === 'validate' && call.args[3] === '--json')
   assert.ok(validate, `тест К2.7 не через ${wrapper}: ${argLists}`)
-  assert.ok([dir, realpathSync(dir)].includes(validate.args[2]), `К2.7 проверяет не эту папку: ${validate.args[2]}`)
+  assert.equal(realpathSync.native(validate.args[2]), realpathSync.native(dir), `К2.7 проверяет не эту папку: ${validate.args[2]}`)
   // Every call got the chosen CLI as one absolute path to it.
   for (const call of calls) {
     assert.ok(call.cli && isAbsolute(call.cli), `ORCA_CLI_COMMAND не абсолютный: ${JSON.stringify(call)}`)
-    assert.equal(resolve(call.cli), wrapper, JSON.stringify(call))
+    // The same file, read as the kernel reads the path and as path.resolve reads it (findCommand does).
+    for (const path of [call.cli, resolve(call.cli)]) {
+      assert.ok(existsSync(path), `${path}: нет такого файла: ${JSON.stringify(call)}`)
+      assert.equal(realpathSync.native(path), realpathSync.native(wrapper), JSON.stringify(call))
+    }
   }
 })
 
@@ -282,6 +299,31 @@ deliveryTest('make test: каталог записи итога в виде Wind
   })
   assertGreenRun(make, `TEST_RESULT_DIR=${windowsResults}`)
   assertFullGreenRecord(results, sha, make, `TEST_RESULT_DIR=${windowsResults}`)
+})
+
+// A Windows results directory that cygpath -u did not turn into a path of the shell: `make test` stops before any step
+// and names the directory, instead of running as if recording were off.
+deliveryTest('make test: каталог записи итога в виде Windows не преобразован (cygpath -u с ошибкой или без вывода) — отказ до шагов, без записи', (temp, t) => {
+  if (windows) {
+    t.skip('поддельный cygpath — сценарий POSIX')
+    return
+  }
+  const dir = exportHead(temp)
+  const windowsResults = 'C:\\Users\\Delivery Test\\AppData\\Local\\Temp\\test-results'
+  const standIns = {
+    'код 1 без вывода': '#!/bin/sh\nexit 1\n',
+    'код 0 без вывода': '#!/bin/sh\nexit 0\n',
+  }
+  for (const [what, sh] of Object.entries(standIns)) {
+    const fakeBin = join(temp, `cygpath-${Object.keys(standIns).indexOf(what)}`)
+    mkdirSync(fakeBin)
+    writeExecutable(fakeBin, 'cygpath', { sh, cmd: '' })
+    const make = makeTest(dir, [`TEST_RESULT_DIR=${windowsResults}`], pathFirst(fakeBin))
+    assert.notEqual(make.status, 0, `${what}:\n${make.output}`)
+    assert.ok(make.stderr.includes(`«${windowsResults}»`), `${what}: нет исходного каталога:\n${make.output}`)
+    assert.equal(make.stdout.trim(), '', `${what}: шаги шли:\n${make.output}`)
+    assert.equal(existsSync(join(dir, 'test-results')), false, `${what}: запись в чекауте`)
+  }
 })
 
 // The recorder needs bash 4.4 or newer; with an older bash on PATH (macOS ships 3.2) `make test` stops and says so

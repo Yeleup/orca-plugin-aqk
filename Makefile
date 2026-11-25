@@ -41,15 +41,17 @@ TYPES = bash -c '"$$ORCA_CLI_COMMAND" plugin types . >/dev/null && node $(TSC) -
 PLUGIN_TEST = bash -c '"$$ORCA_CLI_COMMAND" plugin test .' plugin
 
 # One shell for the whole run: the CLI and the results directory are settled once, then the guards, then the steps.
-# - The CLI: a relative path (one with a directory in it) is anchored to the directory make runs in; a bare `orca` on
+# - The CLI: a relative path (one with a directory in it) is anchored to the physical directory make runs in (pwd -P:
+#   the kernel and path.resolve then read it alike, also in a checkout entered through a symlink); a bare `orca` on
 #   Linux is refused.
 # - The results directory: a native Windows path (C:\…) goes to the recorder in the shell's form (cygpath -u in Git
-#   Bash and MSYS2): the recorder takes only absolute POSIX paths and ~.
+#   Bash and MSYS2): the recorder takes only absolute POSIX paths and ~. If it cannot be converted, `make test` stops
+#   before the tests instead of running without a record.
 # - Recording needs bash 4.4 or newer (BASH_VERSION_ON_PATH).
 .PHONY: test
 test:
 	@cli="$$PLUGIN_ORCA_CLI"; \
-	case "$$cli" in /*|[A-Za-z]:[\\/]*) ;; */*|*\\*) cli="$$(pwd)/$$cli" ;; esac; \
+	case "$$cli" in /*|[A-Za-z]:[\\/]*) ;; */*|*\\*) cli="$$(pwd -P)/$$cli" ;; esac; \
 	if [ "$(ORCA_DEFAULT)" = orca-ide ] && [ "$$cli" = orca ]; then \
 	    echo "make test: CLI Orca «orca» без пути на Linux — экранный диктор GNOME, а не CLI Orca;" \
 	        "задайте orca-ide или полный путь CLI (ORCA_CLI_COMMAND или ORCA=…)" >&2; \
@@ -58,7 +60,12 @@ test:
 	ORCA_CLI_COMMAND="$$cli"; export ORCA_CLI_COMMAND; \
 	results="$$PLUGIN_TEST_RESULT_DIR"; \
 	case "$$results" in [A-Za-z]:[\\/]*) \
-	    if command -v cygpath >/dev/null 2>&1; then results="$$(cygpath -u "$$results")"; fi ;; \
+	    results="$$(cygpath -u "$$results")" || results=; \
+	    case "$$results" in /*) ;; *) \
+	        printf '%s %s\n' "make test: каталог записи итога «$$PLUGIN_TEST_RESULT_DIR» — путь Windows, а cygpath -u" \
+	            "не дал пути оболочки: запись итога не начать; запустите make test в Git Bash или MSYS2 либо задайте каталог путём POSIX" >&2; \
+	        exit 1 ;; \
+	    esac ;; \
 	esac; \
 	if [ -n "$$results" ]; then \
 	    case "$$($(BASH_VERSION_ON_PATH))" in [0-3].*|4.[0-3]|"") \

@@ -61,7 +61,8 @@ CLI Orca — `ORCA_CLI_COMMAND` (его задают терминалы Orca), �
 Для `make test` нужны make и bash 4.4 или новее: этим bash идёт запись итога (`docker/test-result.sh`). На macOS штатный
 bash 3.2 — поставьте новый (например `brew install bash`) раньше в PATH; со старым bash `make test` останавливается
 до тестов, а не проходит без записи. Каталог записи `TEST_RESULT_DIR` в виде Windows (`C:\…`) `make test` передаёт
-регистратору в виде оболочки (`cygpath -u` в Git Bash и MSYS2). Фильтра по имени теста у `orca plugin test` нет:
+регистратору в виде оболочки (`cygpath -u` в Git Bash и MSYS2); если каталог не преобразовался, `make test`
+останавливается до тестов, а не идёт без записи. Фильтра по имени теста у `orca plugin test` нет:
 прогон с `test_args="--compact --filter=…"` запускает все тесты и записывается как отфильтрованный.
 
 ## Очередь агентов
