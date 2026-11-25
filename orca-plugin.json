@@ -1,9 +1,9 @@
 {
   "manifestVersion": 2,
-  "id": "agent-queue-kit",
-  "name": "agent-queue-kit",
+  "id": "agent-queue",
+  "name": "Agent Queue",
   "version": "0.0.1",
-  "description": "Orca plugin for agent-queue-kit. A skeleton: its functions come with the MVP.",
+  "description": "The agent task queue of agent-queue-kit as an Orca plugin. A skeleton: its functions come with the MVP.",
   "license": "MIT",
   "repository": "https://github.com/Yeleup/orca-plugin-aqk",
   "engines": {

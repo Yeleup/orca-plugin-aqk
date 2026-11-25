@@ -4,7 +4,7 @@ import * as main from './worker'
 
 test('the worker starts without host calls or refusals', async () => {
   const worker = await mountWorker(main)
-  assert.deepEqual(worker.logs, ['agent-queue-kit: worker started'])
+  assert.deepEqual(worker.logs, ['agent-queue: worker started'])
   assert.deepEqual(worker.host.calls, [])
   assert.deepEqual(worker.refusals, [])
   await worker.deactivate()
