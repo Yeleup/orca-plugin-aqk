@@ -5,7 +5,7 @@ import { assert, test } from 'orca/testing'
 import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { missingTools, orcaCliCommand } from '../scripts/tools.mjs'
-import { orcaHookRunner, orcaYamlScripts, pluginRoot, run, runOrcaHook, tempDir, testEnv } from './helpers.mjs'
+import { orca, orcaHookRunner, orcaYamlScripts, pluginRoot, run, runOrcaHook, tempDir, testEnv } from './helpers.mjs'
 
 const hooks = orcaYamlScripts(readFileSync(join(pluginRoot, 'orca.yaml'), 'utf8'))
 const windows = process.platform === 'win32'
@@ -75,6 +75,25 @@ test('setup: ORCA_CLI_COMMAND=orca на Linux — выход 1 (экранный
     assert.equal(result.status, 1, result.output)
     assert.match(result.stderr, /missing tools: Orca CLI \(a bare orca is GNOME's screen reader on Linux/)
     assert.equal(existsSync(log), false, 'npm запускался с экранным диктором вместо CLI Orca')
+  } finally {
+    bin.remove()
+  }
+})
+
+// The tests' own calls of Orca's CLI (inspect, validate) check the same rule: run without `make test`
+// (`orca-ide plugin test .`) with ORCA_CLI_COMMAND=orca, they throw instead of starting GNOME's screen reader.
+test('тесты: ORCA_CLI_COMMAND=orca на Linux — CLI Orca из тестов не запускается', (t) => {
+  if (process.platform !== 'linux') {
+    t.skip('голый orca — экранный диктор только на Linux; на macOS и Windows это CLI Orca')
+    return
+  }
+  const bin = tempDir('setup-bin')
+  try {
+    const log = join(bin.dir, 'screen-reader.log')
+    fakeTool(bin.dir, 'orca')
+    const env = { ...fakeEnv(bin.dir, log), ORCA_CLI_COMMAND: 'orca' }
+    assert.throws(() => orca(['plugin', 'validate', pluginRoot, '--json'], { env }), /GNOME's screen reader/)
+    assert.equal(existsSync(log), false, 'тестовый помощник запустил голый orca')
   } finally {
     bin.remove()
   }

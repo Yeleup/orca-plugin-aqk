@@ -16,7 +16,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { findCommand, orcaCliCommand } from '../scripts/tools.mjs'
+import { findCommand, isScreenReader, orcaCliCommand } from '../scripts/tools.mjs'
 
 // The plugin folder: the directory of orca-plugin.json above this file.
 export const pluginRoot = (() => {
@@ -34,15 +34,29 @@ export const pluginRoot = (() => {
 export const NESTED_RUN = 'ORCA_PLUGIN_AQK_NESTED_MAKE_TEST'
 export const nestedRun = process.env[NESTED_RUN] === '1'
 
-// The environment of a command a test starts, without what the enclosing run passes to its children: make's flags,
-// jobserver and command-line variables, and NODE_TEST_CONTEXT of Node's test runner, with which an inner
-// `orca plugin test` would skip every test file and still report them passed.
-export function testEnv(extra = {}) {
-  const env = { ...process.env, ...extra }
-  for (const name of ['MAKEFLAGS', 'MFLAGS', 'MAKELEVEL', 'MAKEOVERRIDES', 'TEST_RESULT_ARGS', 'NODE_TEST_CONTEXT']) {
+// The variables the Makefile assigns. An enclosing `make test ORCA=… test_args=…` exports its command-line variables and
+// its own exports (PLUGIN_ORCA_CLI, TEST_RESULT_ARGS …) to every process below it, and an inner `make test` would take
+// them for its own: another CLI, a filtered run.
+export const makefileVariables = (() => {
+  const names = new Set(['ORCA', 'test_args', 'TEST_RESULT_DIR'])
+  const assignment = /^(?:[^\t#:=]*:\s*)?(?:(?:export|override)\s+)*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\?|:|\+)?=/
+  for (const line of readFileSync(join(pluginRoot, 'Makefile'), 'utf8').split(/\r?\n/)) {
+    const match = assignment.exec(line)
+    if (match) names.add(match[1])
+  }
+  return names
+})()
+
+// The environment of a command a test starts (`base` plus `extra`), without what the enclosing run passes to its
+// children: make's flags, jobserver and variables, and NODE_TEST_CONTEXT of Node's test runner, with which an inner
+// `orca plugin test` would skip every test file and still report them passed. The CLI chosen for the run reaches the
+// command through ORCA_CLI_COMMAND, which stays.
+export function testEnv(extra = {}, base = process.env) {
+  const env = { ...base }
+  for (const name of ['MAKEFLAGS', 'MFLAGS', 'MAKELEVEL', 'MAKEOVERRIDES', 'NODE_TEST_CONTEXT', ...makefileVariables]) {
     delete env[name]
   }
-  return env
+  return { ...env, ...extra }
 }
 
 // The environment of an npm run in a test: no network (only npm's cache, which the worktree's own preparation filled).
@@ -73,9 +87,19 @@ function quoteForCmd(word) {
   return /^[\w.:\\/=-]+$/.test(word) ? word : `"${word}"`
 }
 
-// Orca's CLI of this system (scripts/tools.mjs, as `make test` picks it).
+// Orca's CLI of this system (scripts/tools.mjs, as `make test` picks it). A bare `orca` on Linux is GNOME's screen
+// reader: it throws instead of starting it, also when the tests run without `make test` (`orca-ide plugin test .`).
+export function orcaCli(env = process.env) {
+  const cli = orcaCliCommand(env)
+  if (isScreenReader(cli)) {
+    throw new Error("ORCA_CLI_COMMAND=orca: on Linux a bare orca is GNOME's screen reader, not Orca's CLI; " +
+      'not started — set ORCA_CLI_COMMAND to orca-ide or the full path of the CLI')
+  }
+  return cli
+}
+
 export function orca(args, options = {}) {
-  return run(orcaCliCommand(options.env ?? process.env), args, options)
+  return run(orcaCli(options.env ?? process.env), args, options)
 }
 
 // `orca plugin inspect <dir> --json`: its exit code and parsed answer.
