@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "project": "orca-plugin-agent-queue",
+  "repo": "Yeleup/orca-plugin-aqk",
+  "base_branch": "master",
+  "tests": {
+    "full": "make test",
+    "filtered": "make test test_args=\"--compact --filter=<Name>\""
+  },
+  "data_rule": "The issue never contains data from the local database or real conversations (names, phone numbers, addresses, ids of real customers, tokens or keys).",
+  "automation": {
+    "name": "orca-plugin-agent-queue: очередь агентов",
+    "trigger": "*/5 * * * *"
+  },
+  "after_merge": []
+}
