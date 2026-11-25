@@ -3,5 +3,5 @@
 import type { OrcaWorkerApi } from 'orca/worker'
 
 export default function activate(orca: OrcaWorkerApi): void {
-  orca.log('agent-queue-kit: worker started')
+  orca.log('agent-queue: worker started')
 }

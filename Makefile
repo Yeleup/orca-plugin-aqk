@@ -8,15 +8,19 @@ TEST_RESULT = bash docker/test-result.sh
 # The steps a full run must run, and the test_args of a full run.
 TEST_STEPS = validate types plugin
 test_args ?= --compact
-# Orca's CLI: ORCA_CLI_COMMAND in Orca's terminals, otherwise orca-ide (never a bare `orca`: on Linux outside Orca
-# that is GNOME's screen reader).
-ORCA ?= $(or $(ORCA_CLI_COMMAND),orca-ide)
+# Orca's CLI: ORCA_CLI_COMMAND in Orca's terminals, otherwise `orca` on macOS and Windows and `orca-ide` elsewhere (never
+# a bare `orca` on Linux: outside Orca that is GNOME's screen reader). scripts/tools.mjs has the same rule.
+ORCA ?= $(or $(ORCA_CLI_COMMAND),$(if $(filter Darwin,$(shell uname -s 2>/dev/null))$(filter Windows_NT,$(OS)),orca,orca-ide))
+# TypeScript by the path of its package: the preparation installs it without bin links (no node_modules/.bin).
+TSC = node_modules/typescript/bin/tsc
+# The preparation command of README, named when node_modules/ is missing.
+PREPARE = npm ci --no-audit --no-fund --no-bin-links
 
 # The checks of the manifest Orca makes when it loads the plugin; the last line is the step's summary.
 VALIDATE = bash -c '"$$1" plugin validate . && echo "orca plugin validate: манифест в порядке"' validate $(ORCA)
 # `orca plugin types` writes the typings of this Orca into .orca/ (ignored by git); tsc prints nothing when the types
 # are right, so the step says so itself: a recorded step without output is never green.
-TYPES = bash -c '"$$1" plugin types . >/dev/null && node_modules/.bin/tsc -p . && echo "tsc: типы в порядке"' types $(ORCA)
+TYPES = bash -c '"$$1" plugin types . >/dev/null && node $(TSC) -p . && echo "tsc: типы в порядке"' types $(ORCA)
 # `orca plugin test` has no filter by name: a run with --filter=… in test_args runs every test and is recorded as
 # filtered.
 PLUGIN_TEST = $(ORCA) plugin test .
@@ -24,7 +28,7 @@ PLUGIN_TEST = $(ORCA) plugin test .
 .PHONY: test
 test: export TEST_RESULT_ARGS = $(test_args)
 test:
-	@test -x node_modules/.bin/tsc || { echo "make test: нет node_modules — сначала npm ci" >&2; exit 1; }
+	@test -f $(TSC) || { echo "make test: нет node_modules — сначала $(PREPARE)" >&2; exit 1; }
 	@run=; [ -z "$(TEST_RESULT_DIR)" ] || run="$$(mktemp -u -t test-run.XXXXXXXX)"; status=0; \
 	[ -z "$$run" ] || $(TEST_RESULT) start "$$run" "$(TEST_RESULT_DIR)"; \
 	for step in $(TEST_STEPS); do \

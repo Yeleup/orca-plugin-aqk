@@ -1,19 +1,18 @@
 # Orca (https://github.com/stablyai/orca) hooks for git worktrees of this plugin, a project of the agent queue
 # (agent-queue-kit).
 #
-# setup checks that the host has the tools `make test` needs and installs the development tools of the worktree
-# (TypeScript, package-lock.json) into its own node_modules/. Orca loads src/ itself, with no build and no runtime
-# dependencies. archive has nothing to clean up: node_modules/ and .orca/ go with the worktree. The repository setting
-# "Command source" must include orca.yaml.
+# setup checks that the system has git, node, npm and Orca's CLI and installs the development tools of the worktree
+# (TypeScript, package-lock.json) into its own node_modules/, without bin links: `orca plugin inspect` refuses a plugin
+# folder with a symlink (scripts/setup.mjs). Orca loads src/ itself, with no build and no runtime dependencies. archive
+# has nothing to clean up: node_modules/ and .orca/ go with the worktree. The repository setting "Command source" must
+# include orca.yaml.
+#
+# The same hooks run on macOS, Linux and Windows: Orca runs them through bash on macOS and Linux and on Windows through
+# a .cmd file that calls each line in turn. So every line is one plain command, valid in both shells: no comments,
+# variables, pipes, redirections or conditions inside the scripts.
 scripts:
   setup: |
-    missing=""
-    for tool in bash git make node npm; do
-      command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
-    done
-    command -v "${ORCA_CLI_COMMAND:-orca-ide}" >/dev/null 2>&1 || missing="$missing orca-cli"
-    if [ -n "$missing" ]; then echo "orca-plugin-aqk worktree: missing tools:$missing" >&2; exit 1; fi
-    npm ci --no-audit --no-fund
+    node scripts/setup.mjs
   archive: |
-    exit 0
+    echo orca-plugin-aqk archive: nothing to clean up, node_modules and .orca go with the worktree
 setupAgentStartupPolicy: wait-for-setup
