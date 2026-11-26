@@ -62,7 +62,12 @@ declare module 'node:os' {
 }
 
 declare module 'node:crypto' {
+  export interface Hash {
+    update(data: string, encoding: 'utf8'): Hash
+    digest(encoding: 'hex'): string
+  }
   export function randomUUID(): string
+  export function createHash(algorithm: 'sha256'): Hash
 }
 
 declare module 'node:process' {

@@ -4,6 +4,7 @@
 // project's language; then the owner edits it, and a queue task never changes it. It is read, like the settings, from
 // the project's base branch (./base-branch.ts).
 import type { GithubLanguage } from '../github-texts/catalog'
+import { inlineCode } from '../markdown'
 import { errorMessage, type Machine } from '../platform/machine'
 import { readBaseBranchFile, REMOTE, type BaseBranchCommit } from './base-branch'
 import type { ProjectSettings } from './settings'
@@ -82,15 +83,6 @@ const TEMPLATES: { readonly [L in GithubLanguage]: TemplateText } = {
     never: 'Чего нельзя в worktree',
     neverPlaceholder: '<команды, которые трогают общий стенд, основной чекаут или боевой сервер>',
   },
-}
-
-// `text` as a Markdown code span: fenced by more backticks than any run of them inside, padded when it starts or ends
-// with one.
-function inlineCode(text: string): string {
-  const longest = Math.max(0, ...[...text.matchAll(/`+/g)].map((run) => run[0].length))
-  const fence = '`'.repeat(longest + 1)
-  const pad = text.startsWith('`') || text.endsWith('`') ? ' ' : ''
-  return `${fence}${pad}${text}${pad}${fence}`
 }
 
 export type ReadTaskRulesResult =

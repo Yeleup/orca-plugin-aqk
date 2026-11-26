@@ -72,6 +72,12 @@
     },
     {
       "kind": "workspace:write"
+    },
+    {
+      "kind": "agent:launch"
+    },
+    {
+      "kind": "terminal:send"
     }
   ]
 }
