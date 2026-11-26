@@ -54,19 +54,25 @@
 //   plugin launched: before every run of the CLI — the first send and every asking again, before the search for the CLI
 //   (its `status` is a run too) and again right before `terminal send` — one check: the launch's directory is the real
 //   directory of its task and number in the data directory (no link or file on the way or in its place), its record
-//   (launch.json) a regular file there naming this terminal, and the plugin has not closed it; otherwise the CLI does
-//   not run. An empty message is an error, and nothing is written. The send is recorded (sending-<k>.json) before the
-//   line is typed; its outcome (message-<k>.json) once it is known. «Not sent» only on proof that the line of this
-//   request was not typed: the CLI not found or not started, or Orca refusing the line itself (in the form of Orca's
-//   refusal) on the first send; a receipt saying the terminal did not take it, in any attempt; the check failing on the
-//   first send — before the message's files, then none of them is written (a stop of the task waits for a send under
-//   way, so within one worker the check right before `terminal send` fails only when another worker closed the terminal
-//   meanwhile). Anything else is unknown, also every refusal of asking again: nothing is recorded, the message stays
+//   (launch.json) a regular file there naming this terminal, and the plugin has not closed it — its `closed` mark, or a
+//   close Orca confirmed to this worker when the disk refused the mark (written again at the next check); otherwise the
+//   CLI does not run. A first send looks for the CLI first, checks again after the search and only then writes the
+//   message's files: no CLI, or the check failing, leaves no file of the message. An empty message is an error, and
+//   nothing is written. The send is recorded (sending-<k>.json) before the line is typed; its outcome
+//   (message-<k>.json) once it is known. «Not sent» only on proof that the line of this request was not typed: the CLI
+//   not found or not started, or Orca refusing the line itself (in the form of Orca's refusal, with no receipt beside
+//   it) on the first send; a receipt saying the terminal did not take it, in any attempt; the check failing on the
+//   first send. Anything else is unknown, also every refusal of asking again: nothing is recorded, the message stays
 //   the last input, and the next reading of the report asks Orca again with the same id, unless a send of it runs in
 //   this worker now. The sends of one launch and the askings again run one at a time, in the order of their numbers;
 //   while the outcome of a message is unknown, a new one is an error and nothing of it is written. A send is under way
 //   in this worker from before its record can be seen until its outcome is settled. The caller gets «taken» with the
 //   message's report file and whether the turn started, or an error with the reason and its kind: not sent, or unknown.
+//   A stop of the task waits for a send that writes its files, and the data directory has one worker of the plugin on
+//   the computer, so once the files are written the check right before `terminal send` does not change. The files of a
+//   message (its records, its report, its start mark) are read only as regular files of the launch's directory: a link
+//   or a directory in their place is an error, never another file's text nor a fall back to an earlier input; a send
+//   record is asked about again only with this message's line and report file and a UUID of the plugin.
 // - report: on the plugin's last input to the agent — the last message whose send is recorded and is not proven unsent,
 //   else the task. While that message's outcome is not known, the reading says why and waits — its start still kept on
 //   disk when its report file is there or a turn began after its send. The report is read only from the last input's
@@ -130,6 +136,9 @@ export const ORCA_TEXT_MAX = 4096
 // How long the agent may take to start on an input of the plugin before the input counts as not delivered: on its task
 // from the launch, on a message from the moment its terminal took the line.
 export const DELIVERY_DEADLINE_MS = 10 * 60 * 1000
+
+// A request id of the plugin: a random UUID (version 4, as node:crypto's randomUUID makes it).
+const PLUGIN_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 // How many times a launch, or a message, looks for a free number while others take the ones it found.
 const RESERVE_ATTEMPTS = 100
@@ -363,6 +372,9 @@ export class Agents {
   private readonly known = new Map<string, AgentLaunch>()
   // Typing a line into an agent's terminal: through this computer's Orca CLI (src/platform/orca-terminal.ts).
   private readonly terminalInput: TerminalInput
+  // The launches whose terminal this worker closed (by their directory), Orca having confirmed it: a send's check
+  // refuses them even when the disk did not take their `closed` mark, which is then tried again.
+  private readonly closedHere = new Set<string>()
   // The messages whose line is being typed — a first send or asking again — in this worker now, by launch and number.
   private readonly typing = new Set<string>()
   // The sends of each launch (a message, or asking again about one), one at a time in the order asked, by its
@@ -410,7 +422,8 @@ export class Agents {
   // plugin opened for the task and has not closed yet — and no other terminal. A launch the plugin has closed (its
   // `closed` mark is there) is done, whatever else its records say. A terminal Orca refuses to close counts as closed
   // when a complete list of its workspace no longer names it. A launch whose terminal is unknown — Orca's answer not
-  // recorded, its records unreadable — is reported with the reason, and the other launches are stopped all the same.
+  // recorded, its records unreadable — is reported with the reason, and the other launches are stopped all the same. A
+  // close Orca confirmed counts for the checks of this worker's sends even when the disk refuses the `closed` mark.
   // Rejects only for a task key that is not one.
   async stop(task: TaskRef): Promise<StopResult> {
     const place = this.place(task)
@@ -449,11 +462,10 @@ export class Agents {
             continue
           }
         }
-        try {
-          await this.machine.createText(dataPath(this.machine, record.dir, CLOSED_FILE), `${this.machine.now()}\n`)
-        } catch {
-          // The terminal is closed all the same; the next stop finds it gone.
-        }
+        // Orca confirmed the close (or the terminal is gone): this worker knows it before, and whether or not, the disk
+        // keeps the mark — the check of every send sees either.
+        this.closedHere.add(record.dir)
+        await this.keepClosed(record.dir).catch(() => undefined)
         closed.push(terminalId)
       }
       return { closed, failed }
@@ -528,7 +540,7 @@ export class Agents {
         // the agent on it — its report file there, or a turn begun after its send was recorded — is kept on disk all
         // the same, and then the last input and its file are read again.
         const started = kept.has(input.n) || this.startedOnDisk(launch, input.n)
-        const file = this.readReportFile(input.reportFile)
+        const file = this.readInputReport(launch, input)
         if (!started && (file.text !== null || this.turnOn(launch, input))) {
           await this.keepStarted(launch, input.n)
           kept.add(input.n)
@@ -554,7 +566,7 @@ export class Agents {
       // is given on to the reply nothing waits and nothing is written: the text first, then the time of the file's last
       // write — a file changed between the two reads has the later time.
       const started = kept.has(input.n) || this.startedOnDisk(launch, input.n)
-      const { text, writtenAt } = this.readReportFile(input.reportFile)
+      const { text, writtenAt } = this.readInputReport(launch, input)
       if (!started && (text !== null || this.turnOn(launch, input))) {
         await this.keepStarted(launch, input.n)
         kept.add(input.n)
@@ -595,22 +607,37 @@ export class Agents {
     if (taskDir === null) return Promise.resolve(unsent(this.notOwnTerminal(launch) ?? `not a launch of the plugin: ${launch.dir}`))
     if (this.isStopping(taskDir)) return Promise.resolve(unsent(stoppingMessages(launch)))
     return this.oneAtATime(launch, taskDir, async () => {
-      // A stop of the task begun while this waited for the sends before it: nothing of the message is written.
-      if (this.isStopping(taskDir)) return unsent(stoppingMessages(launch))
-      const foreign = this.notOwnTerminal(launch)
-      if (foreign !== null) return unsent(foreign)
+      const refused = this.mayNotSend(launch, taskDir)
+      if (refused !== null) return unsent(refused)
       this.know(launch)
-      let last: Input
-      try {
-        last = this.lastInput(launch)
-      } catch (error) {
-        return unsent(errorMessage(error))
-      }
-      if (last.message !== null && last.message.outcome === null) {
-        return unsent(`the outcome of message ${last.n} to the agent is not known yet: a new message goes only once it is known (a reading of the report asks Orca again)`)
-      }
+      // Orca's CLI is looked for before anything of the message is written: without it, nothing is.
+      const missing = await this.terminalInput.ready()
+      if (missing !== null) return unsent(`a message to the agent "${launch.agent}" in terminal ${launch.terminalId} was not sent: ${missing}`)
+      // Checked again after the search, with nothing waited for between this check and the start of the first write: a
+      // stop of the task begun meanwhile, or the terminal closed by the plugin, leaves no file of the message.
+      const changed = this.mayNotSend(launch, taskDir)
+      if (changed !== null) return unsent(changed)
       return this.send(launch, text)
     })
+  }
+
+  // Why no new message may be sent to the launch's agent now, or null: a stop of its task runs (begun while this
+  // waited for the sends before it), the terminal is not one the plugin may type into, or the outcome of the previous
+  // message is not known (or its records cannot be read).
+  private mayNotSend(launch: AgentLaunch, taskDir: string): string | null {
+    if (this.isStopping(taskDir)) return stoppingMessages(launch)
+    const foreign = this.notOwnTerminal(launch)
+    if (foreign !== null) return foreign
+    let last: Input
+    try {
+      last = this.lastInput(launch)
+    } catch (error) {
+      return errorMessage(error)
+    }
+    if (last.message !== null && last.message.outcome === null) {
+      return `the outcome of message ${last.n} to the agent is not known yet: a new message goes only once it is known (a reading of the report asks Orca again)`
+    }
+    return null
   }
 
   // Every launch of the task the data directory keeps, in the order of their numbers: each launch directory read by
@@ -770,7 +797,7 @@ export class Agents {
     }
     const foreign = this.notOwnTerminal(launch)
     if (foreign !== null) return attempt === 'first' ? notTaken(foreign) : unknown(foreign)
-    const sent = await this.terminalInput(launch.terminalId, sending.line, sending.requestId, () => this.notOwnTerminal(launch))
+    const sent = await this.terminalInput.send(launch.terminalId, sending.line, sending.requestId, () => this.notOwnTerminal(launch))
     if (!sent.ok) return attempt === 'first' && sent.delivery === 'not-sent' ? notTaken(sent.error) : unknown(sent.error)
     if (!sent.accepted) return notTaken(`the terminal did not take the line: ${sent.refusedReason ?? 'Orca gave no reason'}`)
     try {
@@ -821,25 +848,19 @@ export class Agents {
   // very line and report file the plugin makes for message k of this launch: asking again types its line. Throws when
   // a record of the messages cannot be read or is not one: the last input is then not known.
   private lastInput(launch: AgentLaunch): Input {
-    let entries: DirectoryEntry[] | null
-    try {
-      entries = this.machine.listEntries(launch.dir)
-    } catch (error) {
-      throw new Error(`the messages of launch ${launch.number} cannot be listed in ${launch.dir}: ${errorMessage(error)}`)
-    }
-    const numbers = (entries ?? [])
-      .filter((entry) => entry.kind === 'file')
+    const entries = this.messageEntries(launch)
+    const numbers = entries
       .map((entry) => this.numberOf(entry.name, 'sending-', '.json'))
       .filter((k): k is number => k !== null)
       .sort((a, b) => b - a)
     for (const k of numbers) {
-      const sending = parseSending(this.readRecordText(launch, sendingName(k)))
+      const sending = parseSending(this.readMessageRecord(launch, entries, sendingName(k)))
       const reportFile = dataPath(this.machine, launch.dir, messageReportName(k))
       const line = messageLine(launch.language, dataPath(this.machine, launch.dir, messageFileName(k)), reportFile)
-      if (sending === null || sending.reportFile !== reportFile || sending.line !== line) {
+      if (sending === null || sending.reportFile !== reportFile || sending.line !== line || !PLUGIN_UUID.test(sending.requestId)) {
         throw new Error(`${dataPath(this.machine, launch.dir, sendingName(k))} is not the plugin's record of the send of message ${k}`)
       }
-      const outcomeText = this.readRecordText(launch, outcomeName(k))
+      const outcomeText = this.readMessageRecord(launch, entries, outcomeName(k))
       const outcome = parseOutcome(outcomeText)
       if (outcomeText !== null && outcome === null) {
         throw new Error(`${dataPath(this.machine, launch.dir, outcomeName(k))} is not the record of a message's outcome`)
@@ -850,14 +871,42 @@ export class Agents {
     return { n: 0, reportFile: launch.reportFile, message: null }
   }
 
-  // A record of the launch's directory, or null when it is not there; one that cannot be read is an error.
-  private readRecordText(launch: AgentLaunch, name: string): string | null {
+  // What the launch's directory holds, as the directory has it (a link is a link). Throws when it cannot be listed.
+  private messageEntries(launch: AgentLaunch): DirectoryEntry[] {
+    try {
+      return this.machine.listEntries(launch.dir) ?? []
+    } catch (error) {
+      throw new Error(`the messages of launch ${launch.number} cannot be listed in ${launch.dir}: ${errorMessage(error)}`)
+    }
+  }
+
+  // A record of the plugin's messages in the launch's directory, read only as a regular file of that directory: null
+  // when there is none; a link, a directory or anything else in its place is an error — never another file's text, and
+  // never a reason to fall back to an earlier input. A file that cannot be read is an error too.
+  private readMessageRecord(launch: AgentLaunch, entries: readonly DirectoryEntry[], name: string): string | null {
     const path = dataPath(this.machine, launch.dir, name)
+    const entry = entries.find((each) => this.sameName(each.name, name))
+    if (entry === undefined) return null
+    if (entry.kind !== 'file') throw new Error(`${path} is a link or a directory, not a record of the plugin's messages: it is not read`)
     try {
       return this.machine.readText(path)
     } catch (error) {
       throw new Error(`${path} cannot be read: ${errorMessage(error)}`)
     }
+  }
+
+  // The report file of the input: of the task by the rule of report.md; of message k only as a regular file of the
+  // launch's directory (a link in its place is an error, never the text of another report), then its text and time.
+  private readInputReport(launch: AgentLaunch, input: Input): { readonly text: string | null; readonly writtenAt: number | null } {
+    if (input.message !== null) {
+      const name = messageReportName(input.n)
+      const entry = this.messageEntries(launch).find((each) => this.sameName(each.name, name))
+      if (entry === undefined) return { text: null, writtenAt: null }
+      if (entry.kind !== 'file') {
+        throw new Error(`${input.reportFile} is a link or a directory, not the report on message ${input.n}: it is not read`)
+      }
+    }
+    return this.readReportFile(input.reportFile)
   }
 
   // The number k of a file name `<prefix><k><suffix>` (k a whole number from 1, no leading zero), as the system's file
@@ -934,7 +983,17 @@ export class Agents {
       return refused(`it is not the terminal of ${which}, which is ${recorded.terminalId ?? 'none'}`)
     }
     if (has(CLOSED_FILE) !== undefined) return refused(`the plugin has closed it (${which})`)
+    if (this.closedHere.has(dir)) {
+      // Closed by this worker, its mark not on disk: tried again, with no caller to tell.
+      this.keepClosed(dir).catch(() => undefined)
+      return refused(`the plugin has closed it (${which})`)
+    }
     return null
+  }
+
+  // Keeps on disk, once, that the plugin has closed the terminal of the launch in `dir`.
+  private async keepClosed(dir: string): Promise<void> {
+    await this.machine.createText(dataPath(this.machine, dir, CLOSED_FILE), `${this.machine.now()}\n`)
   }
 
   // Runs `body` once every earlier send of the launch has ended: the sends of one launch — messages, and asking again
@@ -1029,6 +1088,14 @@ export class Agents {
   // an error, never «not started»: it may be there.
   private startedOnDisk(launch: AgentLaunch, n: number): boolean {
     const path = dataPath(this.machine, launch.dir, startedName(n))
+    // The mark of a message: only a regular file of the launch's directory.
+    if (n > 0) {
+      const entry = this.messageEntries(launch).find((each) => this.sameName(each.name, startedName(n)))
+      if (entry === undefined) return false
+      if (entry.kind !== 'file') {
+        throw new Error(`the start of message ${n} of launch ${launch.number} cannot be read from ${path}: a link or a directory is no mark`)
+      }
+    }
     try {
       return this.machine.readText(path) !== null
     } catch (error) {

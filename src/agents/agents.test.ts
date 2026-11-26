@@ -1965,7 +1965,7 @@ test('Сообщение агенту в фоновом worktree и в акти�
   await r.worker.deactivate()
 })
 
-test('CLI Orca на компьютере нет, worktree агента активен — сообщение не отправлено, ошибка с причиной поиска CLI, в терминал ничего не введено; отчёт читается по заданию', async () => {
+test('CLI Orca на компьютере нет, worktree агента активен — сообщение не отправлено, ошибка с причиной поиска CLI, в терминал ничего не введено, файлов сообщения нет; отчёт читается по заданию', async () => {
   const orca = fakeOrca({ cli: false })
   const r = await mount(orca)
   const launch = await launched(r, 101, 'implementer')
@@ -1973,7 +1973,7 @@ test('CLI Orca на компьютере нет, worktree агента акти�
   await taskReported(r, launch, 'Отчёт на задание.\n')
 
   const sent = await r.agents.message(launch, 'Замечание: обновите README.')
-  const prefix = `message 1 to the agent "codex" in terminal ${launch.terminalId} was not sent: `
+  const prefix = `a message to the agent "codex" in terminal ${launch.terminalId} was not sent: `
   assert.ok(!sent.ok && sent.outcome === 'not-sent' && sent.error.startsWith(`${prefix}Orca's CLI is not found: `), JSON.stringify(sent))
   // The reason names where the CLI was looked for.
   assert.ok(sent.error.includes('orca-ide: not in PATH') && sent.error.includes(`${orca.cli}: no such file`), sent.error)
@@ -1981,8 +1981,8 @@ test('CLI Orca на компьютере нет, worktree агента акти�
   assert.deepEqual(orca.machine.starts, [])
   assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [])
   assert.deepEqual(orca.host.callsOf('terminal.sendText'), [])
-  // The send is recorded, and its outcome: not taken, with the reason of the search.
-  assert.deepEqual(outcomeOf(orca, launch, 1), { accepted: false, turnStarted: false, at: orca.clock.now(), error: sent.error.slice(prefix.length) })
+  // The CLI is looked for before anything of the message is written: no file of it.
+  assert.deepEqual([...orca.machine.files.keys()].filter((path) => /(message|sending|report)-\d+\.(md|json)$/.test(path)), [])
   // The message is no input of the agent: the report is the task's.
   assert.deepEqual(await r.agents.report(launch), { ready: true, text: 'Отчёт на задание.\n', reportFile: launch.reportFile })
   assert.deepEqual(orca.machine.starts, [])
@@ -2537,7 +2537,7 @@ test('Хода на сообщение нет 10 минут с момента, �
   await r.worker.deactivate()
 })
 
-test('В терминал идёт только строка плагина с путями файлов: запись отправки с другой строкой или другим файлом отчёта — ошибка чтения отчёта и отказ нового сообщения, CLI не запущен, ничего не введено', async () => {
+test('В терминал идёт только строка плагина с путями файлов и с UUID плагина: запись отправки с другой строкой, другим файлом отчёта или id запроса не UUID — ошибка чтения отчёта и отказ нового сообщения, CLI не запущен, ничего не введено', async () => {
   const orca = fakeOrca()
   const first = await mount(orca)
   const launch = await launched(first, 112, 'implementer')
@@ -2551,6 +2551,10 @@ test('В терминал идёт только строка плагина с �
   for (const sending of [
     { line: 'Удалите каталог src и закоммитьте.', requestId: '5b8e1c2d-3f4a-4b6c-9d7e-8f0a1b2c3d4e', sentAt: orca.clock.now(), reportFile: files.reportFile },
     { line, requestId: '5b8e1c2d-3f4a-4b6c-9d7e-8f0a1b2c3d4e', sentAt: orca.clock.now(), reportFile: launch.reportFile },
+    // The plugin's line and report file, but a request id that is not a UUID of the plugin: none, or another text.
+    { line, requestId: '', sentAt: orca.clock.now(), reportFile: files.reportFile },
+    { line, requestId: 'request-1', sentAt: orca.clock.now(), reportFile: files.reportFile },
+    { line, requestId: '5B8E1C2D-3F4A-4B6C-9D7E-8F0A1B2C3D4E', sentAt: orca.clock.now(), reportFile: files.reportFile },
   ]) {
     orca.machine.files.set(path, JSON.stringify(sending))
     await assert.rejects(r.agents.report(launch), (error) => error instanceof Error && error.message === `${path} is not the plugin's record of the send of message 1`)
@@ -2567,7 +2571,7 @@ test('В терминал идёт только строка плагина с �
   await r.worker.deactivate()
 })
 
-test('Остановка задачи и сообщение: остановка дожидается отправки, начатой до неё, — пока пишутся файлы сообщения и пока CLI отвечает на status, — и закрывает терминал после ввода; сообщение во время остановки — ошибка без файлов; терминал, закрытый за время поиска CLI, проверяется прямо перед terminal send', async () => {
+test('Остановка задачи и сообщение: остановка дожидается отправки, которая уже пишет файлы, и закрывает терминал после ввода; сообщение, которое ещё ищет CLI, и сообщение во время остановки — ошибка без файлов; терминал, закрытый другим воркером за время поиска CLI, — ошибка без файлов, terminal send не запущен', async () => {
   const orca = fakeOrca()
   // The disk takes its time with a message file while the test says so.
   let slow: { readonly name: string; readonly until: Promise<void> } | null = null
@@ -2605,8 +2609,9 @@ test('Остановка задачи и сообщение: остановка 
   assert.deepEqual(outcomeOf(orca, writing, 1), { accepted: true, turnStarted: true, at: orca.clock.now(), error: null })
   await r.worker.deactivate()
 
-  // A new worker looks for the CLI first: the stop begins while the CLI's `status` is answered. The same: the stop
-  // waits, the line is typed, then the terminal is closed.
+  // A new worker looks for the CLI first, before writing anything: the stop begins while the CLI's `status` is
+  // answered. The message has written nothing yet, so it is refused once the CLI is found — no file of it — and the
+  // stop, which waited for it, closes the terminal; nothing is typed.
   const searching = await mount(orca)
   const searched = await launched(searching, 131, 'implementer')
   const status = gate()
@@ -2618,14 +2623,19 @@ test('Остановка задачи и сообщение: остановка 
   assert.equal(orca.terminals.get(searched.terminalId)?.open, true)
   orca.statusGate = null
   status.open()
-  assert.equal((await sent).ok, true)
+  assert.deepEqual(await sent, {
+    ok: false,
+    outcome: 'not-sent',
+    error: 'the agents of issue-131 are being stopped: nothing more is typed into their terminals',
+  })
   assert.deepEqual(await stopped, { closed: [searched.terminalId], failed: [] })
-  assert.deepEqual(orca.terminals.get(searched.terminalId)?.typed, [sendingOf(orca, searched, 1).line])
+  assert.deepEqual(orca.terminals.get(searched.terminalId)?.typed, [])
+  assert.equal(orca.machine.files.has(messageFiles(orca, searched, 1).messageFile), false)
   await searching.worker.deactivate()
 
   // Another worker of the plugin stops the task while this one looks for the CLI: the terminal is closed and its
-  // `closed` mark written. The check right before `terminal send` refuses: no `terminal send` runs, nothing is typed,
-  // and the line is not sent — its send was recorded, and so is that it was not taken.
+  // `closed` mark written. The check after the search refuses: nothing of the message is written, no `terminal send`
+  // runs, nothing is typed.
   const other = await mount(orca)
   const closing = await launched(other, 132, 'implementer')
   const answer = gate()
@@ -2633,22 +2643,21 @@ test('Остановка задачи и сообщение: остановка 
   const before = cliSends(orca).length
   const refused = other.agents.message(closing, 'Замечание.')
   await settle()
-  assert.ok(orca.machine.files.has(dataPath(orca.machine, closing.dir, 'sending-1.json')))
+  assert.equal(orca.machine.files.has(messageFiles(orca, closing, 1).messageFile), false)
   const terminal = orca.terminals.get(closing.terminalId)
   assert.ok(terminal)
   terminal.open = false
   orca.machine.files.set(dataPath(orca.machine, closing.dir, 'closed'), `${orca.clock.now()}\n`)
   orca.statusGate = null
   answer.open()
-  const why = notOwn(closing.terminalId, 'the plugin has closed it (launch 1 of issue-132)')
   assert.deepEqual(await refused, {
     ok: false,
     outcome: 'not-sent',
-    error: `message 1 to the agent "codex" in terminal ${closing.terminalId} was not sent: ${why}`,
+    error: notOwn(closing.terminalId, 'the plugin has closed it (launch 1 of issue-132)'),
   })
   assert.equal(cliSends(orca).length, before)
   assert.deepEqual(terminal.typed, [])
-  assert.deepEqual(outcomeOf(orca, closing, 1), { accepted: false, turnStarted: false, at: orca.clock.now(), error: why })
+  assert.deepEqual([...orca.machine.files.keys()].filter((path) => path.startsWith(`${closing.dir}/`) && /(message|sending|report)-\d+\.(md|json)$/.test(path)), [])
   assert.deepEqual(other.worker.refusals, [])
   await other.worker.deactivate()
 })
@@ -2696,7 +2705,7 @@ test('Отправка в работе с момента записи отпра
   await r.worker.deactivate()
 })
 
-test('Ответ CLI не в форме отказа Orca (код отказа без поля ok) и противоречивый ответ (accepted false с deliveryOutcome unknown) — исход неизвестен, «не отправлено» не записано; следующий запрос отчёта узнаёт исход тем же id', async () => {
+test('Ответ CLI не в форме отказа Orca (код отказа без поля ok) и противоречивые ответы (accepted false с deliveryOutcome unknown; отказ в самой строке вместе с квитанцией accepted true) — исход неизвестен, «не отправлено» не записано; следующий запрос отчёта узнаёт исход тем же id', async () => {
   const answers = [
     { code: 1, stdout: JSON.stringify({ id: 'cli-7', error: { code: 'invalid_argument', message: '--text is empty' } }) },
     {
@@ -2706,6 +2715,15 @@ test('Ответ CLI не в форме отказа Orca (код отказа �
         ok: true,
         result: { send: { handle: 'terminal-1', accepted: false, refusedReason: 'the terminal is read-only' } },
         error: { code: 'runtime_error', message: 'Orca cannot prove whether the prompt was delivered', data: { deliveryOutcome: 'unknown' } },
+      }),
+    },
+    {
+      code: 1,
+      stdout: JSON.stringify({
+        id: 'cli-9',
+        ok: false,
+        error: { code: 'terminal_handle_stale', message: 'terminal_handle_stale terminal-1' },
+        result: { send: { handle: 'terminal-1', accepted: true, prompt: { stages: ['input_accepted'] } } },
       }),
     },
   ]
@@ -2799,6 +2817,95 @@ test('Исход неизвестен (ответ CLI потерян, повто
   orca.list(launch.terminalId, 'done', orca.clock.now())
   assert.deepEqual(await r.agents.report(launch), { ready: true, text: 'Отчёт на замечание.\n', reportFile })
   assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [sending.line])
+  assert.deepEqual(r.worker.refusals, [])
+  await r.worker.deactivate()
+})
+
+test('Метку closed диск не принял, а Orca закрытие подтвердила: остановка называет терминал закрытым, и проверка своего терминала его не пропускает — новое сообщение — ошибка без файлов, повторный запрос исхода ждёт с причиной, CLI не запущен; метка дописывается, когда диск её принимает', async () => {
+  const orca = fakeOrca()
+  // The disk refuses the `closed` marks while the test says so.
+  let refuse = true
+  const machine: Machine = {
+    ...orca.machine,
+    createText: async (path, text) => {
+      if (refuse && path.endsWith('/closed')) throw new Error('ENOSPC: no space left on device')
+      return orca.machine.createText(path, text)
+    },
+  }
+  const r = await mount(orca, { machine })
+  // Two agents of one task: one has a message whose outcome is unknown (its answer lost), one has no message.
+  const waiting = await launched(r, 138, 'implementer')
+  const fresh = await launched(r, 138, 'reviewer')
+  orca.loseAnswers = 1
+  const lost = await r.agents.message(waiting, 'Замечание.')
+  assert.ok(!lost.ok && lost.outcome === 'unknown', JSON.stringify(lost))
+  const runs = cliSends(orca).length
+  // The stop closes both terminals through Orca; the marks are not on disk.
+  assert.deepEqual(await r.agents.stop(issueTask(PROJECT, 138)), { closed: [waiting.terminalId, fresh.terminalId], failed: [] })
+  for (const launch of [waiting, fresh]) assert.equal(orca.machine.files.has(dataPath(orca.machine, launch.dir, 'closed')), false)
+
+  // A first message: refused before anything is written, no CLI run.
+  assert.deepEqual(await r.agents.message(fresh, 'Замечание.'), {
+    ok: false,
+    outcome: 'not-sent',
+    error: notOwn(fresh.terminalId, 'the plugin has closed it (launch 2 of issue-138)'),
+  })
+  assert.equal(orca.machine.files.has(messageFiles(orca, fresh, 1).messageFile), false)
+  // Asking again about the lost answer: the reading waits with the reason, and does not run the CLI.
+  const reportFile = messageFiles(orca, waiting, 1).reportFile
+  assert.deepEqual(
+    await r.agents.report(waiting),
+    notReady(waiting, {
+      reportFile,
+      unresolved: `the outcome of message 1 to the agent "codex" in terminal ${waiting.terminalId} is unknown: ${notOwn(waiting.terminalId, 'the plugin has closed it (launch 1 of issue-138)')}`,
+    }),
+  )
+  assert.equal(cliSends(orca).length, runs)
+  assert.equal(outcomeOf(orca, waiting, 1), undefined)
+
+  // The disk takes the marks again: the next check of the terminal writes its mark.
+  refuse = false
+  assert.equal((await r.agents.message(fresh, 'Замечание.')).ok, false)
+  await settle()
+  assert.ok(orca.machine.files.has(dataPath(orca.machine, fresh.dir, 'closed')))
+  assert.equal(cliSends(orca).length, runs)
+  assert.deepEqual(r.worker.refusals, [])
+  await r.worker.deactivate()
+})
+
+test('Ссылка на месте файла сообщения: report-<k>.md — ссылка на отчёт задания, message-<k>.json — ссылка на отрицательный исход другого сообщения — ошибка с причиной, а не прежний отчёт и не откат к прежнему входу', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+
+  // The report on message 1 is a link to the task's report: a new «done» does not confirm the task's text.
+  const linked = await launched(r, 139, 'implementer')
+  await taskReported(r, linked, 'Отчёт на задание.\n')
+  const sent = await r.agents.message(linked, 'Замечание.')
+  assert.ok(sent.ok, JSON.stringify(sent))
+  orca.machine.links.set(sent.reportFile, linked.reportFile)
+  assert.equal(orca.machine.readText(sent.reportFile), 'Отчёт на задание.\n')
+  orca.clock.advance(60_000)
+  orca.list(linked.terminalId, 'done', orca.clock.now())
+  const notAReport = `${sent.reportFile} is a link or a directory, not the report on message 1: it is not read`
+  await assert.rejects(r.agents.report(linked), (error) => error instanceof Error && error.message === notAReport)
+
+  // Message 1 refused by Orca (not taken); message 2 typed and its answer lost — its outcome unknown. A link in place
+  // of message-2.json to message 1's negative outcome: an error, not a fall back to the task, and no CLI run.
+  const dropped = await launched(r, 140, 'implementer')
+  await taskReported(r, dropped, 'Отчёт на задание.\n')
+  orca.cliRefusals.push({ code: 'agent_prompt_blocked', message: 'the agent shows a permission prompt' })
+  assert.equal((await r.agents.message(dropped, 'Замечание 1.')).ok, false)
+  orca.loseAnswers = 1
+  const second = await r.agents.message(dropped, 'Замечание 2.')
+  assert.ok(!second.ok && second.outcome === 'unknown', JSON.stringify(second))
+  const runs = cliSends(orca).length
+  const outcome2 = dataPath(orca.machine, dropped.dir, 'message-2.json')
+  orca.machine.links.set(outcome2, dataPath(orca.machine, dropped.dir, 'message-1.json'))
+  assert.deepEqual(JSON.parse(orca.machine.readText(outcome2) ?? '{}').accepted, false)
+  const notARecord = `${outcome2} is a link or a directory, not a record of the plugin's messages: it is not read`
+  await assert.rejects(r.agents.report(dropped), (error) => error instanceof Error && error.message === notARecord)
+  assert.deepEqual(await r.agents.message(dropped, 'Замечание 3.'), { ok: false, outcome: 'not-sent', error: notARecord })
+  assert.equal(cliSends(orca).length, runs)
   assert.deepEqual(r.worker.refusals, [])
   await r.worker.deactivate()
 })

@@ -28,11 +28,12 @@
 //   whether `turn_started` is among its stages), or false with Orca's reason: the terminal did not take the line;
 // - not sent — proven that the line of this request was not typed: the CLI is not found or did not start, the
 //   caller's check refused, or Orca refused the line itself in the form of Orca's refusal (`ok: false`, an `error`
-//   with its code and message, a non-zero exit) with one of `terminal_handle_stale`, `invalid_argument`,
+//   with its code and message, a non-zero exit, no `result`) with one of `terminal_handle_stale`, `invalid_argument`,
 //   `agent_prompt_blocked`, `incompatible_runtime`;
 // - unknown — anything else: no JSON, a timeout, `runtime_unavailable` (Orca's CLI answers it both before the request
 //   leaves and after the connection closed behind it), any other refusal, an answer in neither form (no boolean `ok`,
-//   a success with an error, a refusal without its code or with exit 0), a success without a true or false `accepted`.
+//   a success with an error, a refusal without its code or with exit 0, a refusal with a receipt — receipt and refusal
+//   exclude each other), a success without a true or false `accepted`.
 //   When this run asked again about an earlier one, only a receipt decides: the agents layer reads every refusal of it
 //   as «unknown».
 import type { Machine } from './machine'
@@ -67,34 +68,43 @@ export type TerminalSendResult =
   // lost, or Orca failed or could not be reached; the same request id asks about it again.
   | { readonly ok: false; readonly delivery: 'not-sent' | 'unknown'; readonly error: string }
 
-// Types `line` and Enter into the terminal `terminalId` as the request `requestId` (a UUID): one run of the CLI. `check`
-// runs once the CLI is found, right before `terminal send`: a reason it returns means nothing runs and the line is not
-// sent with that reason; null lets the send go.
-export type TerminalInput = (
-  terminalId: string,
-  line: string,
-  requestId: string,
-  check: () => string | null,
-) => Promise<TerminalSendResult>
+// Typing into an Orca terminal through the CLI of this computer.
+export type TerminalInput = {
+  // Finds Orca's CLI by Ф14 unless it is found already: null when it is there, otherwise why there is none. A caller
+  // looks for it before it writes anything of a send, so that a send without a CLI leaves nothing behind.
+  ready(): Promise<string | null>
+  // Types `line` and Enter into the terminal `terminalId` as the request `requestId` (a UUID): one run of the CLI,
+  // looked for first when it is not found yet. `check` runs once the CLI is found, right before `terminal send` starts,
+  // with nothing waited for between them: a reason it returns means nothing runs and the line is not sent with that
+  // reason; null lets the send go.
+  send(terminalId: string, line: string, requestId: string, check: () => string | null): Promise<TerminalSendResult>
+}
 
-// The terminal input of this computer's Orca CLI, found by Ф14 at the first call and kept while it starts.
+// The terminal input of this computer's Orca CLI, found by Ф14 when first needed and kept while it starts.
 export function orcaCliTerminalInput(machine: Machine): TerminalInput {
   let cli: string | null = null
-  return async (terminalId, line, requestId, check) => {
-    if (cli === null) {
-      const search = await findOrcaCli(machine)
-      if (!search.found) return { ok: false, delivery: 'not-sent', error: `Orca's CLI is not found: ${search.reason}` }
-      cli = search.file
-    }
-    // Nothing waits between the caller's check and the start of `terminal send`.
-    const refused = check()
-    if (refused !== null) return { ok: false, delivery: 'not-sent', error: refused }
-    const result = await runProgram(machine, cli, terminalSendArgs(terminalId, line, requestId), {
-      timeoutMs: TERMINAL_SEND_TIMEOUT_MS,
-    })
-    // A CLI that could not be started is looked for again next time.
-    if (result.error !== null && (result.error.kind === 'not_found' || result.error.kind === 'start_failed')) cli = null
-    return terminalSendOutcome(result)
+  const find = async (): Promise<string | null> => {
+    if (cli !== null) return null
+    const search = await findOrcaCli(machine)
+    if (!search.found) return `Orca's CLI is not found: ${search.reason}`
+    cli = search.file
+    return null
+  }
+  return {
+    ready: find,
+    send: async (terminalId, line, requestId, check) => {
+      const missing = await find()
+      if (missing !== null || cli === null) return { ok: false, delivery: 'not-sent', error: missing ?? "Orca's CLI is not found" }
+      // Nothing waits between the caller's check and the start of `terminal send`.
+      const refused = check()
+      if (refused !== null) return { ok: false, delivery: 'not-sent', error: refused }
+      const result = await runProgram(machine, cli, terminalSendArgs(terminalId, line, requestId), {
+        timeoutMs: TERMINAL_SEND_TIMEOUT_MS,
+      })
+      // A CLI that could not be started is looked for again next time.
+      if (result.error !== null && (result.error.kind === 'not_found' || result.error.kind === 'start_failed')) cli = null
+      return terminalSendOutcome(result)
+    },
   }
 }
 
@@ -145,8 +155,9 @@ export function terminalSendOutcome(result: RunResult): TerminalSendResult {
     return { ok: false, delivery: 'unknown', error: `orca terminal send: ${said} ${exit}` }
   }
   if (ok === false) {
-    // Only Orca's refusal in its own form — its code and message, a failed exit — proves anything.
-    const refusal = typeof code === 'string' && typeof message === 'string' && result.code !== 0
+    // Only Orca's refusal in its own form — its code and message, a failed exit, and no receipt beside it — proves
+    // anything: an answer that is a refusal and a receipt at once is neither.
+    const refusal = typeof code === 'string' && typeof message === 'string' && result.code !== 0 && field(answer, 'result') === undefined
     return {
       ok: false,
       delivery: refusal && NOT_SENT_CODES.has(code) ? 'not-sent' : 'unknown',
