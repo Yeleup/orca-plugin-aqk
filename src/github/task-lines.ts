@@ -5,7 +5,9 @@
 // What counts as such a line (README «Строки задачи»):
 // - a whole line of the text, blanks around it ignored; lines in fenced code blocks (``` or ~~~), in quotes (> — with
 //   the lines that go on a quoted paragraph without a blank line, as GitHub Flavored Markdown reads a quote) and
-//   inside HTML comments do not count — they are not lines of the task as GitHub shows it;
+//   inside HTML comments do not count — they are not lines of the task as GitHub shows it. A quoted line whose content
+//   after > and list markers starts with < (HTML or an autolink <https://…>) is not taken for a quoted paragraph: the
+//   line right after it is read;
 // - it starts with the words, in any case: «Зависит от» or «Depends on», then an optional colon and the first number
 //   with #; «MVP» and a colon, then the number with #; «Часть», then an optional colon and the number with #;
 // - the rest of the line is only numbers with #: for dependencies one or more, divided by commas, blanks, «и» or «and»;

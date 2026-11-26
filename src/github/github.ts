@@ -5,7 +5,8 @@
 //   that reads the texts — so a switch of gh's account (`gh auth switch`) counts from the next read on, and an account
 //   that changes within one paginated read is an error. A text counts only when the owner wrote it and nobody else
 //   changed it: its author is the owner, its last editor (if it was edited) is the owner, every entry of its edit
-//   history is the owner's (read whole, page by page), and an issue's title was renamed only by the owner. A text with
+//   history is the owner's (read whole, page by page, and no shorter than GitHub counted with the text), and an
+//   issue's title was renamed only by the owner. A text with
 //   an edit by someone else, or by an editor GitHub no longer knows (a deleted account), does not count. Issues and
 //   comments that do not count are never returned — so they never reach an agent's task; such an issue looked up by its
 //   number gives only its number, state and why. Not knowing the owner is an error, never «all users».
@@ -41,7 +42,7 @@ import {
   type Repository,
 } from './gh'
 import { LABEL_LOOK, PLUGIN_LABELS, type PluginLabel } from './labels'
-import { checkMark, composeBody, findByOperation, parseBody, type Mark } from './mark'
+import { checkMark, composeBody, findByOperation, type Mark } from './mark'
 import { CheckError } from './mask'
 
 export type IssueState = 'open' | 'closed'
@@ -383,9 +384,10 @@ export class GitHub {
 
   // A comment that belongs to an operation (its mark has `operation`): written only when the owner's comments of the
   // issue or PR have none with this operation and kind yet. A repeat after a lost GitHub answer finds the comment
-  // written the first time and writes no second one (`existed: true`). When a comment of the owner that may be that
-  // one was changed by someone else — its mark names this operation, or it has no readable mark any more — the state
-  // of the operation cannot be confirmed: GitHubError `unconfirmed`, and nothing is written.
+  // written the first time and writes no second one (`existed: true`) — also when changed comments are next to it.
+  // Without such an unchanged comment, any comment of the owner that someone else changed stops the write: what it
+  // holds now proves neither that the operation is there nor that it is not (a changed mark may even name another
+  // operation) — GitHubError `unconfirmed`, nothing is written. The owner's way out: delete the changed comment.
   async commentOnce(issue: number, content: BodyContent): Promise<Written<Comment> & { readonly existed: boolean }> {
     const checked = bodyOf(content, this.boundary(content.diff))
     const mark = content.mark
@@ -394,11 +396,7 @@ export class GitHub {
     const confirmed = own.filter((one) => one.origin === 'owner').map((one) => one.comment)
     const found = findByOperation(confirmed, { operation: mark.operation, kind: mark.kind })
     if (found !== null) return { result: found, hidden: checked.hidden, rules: checked.rules, existed: true }
-    const doubtful = own.find((one) => {
-      if (one.origin === 'owner') return false
-      const read = parseBody(one.comment.body).mark
-      return read === null || read.operation === mark.operation
-    })
+    const doubtful = own.find((one) => one.origin !== 'owner')
     if (doubtful !== undefined) {
       throw new GitHubError('unconfirmed', ['api', 'graphql', 'AqComments'], {
         ghText: '',
@@ -628,7 +626,16 @@ export class GitHub {
   // The whole edit history (`edits`) or title renames (`renames`) of an issue or comment, read on by its own query
   // after the first 100 came with the list. The query names the repository; the node must belong to it, and gh must
   // still run as the same user.
-  private async history(id: unknown, what: 'edits' | 'renames', list: Read): Promise<Record<string, unknown>[]> {
+  // The entries must be at least as many as GitHub counted with the text (`counted`): an entry is never removed from a
+  // history (a deleted revision stays, with `deletedBy`), so fewer means the history did not come whole — GitHubError
+  // `bad_answer`, and nothing of the text is used. More means it grew meanwhile; every entry is checked as ever.
+  private async history(
+    id: unknown,
+    what: 'edits' | 'renames',
+    list: Read,
+    counted: number,
+    of: string,
+  ): Promise<Record<string, unknown>[]> {
     if (typeof id !== 'string' || id === '') throw shapeError(list.args, 'a text without its id')
     const read = await this.read(what === 'edits' ? Q_EDITS : Q_RENAMES, { id }, true)
     if (read.owner.toLowerCase() !== list.owner.toLowerCase()) {
@@ -644,7 +651,14 @@ export class GitHub {
         throw shapeError(read.args, `the text ${id} is not one of ${repositoryRef(this.repository)}`)
       }
     }
-    return this.pagedNodes(read, (data) => field(data.node, what === 'edits' ? 'userContentEdits' : 'timelineItems'))
+    const entries = this.pagedNodes(read, (data) => field(data.node, what === 'edits' ? 'userContentEdits' : 'timelineItems'))
+    if (entries.length < counted) {
+      throw shapeError(
+        read.args,
+        `the ${what === 'edits' ? 'edit' : 'rename'} history of ${of} came incomplete: GitHub counted ${counted}, read ${entries.length}`,
+      )
+    }
+    return entries
   }
 
   // Whether a text counts as the owner's (see the header): `owner`, or why not. An edit history or rename history
@@ -658,15 +672,20 @@ export class GitHub {
       if (!sameLogin(node.author, owner)) return 'author' as const
       if ((node.lastEditedAt !== null || node.editor !== null) && !sameLogin(node.editor, owner)) return 'edited' as const
       const edits = listed(node.userContentEdits, 'userContentEdits')
-      const renames = issue ? listed(node.timelineItems, 'timelineItems') : { nodes: [], more: false }
+      const renames = issue ? listed(node.timelineItems, 'timelineItems') : { nodes: [], more: false, total: 0 }
       if (edits.nodes.some((edit) => !ownEdit(edit, owner))) return 'edited' as const
       if (renames.nodes.some((rename) => !sameLogin(rename.actor, owner))) return 'edited' as const
-      return { edits: edits.more, renames: renames.more }
+      const of = issue ? `issue #${String(node.number)}` : `comment ${String(node.url)}`
+      return { edits: edits.more ? edits.total : null, renames: renames.more ? renames.total : null, of }
     })
     if (typeof first === 'string') return first
-    if (first.edits && (await this.history(node.id, 'edits', read)).some((edit) => !ownEdit(edit, owner))) return 'edited'
-    if (first.renames && (await this.history(node.id, 'renames', read)).some((rename) => !sameLogin(rename.actor, owner))) {
-      return 'edited'
+    if (first.edits !== null) {
+      const edits = await this.history(node.id, 'edits', read, first.edits, first.of)
+      if (edits.some((edit) => !ownEdit(edit, owner))) return 'edited'
+    }
+    if (first.renames !== null) {
+      const renames = await this.history(node.id, 'renames', read, first.renames, first.of)
+      if (renames.some((rename) => !sameLogin(rename.actor, owner))) return 'edited'
     }
     return 'owner'
   }
@@ -800,7 +819,10 @@ function shapeError(args: readonly string[], what: string): GitHubError {
 }
 
 // The items of a nested list read with totalCount, and whether GitHub has more than it gave.
-function listed(connection: unknown, name: string): { readonly nodes: Record<string, unknown>[]; readonly more: boolean } {
+function listed(
+  connection: unknown,
+  name: string,
+): { readonly nodes: Record<string, unknown>[]; readonly more: boolean; readonly total: number } {
   if (!isObject(connection) || !Array.isArray(connection.nodes) || typeof connection.totalCount !== 'number') {
     throw new Error(`no ${name}`)
   }
@@ -808,7 +830,7 @@ function listed(connection: unknown, name: string): { readonly nodes: Record<str
     if (!isObject(node)) throw new Error(`an item of ${name} is not an object`)
     return node
   })
-  return { nodes, more: connection.totalCount > nodes.length }
+  return { nodes, more: connection.totalCount > nodes.length, total: connection.totalCount }
 }
 
 // An entry of an edit history made (and, if a revision was deleted, deleted) by the owner.

@@ -110,6 +110,8 @@ test('телефон в части пути файла и номера подр�
   // Not phone numbers: a date before a number, a long number without groups, a run id in a link.
   assert.equal(mask.apply('звонок 2026-11-26 701 555 0123 утром').text, `звонок 2026-11-26 ${HIDDEN} утром`)
   assert.equal(mask.apply('время 1764145901123456789 нс').text, 'время 1764145901123456789 нс')
+  // GitHub's anchor words outside an https:// link are no exception.
+  assert.equal(mask.apply('метка issuecomment-2025550117 и #event-2025550117').text, `метка issuecomment-${HIDDEN} и #event-${HIDDEN}`)
   // Not phone numbers either: the groups of a hyphenated id, GitHub's anchors in links.
   for (const plain of [
     'id 123e4567-e89b-42d3-a456-426614174000',

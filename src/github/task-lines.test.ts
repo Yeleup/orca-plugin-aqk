@@ -91,6 +91,10 @@ test('строка сразу после цитаты без пустой стр
   assert.deepEqual(parseTaskLines('> - Пример\n\nЗависит от #5').dependsOn, [5])
   // An empty list item or a quoted fence has no paragraph to go on.
   assert.deepEqual(parseTaskLines('> -\nЗависит от #6').dependsOn, [6])
+  // A quoted line whose content (after > and list markers) starts with < — HTML or an autolink — is no paragraph of
+  // the quote: the line right after it is read (the rule as it is, README «Строки задачи»).
+  assert.deepEqual(parseTaskLines('> <div>\nЗависит от #5').dependsOn, [5])
+  assert.deepEqual(parseTaskLines('> - <https://example.com>\nЗависит от #5').dependsOn, [5])
   // Nested quotes the same.
   assert.deepEqual(parseTaskLines('>> Вложенная цитата\nЧасть #4\n\nЧасть #3'), { dependsOn: [], mvp: null, partOf: 3, problems: [] })
 })

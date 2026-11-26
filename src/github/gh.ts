@@ -18,8 +18,11 @@ import { runProgram, type RunResult } from '../platform/run'
 export const GH_TIMEOUT_MS = 120_000
 export const GH_LIST_TIMEOUT_MS = 600_000
 
-// What gh itself must not do in a worker: ask anything, or check for its own updates.
-const GH_ENV = { GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' }
+// What gh itself must not do in a worker: ask anything, check for its own updates, or trace its HTTP traffic — a trace
+// (GH_DEBUG=api, or DEBUG=api while GH_DEBUG is not set) writes the response bodies, texts of any author, to stderr,
+// which is gh's text in an error. GH_DEBUG set to 0 turns gh's logging and tracing off whatever DEBUG says (an empty
+// value would not reach gh on Windows).
+const GH_ENV = { GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1', GH_DEBUG: '0' }
 
 export const DEFAULT_HOST = 'github.com'
 

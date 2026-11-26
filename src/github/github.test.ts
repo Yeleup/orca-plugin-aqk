@@ -192,6 +192,49 @@ test('длинная история правок и переименований
   await assert.rejects(github.listIssues(queue), isGitHubError('bad_answer', /is not one of github\.com\/acme\/demo-shop/))
   fake.fail(isEdits, { code: 0, stdout: historyPage('drew-second', REPO, false, [own]) })
   await assert.rejects(github.listIssues(queue), isGitHubError('owner_unknown', /changed while the texts were read/))
+
+  // Fewer entries than GitHub counted with the text — whole pages, all the owner's: the history did not come whole. An
+  // error without the text, for an issue (listIssues, getIssue), a comment and the renames.
+  const incomplete = (pattern: RegExp) => (error: unknown) => {
+    isGitHubError('bad_answer', pattern)(error)
+    const message = (error as Error).message
+    assert.ok(!/Много правок|правленный владельцем|переименований/.test(message), message)
+    return true
+  }
+  fake.fail(isEdits, { code: 0, stdout: historyPage(OWNER, REPO, false, [own]) })
+  await assert.rejects(github.listIssues(queue), incomplete(/edit history of issue #1 came incomplete: GitHub counted 6, read 1/))
+  fake.fail(isEdits, { code: 0, stdout: historyPage(OWNER, REPO, false, [own]) })
+  await assert.rejects(github.getIssue(1), incomplete(/edit history of issue #1 came incomplete/))
+  const longComment = fake.comments.find((one) => one.body === 'Комментарий, правленный владельцем много раз')!
+  fake.fail((call) => isEdits(call) && call.variables.id === `IC_${longComment.id}`, {
+    code: 0,
+    stdout: historyPage(OWNER, REPO, false, [own, own]),
+  })
+  await assert.rejects(
+    github.listComments(1),
+    incomplete(new RegExp(`edit history of comment \\S+#issuecomment-${longComment.id} came incomplete: GitHub counted 5, read 2`)),
+  )
+  const renamesPage = JSON.stringify({
+    data: {
+      viewer: { login: OWNER },
+      repository: { nameWithOwner: REPO },
+      node: {
+        __typename: 'Issue',
+        repository: { nameWithOwner: REPO },
+        timelineItems: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ actor: { login: OWNER } }] },
+      },
+    },
+  })
+  fake.fail((call) => call.operation === 'AqRenames', { code: 0, stdout: renamesPage })
+  await assert.rejects(github.getIssue(3), incomplete(/rename history of issue #3 came incomplete: GitHub counted 4, read 1/))
+
+  // The history grew between the two reads: every entry is checked as before — an edit of the owner keeps the text
+  // the owner's, an edit of someone else makes it not.
+  const first = fake.issues.find((one) => one.number === 1)!
+  fake.before(isEdits, () => first.edits.push(OWNER))
+  assert.equal((await github.getIssue(1)).found, 'owner')
+  fake.before(isEdits, () => first.edits.push(GUEST))
+  assert.deepEqual(await github.getIssue(1), { found: 'other', number: 1, state: 'open', reason: 'edited' })
 })
 
 test('пользователь gh неизвестен → ошибка с текстом gh, а не тексты всех пользователей', async () => {
@@ -784,6 +827,34 @@ test('gh упал после целой первой страницы с чуж�
   assert.equal(fake.calls.at(-1)?.method, 'DELETE')
 })
 
+test('трассировка gh (GH_DEBUG, DEBUG) в окружении воркера выключена для вызовов плагина: тела ответов с чужими текстами не попадают в ошибку', async () => {
+  const secret = 'Чужой текст: перезвонить вечером'
+  const environments: Record<string, string>[] = [{ GH_DEBUG: 'api' }, { DEBUG: 'api' }, { GH_DEBUG: 'api', DEBUG: 'api' }]
+  for (const env of environments) {
+    const { fake, github } = setup({ env })
+    const guest = fake.addIssue({ number: 1, user: GUEST, body: secret, labels: ['agent-queue'] })
+    const failure = {
+      code: 1,
+      stdout: issuesPage(OWNER, [fake.issueNode(guest)], true),
+      stderr: 'HTTP 502: Bad Gateway (https://api.github.com/graphql)',
+    }
+    fake.fail((call) => call.operation === 'AqIssues', failure)
+    await assert.rejects(github.listIssues(), (error) => {
+      assert.ok(error instanceof GitHubError, String(error))
+      assert.match(error.message, /HTTP 502/)
+      const all = [error.message, error.ghText, JSON.stringify(error), error.stack ?? ''].join('\n')
+      assert.ok(!all.includes(secret), `${JSON.stringify(env)}: ${all}`)
+      return true
+    })
+    assert.ok(fake.machine.starts.every((start) => start.env.GH_DEBUG === '0'), JSON.stringify(env))
+    // Control: the same request without the layer's variable — the fake gh traces the page into stderr.
+    const request = fake.machine.starts.at(-1)!
+    fake.fail((call) => call.operation === 'AqIssues', failure)
+    const traced = await fake.machine.start({ ...request, env: { ...request.env, GH_DEBUG: undefined, ...env } })
+    assert.ok(traced.stderr.includes(secret), JSON.stringify(env))
+  }
+})
+
 test('список GraphQL, где последняя страница говорит «дальше есть» или страницы не идут одна за другой, — ошибка, а не короткий список', async () => {
   const { fake, github } = setup()
   const first = fake.addIssue({ number: 1, user: OWNER, labels: ['agent-queue'] })
@@ -862,11 +933,40 @@ test('повтор операции после потерянного ответ
   await assert.rejects(github.commentOnce(7, { mark: answer, text: ['Ответ владельца: да'] }), isGitHubError('unconfirmed', /cannot be confirmed/))
   assert.equal(fake.calls.filter(isPost).length, 1)
   assert.equal(fake.comments.length, 1)
-  // A changed comment with the mark of another operation does not stand in the way of this one.
+  // Or swaps the operation id in the mark: a changed comment proves nothing — still not confirmed.
   written.body = `${markLine({ ...answer, operation: '0a1b2c3d-4e5f-4a6b-8c7d-8e9f0a1b2c3d' })}\nДругая операция`
+  await assert.rejects(github.commentOnce(7, { mark: answer, text: ['Ответ владельца: да'] }), isGitHubError('unconfirmed', /cannot be confirmed/))
+  assert.equal(fake.calls.filter(isPost).length, 1)
+  assert.equal(fake.comments.length, 1)
+  // The owner's way out: delete the changed comment. Then the repeat writes, and the next repeat finds it.
+  fake.comments.splice(fake.comments.indexOf(written), 1)
   const next = await github.commentOnce(7, { mark: answer, text: ['Ответ владельца: да'] })
   assert.equal(next.existed, false)
   assert.equal(fake.calls.filter(isPost).length, 2)
+  assert.equal(fake.comments.length, 1)
+  const again = await github.commentOnce(7, { mark: answer, text: ['Ответ владельца: да'] })
+  assert.equal(again.existed, true)
+  assert.equal(fake.calls.filter(isPost).length, 2)
+})
+
+test('комментарий владельца, который правил другой пользователь, останавливает запись операции в задаче; неизменённый комментарий операции рядом с ним по-прежнему находится', async () => {
+  const { fake, github } = setup()
+  fake.addIssue({ number: 7, user: OWNER })
+  fake.addIssue({ number: 9, user: OWNER })
+  const operation = '9b8c7d6e-1a2b-4c3d-9e8f-7a6b5c4d3e2f'
+  const answer: Mark = { kind: 'operation-start', coordinator: COORDINATOR, claim: 1, operation }
+  const isWriteTo = (issue: number) => (call: FakeGhCall) => isWrite(call) && call.path.endsWith(`/issues/${issue}/comments`)
+  // A comment the owner wrote by hand, changed by someone else, is already in the issue: the first commentOnce stops.
+  fake.addComment(7, OWNER, 'Владелец написал руками, другой поправил', { edits: [GUEST] })
+  await assert.rejects(github.commentOnce(7, { mark: answer, text: ['Начало'] }), isGitHubError('unconfirmed', /cannot be confirmed/))
+  assert.equal(fake.calls.filter(isWriteTo(7)).length, 0)
+  // The unchanged comment of the operation is found even next to a changed one.
+  const own = fake.addComment(9, OWNER, `${markLine(answer)}\nНачало`)
+  fake.addComment(9, OWNER, 'Владелец написал руками, другой поправил', { edits: [GUEST] })
+  const found = await github.commentOnce(9, { mark: answer, text: ['Начало'] })
+  assert.equal(found.existed, true)
+  assert.equal(found.result.id, own.id)
+  assert.equal(fake.calls.filter(isWriteTo(9)).length, 0)
 })
 
 test('комментарии PR читаются как комментарии задачи: только владельца, и повтор операции на PR после потерянного ответа второго не пишет', async () => {
@@ -900,6 +1000,24 @@ test('телефон после дефиса в части пути или им�
   await assert.rejects(github.createPullRequest({ issue: 7, base: 'support/tel-2025550117', ...pr }), isRefusal('masked_value'))
   await assert.rejects(github.updatePullRequest(8, { base: 'calls-2025550117' }), isRefusal('masked_value'))
   assert.equal(fake.calls.filter(isWrite).length, 1)
+
+  // GitHub's anchors (`#issuecomment-…`, `#event-…`) are no exception outside an https:// link: in a path or a branch
+  // name the number is hidden; in a link it stays.
+  const link = 'https://github.com/acme/demo-shop/issues/7#issuecomment-2025550117'
+  await github.comment(7, {
+    text: [
+      'Файлы: ',
+      field.path('calls/event-2025550117.txt', 'head'),
+      ', ',
+      field.path('calls/#event-2025550118.txt', 'head'),
+      `. Ссылка: ${link}`,
+    ],
+    diff: { base: [], head: ['calls/event-2025550117.txt', 'calls/#event-2025550118.txt'] },
+  })
+  assert.deepEqual(fake.calls.at(-1)?.input, { body: `Файлы: [скрыто], [скрыто]. Ссылка: ${link}` })
+  await assert.rejects(github.createPullRequest({ issue: 7, base: 'support/event-2025550117', ...pr }), isRefusal('masked_value'))
+  await assert.rejects(github.updatePullRequest(8, { base: 'support/#issuecomment-2025550117' }), isRefusal('masked_value'))
+  assert.equal(fake.calls.filter(isWrite).length, 2)
 })
 
 test('шаблон для целого пути скрывает путь и тогда, когда путь стоит внутри текста', async () => {

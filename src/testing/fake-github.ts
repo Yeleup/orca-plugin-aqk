@@ -200,7 +200,16 @@ export class FakeGitHub {
     return new Date(this.clock).toISOString()
   }
 
+  // gh's HTTP tracing, as gh decides it: GH_DEBUG set and holding `api`, or — only when GH_DEBUG is not set — DEBUG
+  // holding `api`. A traced call prints the response bodies to stderr: here, stderr starts with the answer's stdout.
   answer(request: StartRequest): FakeAnswer {
+    const answer = this.answerOf(request)
+    const debug = request.env.GH_DEBUG
+    const traced = debug !== undefined ? debug.includes('api') : (request.env.DEBUG ?? '').includes('api')
+    return traced ? { ...answer, stderr: `${answer.stdout ?? ''}${answer.stderr ?? ''}` } : answer
+  }
+
+  private answerOf(request: StartRequest): FakeAnswer {
     if (request.file !== FAKE_GH) return { code: 127, stderr: `fake: not gh: ${request.file}` }
     const call = readCall(request)
     for (const hook of this.hooks) {
