@@ -9,13 +9,15 @@ import { GITHUB_LANGUAGES, isGithubLanguage, type GithubLanguage } from '../gith
 import { errorMessage, type Machine } from '../platform/machine'
 import type { ProjectTestSettings } from '../platform/run'
 import {
+  blobText,
   branchNameProblem,
+  commitEntry,
   defaultBranch,
-  readBaseBranchFile,
+  MAX_FILE_BYTES,
   REMOTE,
   remoteBranches,
-  textsInCommits,
   type BaseBranchCommit,
+  type CommitEntry,
 } from './base-branch'
 
 export const SETTINGS_FILE = '.agent-queue.json'
@@ -148,7 +150,7 @@ export function describeProblems(problems: readonly SettingsProblem[]): string {
 export type ReadSettingsResult =
   | { readonly ok: true; readonly settings: ProjectSettings; readonly source: BaseBranchCommit }
   // No .agent-queue.json: the project is not connected. Read from the caller's branch: that branch has none; otherwise
-  // neither the default branch (`source`) nor any other branch of origin has a file that names its own branch.
+  // neither the default branch (`source`) nor any other branch of origin has a copy of the file.
   | { readonly ok: false; readonly kind: 'missing'; readonly error: string; readonly source: BaseBranchCommit }
   // The file is there but wrong: `problems` names each field at fault.
   | {
@@ -158,95 +160,235 @@ export type ReadSettingsResult =
       readonly problems: readonly SettingsProblem[]
       readonly source: BaseBranchCommit
     }
-  // The default branch has no file, and several branches of origin each have one that names its own branch: which of
-  // them is the base branch is not known.
+  // The default branch has no file, and several branches of origin could be the base: each names itself, or none
+  // does and each has a copy that may be the base's own, broken. None is chosen; `error` gives each one's reason.
   | { readonly ok: false; readonly kind: 'ambiguous'; readonly error: string; readonly branches: readonly string[] }
-  // git failed, or the clone lacks the branch: nothing is known about the file.
+  // git failed, the clone lacks the branch, or the file is not a readable file: nothing is known about the settings.
   | { readonly ok: false; readonly kind: 'unreadable'; readonly error: string }
 
+// How many branches are looked at, at once, when the base branch is searched for.
+const SEARCH_CONCURRENCY = 8
+
 // Reads the project's settings from its base branch: the committed .agent-queue.json of origin/<branch>, never the
-// working tree of the checkout.
+// working tree of the checkout. Everything is decided from one picture of origin's branches as the clone knows them,
+// and each copy of the file is read once, exactly (./base-branch.ts): the result's settings come from the very commit
+// in `source` that the choice was made on.
 // - A caller that knows the base branch names it (`options.branch`), and reading starts there.
 // - Otherwise reading starts at the repository's default branch. When that branch has no file, the project may be
 //   connected on another base branch (the connection commit goes only to the branch the owner chose, Ф1): the base
-//   branch is then the branch of origin whose file names that very branch (`baseBranch`) — the file the connection
-//   wizard wrote there. A file on any other branch (a task's branch, a branch made from the base) names the base, not
-//   its own branch, and does not count.
-// A file that names another base branch hands over to the file of that branch, which must name its own branch: the
-// settings are always those of the base branch they name.
+//   branch is then the branch of origin whose copy names that very branch in `baseBranch` — the file the connection
+//   wizard wrote there. A copy on any other branch (a task's branch, a branch made from the base) names the base, not
+//   its own branch, and does not count. When no copy names its own branch, the base branch's own file may be broken:
+//   a copy that names a branch which has a copy defers to it, and the others — a copy whose base branch cannot be told
+//   (not JSON, `baseBranch` not a branch name, not a readable file), a copy that names a branch without a copy — may be
+//   the base's own. One is reported with its problems (a wrong field named), several are `ambiguous`.
+// A copy that names another base branch hands over to that branch by its `baseBranch` alone — its other fields are
+// not checked, it is not the base branch's file — and the file of that branch must name its own branch: the settings
+// are always those of the base branch they name.
 export async function readProjectSettings(
   machine: Machine,
   checkout: string,
   options: { readonly branch?: string } = {},
 ): Promise<ReadSettingsResult> {
-  let repositoryDefault: Promise<string> | null = null
-  const fallback = () => (repositoryDefault ??= defaultBranch(machine, checkout))
-  const readFrom = async (branch: string): Promise<ReadSettingsResult> => {
-    const file = await readBaseBranchFile(machine, checkout, branch, SETTINGS_FILE)
-    const source = { branch: file.branch, commit: file.commit }
-    if (!file.found) {
-      return { ok: false, kind: 'missing', error: `${REMOTE}/${branch} has no ${SETTINGS_FILE}`, source }
-    }
-    const checked = checkSettingsText(file.text)
-    if (!checked.ok) return invalid(source, checked.problems)
-    return { ok: true, settings: { ...checked.settings, baseBranch: checked.settings.baseBranch ?? (await fallback()) }, source }
-  }
-  // The default branch has no file: the branch of origin whose file names it.
-  const discover = async (missing: Extract<ReadSettingsResult, { kind: 'missing' }>): Promise<ReadSettingsResult> => {
-    const branches = (await remoteBranches(machine, checkout)).filter(({ branch }) => branch !== missing.source.branch)
-    const texts = await textsInCommits(machine, checkout, branches.map(({ commit }) => commit), SETTINGS_FILE)
-    const named = branches
-      .filter(({ branch, commit }) => namesOwnBranch(texts.get(commit), branch))
-      .map(({ branch }) => branch)
-      .sort()
-    const [only] = named
-    if (only === undefined) {
-      const error = `${missing.error}, and no other branch of ${REMOTE} has one that names its own branch as baseBranch`
-      return { ...missing, error }
-    }
-    if (named.length > 1) {
-      const list = named.map((branch) => `${REMOTE}/${branch}`).join(', ')
-      const error = `${SETTINGS_FILE}: ${list} each have one that names its own branch as baseBranch; which one is the base branch is not known`
-      return { ok: false, kind: 'ambiguous', error, branches: named }
-    }
-    return readFrom(only)
-  }
   try {
-    const start = options.branch ?? (await fallback())
-    const first = await readFrom(start)
-    if (!first.ok && first.kind === 'missing' && options.branch === undefined) return await discover(first)
-    if (!first.ok || first.settings.baseBranch === start) return first
-    const base = first.settings.baseBranch
-    const second = await readFrom(base)
-    if (!second.ok && second.kind === 'missing') {
-      return invalid(first.source, [
-        { field: 'baseBranch', message: `names the base branch ${base}, but ${REMOTE}/${base} has no ${SETTINGS_FILE}` },
-      ])
-    }
-    if (second.ok && second.settings.baseBranch !== base) {
-      return invalid(second.source, [
-        {
-          field: 'baseBranch',
-          message: `names the base branch ${second.settings.baseBranch}, while the file of ${REMOTE}/${start} names ${base}: the base branch's own file must name it`,
-        },
-      ])
-    }
-    return second
+    return await new SettingsReader(machine, checkout).read(options.branch)
   } catch (error) {
     return { ok: false, kind: 'unreadable', error: `${SETTINGS_FILE}: ${errorMessage(error)}` }
   }
 }
 
-// Whether a settings file's text names `branch` as its base branch: the mark of the base branch's own file. Only its
-// `baseBranch` counts here; the whole file is checked when it is read.
-function namesOwnBranch(text: string | undefined, branch: string): boolean {
-  if (text === undefined) return false
+// One copy of the settings file on a branch, at the commit of the picture: its text, why it is not a readable file,
+// or none.
+type Copy = BaseBranchCommit &
+  (
+    | { readonly state: 'file'; readonly text: string }
+    | { readonly state: 'unreadable'; readonly reason: string }
+    | { readonly state: 'none' }
+  )
+type FileCopy = Extract<Copy, { state: 'file' }>
+
+// Where a copy says the base branch is, from its `baseBranch` alone: a branch it names, the repository's default branch
+// when it names none, or `unknown` when that cannot be told — the text is not a JSON object, or its `baseBranch` is not
+// a branch name.
+type NamedBase = { readonly kind: 'named'; readonly branch: string } | { readonly kind: 'default' } | { readonly kind: 'unknown' }
+
+function namedBase(text: string): NamedBase {
+  let json: unknown
   try {
-    const json: unknown = JSON.parse(text.replace(/^\uFEFF/, ''))
-    return isObject(json) && json.baseBranch === branch
+    json = JSON.parse(text)
   } catch {
-    return false
+    return { kind: 'unknown' }
   }
+  if (!isObject(json)) return { kind: 'unknown' }
+  if (!Object.hasOwn(json, 'baseBranch')) return { kind: 'default' }
+  const branch = json.baseBranch
+  return typeof branch === 'string' && branchNameProblem(branch) === null ? { kind: 'named', branch } : { kind: 'unknown' }
+}
+
+class SettingsReader {
+  private branches: Map<string, string> | null = null
+  private repositoryDefault: Promise<string> | null = null
+  private readonly entries = new Map<string, Promise<CommitEntry>>()
+  private readonly texts = new Map<string, Promise<string>>()
+
+  constructor(
+    private readonly machine: Machine,
+    private readonly checkout: string,
+  ) {}
+
+  async read(branch: string | undefined): Promise<ReadSettingsResult> {
+    if (branch !== undefined) {
+      const notBranch = branchNameProblem(branch)
+      if (notBranch !== null) throw new Error(`${JSON.stringify(branch)} is not a branch name: ${notBranch}`)
+    }
+    const start = branch ?? (await this.defaultBranch())
+    const commit = (await this.picture()).get(start)
+    if (commit === undefined) {
+      throw new Error(`this clone has no ${REMOTE}/${start}: there is no such branch, or it was not fetched yet`)
+    }
+    const copy = await this.copyAt(start, commit)
+    if (copy.state === 'file') return this.handOver(copy)
+    if (copy.state === 'unreadable') throw new Error(`${REMOTE}/${start}: ${copy.reason}`)
+    const error = `${REMOTE}/${start} has no ${SETTINGS_FILE}`
+    const missing = { ok: false, kind: 'missing', error, source: { branch: start, commit } } as const
+    return branch === undefined ? this.search(missing) : missing
+  }
+
+  // The default branch has no file: the branch of origin whose copy is the base branch's own.
+  private async search(missing: Extract<ReadSettingsResult, { kind: 'missing' }>): Promise<ReadSettingsResult> {
+    const others = [...(await this.picture())].filter(([branch]) => branch !== missing.source.branch)
+    const copies = await mapLimit(others, SEARCH_CONCURRENCY, ([branch, commit]) => this.copyAt(branch, commit))
+    const own = copies.filter((copy): copy is FileCopy => {
+      if (copy.state !== 'file') return false
+      const base = namedBase(copy.text)
+      return base.kind === 'named' && base.branch === copy.branch
+    })
+    if (own.length === 1 && own[0] !== undefined) return this.settle(own[0])
+    if (own.length > 1) return ambiguous(own.map((copy) => [copy.branch, 'names its own branch as baseBranch']))
+    // No copy names its own branch: the base branch's own file may be broken. A copy that names a branch which has a
+    // copy itself defers to that branch (a task's branch made from the base names the base). The rest may be the
+    // base's own: a copy whose base branch cannot be told, or one that names a branch without a copy (a mistyped
+    // baseBranch). If every copy names another one, they all are.
+    const copied = copies.filter((copy): copy is Exclude<Copy, { state: 'none' }> => copy.state !== 'none')
+    const branches = new Set(copied.map((copy) => copy.branch))
+    const defers = (copy: (typeof copied)[number]): boolean => {
+      if (copy.state !== 'file') return false
+      const base = namedBase(copy.text)
+      if (base.kind === 'unknown') return false
+      const target = base.kind === 'named' ? base.branch : missing.source.branch
+      return target !== copy.branch && branches.has(target)
+    }
+    const undeferred = copied.filter((copy) => !defers(copy))
+    const candidates = undeferred.length > 0 ? undeferred : copied
+    const [only] = candidates
+    if (only === undefined) {
+      const error = `${missing.error}, and no other branch of ${REMOTE} has one`
+      return { ...missing, error }
+    }
+    if (candidates.length === 1) {
+      if (only.state === 'file') return this.handOver(only)
+      throw new Error(`${REMOTE}/${only.branch}: ${only.reason}`)
+    }
+    return ambiguous(
+      await Promise.all(
+        candidates.map(async (copy): Promise<[string, string]> => {
+          if (copy.state === 'unreadable') return [copy.branch, copy.reason]
+          const result = await this.handOver(copy)
+          return [copy.branch, result.ok ? `reads as the settings of ${REMOTE}/${result.source.branch}` : result.error]
+        }),
+      ),
+    )
+  }
+
+  // A copy that names another base branch hands over to that branch's own file, by its `baseBranch` alone.
+  private async handOver(copy: FileCopy): Promise<ReadSettingsResult> {
+    const named = namedBase(copy.text)
+    if (named.kind === 'unknown') return this.settle(copy)
+    const base = named.kind === 'named' ? named.branch : await this.defaultBranch()
+    if (base === copy.branch) return this.settle(copy)
+    const naming =
+      named.kind === 'named' ? `names the base branch ${base}` : `names no base branch, so it is the default branch ${base}`
+    const source = { branch: copy.branch, commit: copy.commit }
+    const commit = (await this.picture()).get(base)
+    if (commit === undefined) {
+      return invalid(source, [{ field: 'baseBranch', message: `${naming}, but this clone has no ${REMOTE}/${base}` }])
+    }
+    const target = await this.copyAt(base, commit)
+    if (target.state === 'none') {
+      return invalid(source, [{ field: 'baseBranch', message: `${naming}, but ${REMOTE}/${base} has no ${SETTINGS_FILE}` }])
+    }
+    if (target.state === 'unreadable') throw new Error(`${REMOTE}/${base}: ${target.reason}`)
+    const result = await this.settle(target)
+    if (result.ok && result.settings.baseBranch !== base) {
+      const message = `names the base branch ${result.settings.baseBranch}, while the file of ${REMOTE}/${copy.branch} names ${base}: the base branch's own file must name it`
+      return invalid(result.source, [{ field: 'baseBranch', message }])
+    }
+    return result
+  }
+
+  // The whole check of a copy, the defaults filled in.
+  private async settle(copy: FileCopy): Promise<ReadSettingsResult> {
+    const source = { branch: copy.branch, commit: copy.commit }
+    const checked = checkSettingsText(copy.text)
+    if (!checked.ok) return invalid(source, checked.problems)
+    const baseBranch = checked.settings.baseBranch ?? (await this.defaultBranch())
+    return { ok: true, settings: { ...checked.settings, baseBranch }, source }
+  }
+
+  private async copyAt(branch: string, commit: string): Promise<Copy> {
+    let entry = this.entries.get(commit)
+    if (entry === undefined) {
+      entry = commitEntry(this.machine, this.checkout, commit, SETTINGS_FILE)
+      this.entries.set(commit, entry)
+    }
+    const found = await entry
+    if (found.kind === 'none') return { branch, commit, state: 'none' }
+    if (found.kind === 'other') return { branch, commit, state: 'unreadable', reason: `${SETTINGS_FILE} is ${found.what}, not a file` }
+    if (found.size > MAX_FILE_BYTES) {
+      const reason = `${SETTINGS_FILE} is ${found.size} bytes, more than the ${MAX_FILE_BYTES} read`
+      return { branch, commit, state: 'unreadable', reason }
+    }
+    let text = this.texts.get(found.blob)
+    if (text === undefined) {
+      text = blobText(this.machine, this.checkout, found)
+      this.texts.set(found.blob, text)
+    }
+    return { branch, commit, state: 'file', text: await text }
+  }
+
+  // origin's branches and their commits, read once.
+  private async picture(): Promise<Map<string, string>> {
+    this.branches ??= new Map(
+      (await remoteBranches(this.machine, this.checkout)).map(({ branch, commit }) => [branch, commit] as const),
+    )
+    return this.branches
+  }
+
+  private defaultBranch(): Promise<string> {
+    this.repositoryDefault ??= defaultBranch(this.machine, this.checkout)
+    return this.repositoryDefault
+  }
+}
+
+function ambiguous(branches: readonly (readonly [string, string])[]): ReadSettingsResult {
+  const sorted = [...branches].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  const reasons = sorted.map(([branch, reason]) => `${REMOTE}/${branch}: ${reason}`).join('; ')
+  const error = `${SETTINGS_FILE}: which branch of ${REMOTE} is the base branch is not known — ${reasons}`
+  return { ok: false, kind: 'ambiguous', error, branches: sorted.map(([branch]) => branch) }
+}
+
+// `work` for each item, at most `limit` at a time; the results in the items' order.
+async function mapLimit<T, R>(items: readonly T[], limit: number, work: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array<R>(items.length)
+  let next = 0
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next++
+      results[index] = await work(items[index] as T)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return results
 }
 
 function invalid(source: BaseBranchCommit, problems: readonly SettingsProblem[]): ReadSettingsResult {
