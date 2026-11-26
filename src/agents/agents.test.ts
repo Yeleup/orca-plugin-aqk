@@ -8,10 +8,20 @@ import type { Machine } from '../platform/machine'
 import { dataDirectory, dataName, dataPath } from '../platform/paths'
 import type { AgentRole, ProjectAgents } from '../project/settings'
 import { fakeOrca, type FakeOrca } from '../testing/fake-orca'
-import { Agents, issueTask, ORCA_TEXT_MAX, type AgentLaunch, type LaunchFiles, type LaunchRequest, type TaskRef } from './agents'
+import {
+  Agents,
+  issueTask,
+  ORCA_TEXT_MAX,
+  type AgentLaunch,
+  type LaunchFiles,
+  type LaunchRequest,
+  type ProjectRef,
+  type StopResult,
+  type TaskRef,
+} from './agents'
 import { implementerTask, launchPrompt, reviewerTask } from './task-text'
 
-const PROJECT = 'Example-Org/Sample-Shop'
+const PROJECT: ProjectRef = { id: 'Example-Org/Sample-Shop', hostId: 'local' }
 const DATA_RULE = 'Никаких данных покупателей: имён, телефонов, адресов, токенов и ключей.'
 // Agents of the settings other than the defaults: each role gets the agent of its own field.
 const AGENTS: ProjectAgents = { implementer: 'codex', reviewer: 'claude', solver: 'gemini', start: 'opencode' }
@@ -60,9 +70,14 @@ async function launched(rig: Rig, issue: number, role: AgentRole, agents?: Proje
   return result.launch
 }
 
+// The name of a project's directory in the data directory: from its id and its host.
+function projectName(project: ProjectRef): string {
+  return dataName(JSON.stringify([project.id, project.hostId]))
+}
+
 // The directory of launch `n` of a task in the data directory.
-function launchDir(rig: Rig, key: string, n: number): string {
-  return dataPath(rig.orca.machine, rig.dataDir, 'projects', dataName(PROJECT), key, 'agents', String(n))
+function launchDir(rig: Rig, key: string, n: number, project: ProjectRef = PROJECT): string {
+  return dataPath(rig.orca.machine, rig.dataDir, 'projects', projectName(project), key, 'agents', String(n))
 }
 
 function json(orca: FakeOrca, path: string): unknown {
@@ -91,15 +106,47 @@ async function settle(): Promise<void> {
 
 test('Запуски решателя и агента старта берут агентов своих ролей из настроек проекта; каждый запуск задачи — свой номер и каталог с заданием, записью до запроса к Orca и записью её ответа; подсказка длиннее 4096 знаков — ошибка, Orca не вызвана', async () => {
   const orca = fakeOrca()
-  const r = await mount(orca)
+  const first = dataPath(orca.machine, dataDirectory(orca.machine), 'projects', projectName(PROJECT), 'issue-12', 'agents', '1')
+  const firstFiles: LaunchFiles = { dir: first, taskFile: `${first}/task.md`, reportFile: `${first}/report.md` }
+  // The disk takes its time with launch 1's record before the request.
+  const recordWrite = gate()
+  const machine: Machine = {
+    ...orca.machine,
+    createText: async (path, text) => {
+      if (path === `${first}/launching.json`) await recordWrite.promise
+      return orca.machine.createText(path, text)
+    },
+  }
+  const r = await mount(orca, { machine })
   const t0 = orca.clock.now()
 
-  // The implementer of issue 12; Orca holds its answer back: the record before the request is on disk, Orca's is not.
+  // The implementer of issue 12. Until the record before the request is written, Orca is not asked; the moment Orca
+  // gets the call, the task file and that record are on disk, and Orca's answer is not. Orca then holds its answer
+  // back, and the launch is pending.
+  const atCall: unknown[] = []
+  orca.onLaunch = () => {
+    atCall.push({
+      task: orca.machine.files.get(firstFiles.taskFile),
+      launching: json(orca, `${first}/launching.json`),
+      answer: orca.machine.files.has(`${first}/launch.json`),
+    })
+  }
   const held = gate()
   orca.launchGate = held.promise
   const implementing = r.agents.launch(request(12, 'implementer'))
   await settle()
-  const first = launchDir(r, 'issue-12', 1)
+  assert.equal(orca.machine.files.get(firstFiles.taskFile), request(12, 'implementer').taskText(firstFiles))
+  assert.deepEqual(orca.host.calls, [])
+  recordWrite.open()
+  await settle()
+  assert.deepEqual(atCall, [
+    {
+      task: request(12, 'implementer').taskText(firstFiles),
+      launching: { role: 'implementer', agent: 'codex', language: 'ru', workspaceId: 'workspace-issue-12', launchedAt: t0 },
+      answer: false,
+    },
+  ])
+  orca.onLaunch = null
   assert.deepEqual(json(orca, `${first}/launching.json`), {
     role: 'implementer',
     agent: 'codex',
@@ -201,7 +248,7 @@ test('Запуски решателя и агента старта берут а
   // A data directory whose paths make the prompt longer than Orca takes: an error, and Orca is not asked. The prompt
   // grows by two characters for each character of the directory (the task file and the report file).
   const promptOf = (dataDir: string) => {
-    const dir = dataPath(orca.machine, dataDir, 'projects', dataName(PROJECT), 'issue-7', 'agents', '1')
+    const dir = dataPath(orca.machine, dataDir, 'projects', projectName(PROJECT), 'issue-7', 'agents', '1')
     return launchPrompt('ru', `${dir}/task.md`, `${dir}/report.md`)
   }
   let longest = '/data/'
@@ -312,6 +359,21 @@ test('Ошибка Orca при запуске → ошибка с именем �
     leftOpen.error,
     'the agent "codex" (agents.implementer in .agent-queue.json) was launched, but its launch could not be recorded (ENOSPC: no space left on device); its terminal terminal-2 could not be closed: action_failed: the terminal did not close',
   )
+  // Orca refused the launch, and its refusal could not be recorded either: the error gives both, keeps the kind of an
+  // agent Orca does not know, and says that a stop will report the launch's terminal as unknown.
+  const refusedUnrecorded = await r.agents.launch(request(19, 'implementer', { ...AGENTS, implementer: 'nosuch-agent' }))
+  assert.deepEqual(refusedUnrecorded, {
+    ok: false,
+    kind: 'unknown-agent',
+    role: 'implementer',
+    agent: 'nosuch-agent',
+    error:
+      'Orca does not know the agent "nosuch-agent" (agents.implementer in .agent-queue.json); and this could not be recorded (ENOSPC: no space left on device): a stop reports launch 1 as one whose terminal is unknown',
+  })
+  assert.deepEqual(
+    (await r.agents.stop(issueTask(PROJECT, 19))).failed.map((failure) => [failure.launch, failure.terminalId]),
+    [[1, null]],
+  )
   await r.worker.deactivate()
 
   // The task file could not be written: an error with the reason, and Orca is not asked.
@@ -332,11 +394,18 @@ test('Ошибка Orca при запуске → ошибка с именем �
 
 test('Запись запуска создаётся один раз: запись, которая уже есть, не переписывается — запуск — ошибка, Orca не вызвана', async () => {
   const orca = fakeOrca()
-  const r = await mount(orca)
-  // A launching.json in the directory of launch 1 that this plugin did not write there.
-  const dir = launchDir(r, 'issue-18', 1)
+  // Another writer puts a launching.json into the launch's directory right after the launch took its number.
   const foreign = '{"role":"implementer","agent":"claude","language":"en","workspaceId":"workspace-elsewhere","launchedAt":1}\n'
-  orca.machine.files.set(`${dir}/launching.json`, foreign)
+  const machine: Machine = {
+    ...orca.machine,
+    createText: async (path, text) => {
+      const created = await orca.machine.createText(path, text)
+      if (path.endsWith('/task.md')) orca.machine.files.set(path.replace(/task\.md$/, 'launching.json'), foreign)
+      return created
+    },
+  }
+  const r = await mount(orca, { machine })
+  const dir = launchDir(r, 'issue-18', 1)
   const result = await r.agents.launch(request(18, 'implementer'))
   assert.deepEqual(result, {
     ok: false,
@@ -409,6 +478,9 @@ test('Остановка во время запуска дожидается о�
   const held = gate()
   orca.launchGate = held.promise
   const launching = r.agents.launch(request(16, 'implementer'))
+  // The stop begins once Orca has the request (a launch that has not asked Orca yet is refused instead).
+  await settle()
+  assert.equal(orca.host.callsOf('agent.launch').length, 1)
   let stopped = false
   const stopping = r.agents.stop(issueTask(PROJECT, 16)).then((result) => {
     stopped = true
@@ -562,9 +634,9 @@ test('Ключ задачи не из слов и не issue-<N> — ошибк�
   const r = await mount(fakeOrca())
   assert.throws(() => issueTask(PROJECT, 0), /not an issue number: 0/)
   assert.throws(() => issueTask(PROJECT, 1.5), /not an issue number/)
-  // Not words, or `issue-` without a plain issue number (`issue-007` would be issue 7's directory a second time).
+  // Neither `issue-<N>` (N from 1, no leading zero) nor lower-case words of letters joined by hyphens.
   const keys = ['../issue-1', 'Issue-1', 'issue 1', 'issue_1', '-issue', 'issue-', 'issue--1', '', 'mvp/start', '..']
-  for (const key of [...keys, 'issue-0', 'issue-007', 'issue-start']) {
+  for (const key of [...keys, '42', 'issue-0', 'issue-007', 'mvp-2']) {
     assert.throws(() => r.agents.launches({ project: PROJECT, key }), /not a task key/)
     await assert.rejects(r.agents.stop({ project: PROJECT, key }), /not a task key/)
     const failed = await r.agents.launch({ ...request(1, 'implementer'), task: { project: PROJECT, key } })
@@ -572,14 +644,209 @@ test('Ключ задачи не из слов и не issue-<N> — ошибк�
   }
   assert.deepEqual(r.orca.host.calls, [])
   assert.deepEqual([...r.orca.machine.files.keys()], [])
-  // A queue task and other work of the project have keys of words; any project id gives a plain directory name.
-  const start = await r.agents.launch({ ...request(1, 'start'), task: { project: '../../C:\\Other Project', key: 'mvp-start' } })
+  // Both forms pass: a queue task's `issue-<N>`, and words — also words that begin with `issue`. Any project id and
+  // host give a plain directory name.
+  const odd: ProjectRef = { id: '../../C:\\Other Project', hostId: 'ssh:Build Box' }
+  const start = await r.agents.launch({ ...request(1, 'start'), task: { project: odd, key: 'mvp-start' } })
   assert.ok(start.ok, JSON.stringify(start))
   assert.equal(start.launch.agent, 'opencode')
-  assert.equal(
-    start.launch.dir,
-    `${r.dataDir}/projects/${dataName('../../C:\\Other Project')}/mvp-start/agents/1`,
+  assert.equal(start.launch.dir, `${r.dataDir}/projects/${projectName(odd)}/mvp-start/agents/1`)
+  assert.match(projectName(odd), /^c-other-project-ssh-build-box-[0-9a-f]{12}$/)
+  const triage = await r.agents.launch({ ...request(1, 'solver'), task: { project: PROJECT, key: 'issue-triage' } })
+  assert.ok(triage.ok && triage.launch.dir === launchDir(r, 'issue-triage', 1), JSON.stringify(triage))
+  const queued = await r.agents.launch(request(1, 'implementer'))
+  assert.ok(queued.ok && queued.launch.dir === launchDir(r, 'issue-1', 1), JSON.stringify(queued))
+  await r.worker.deactivate()
+})
+
+test('Две копии проекта с одним id на разных хостах: у каждой свои записи запусков, остановка закрывает только терминалы своей копии и не ждёт запусков другой', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const remote: ProjectRef = { id: PROJECT.id, hostId: 'ssh:build-box' }
+  const onRemote = (issue: number, role: AgentRole): LaunchRequest => ({
+    ...request(issue, role),
+    task: issueTask(remote, issue),
+    workspaceId: `workspace-remote-issue-${issue}`,
+  })
+  const local = await launched(r, 12, 'implementer')
+  const copy = await r.agents.launch(onRemote(12, 'implementer'))
+  assert.ok(copy.ok, JSON.stringify(copy))
+  // The same task number on both hosts: each copy its own launch 1, in its own directory.
+  assert.deepEqual([local.number, copy.launch.number], [1, 1])
+  assert.equal(local.dir, launchDir(r, 'issue-12', 1))
+  assert.equal(copy.launch.dir, launchDir(r, 'issue-12', 1, remote))
+  assert.notEqual(local.dir, copy.launch.dir)
+
+  assert.deepEqual(await r.agents.stop(issueTask(remote, 12)), { closed: [copy.launch.terminalId], failed: [] })
+  assert.equal(orca.terminals.get(local.terminalId)?.open, true)
+  assert.deepEqual(
+    r.agents.launches(issueTask(PROJECT, 12)).map((record) => [record.number, record.outcome, record.closed]),
+    [[1, 'launched', false]],
   )
-  assert.match(dataName('../../C:\\Other Project'), /^c-other-project-[0-9a-f]{12}$/)
+
+  // The bookkeeping of launches and stops is per copy too: while Orca holds a launch of the local copy, a stop of the
+  // other copy does not wait for it, and a launch of the other copy is not refused by the local copy's stop.
+  const held = gate()
+  orca.launchGate = held.promise
+  const waiting = r.agents.launch(request(12, 'reviewer'))
+  await settle()
+  let remoteStopped = false
+  const remoteStop = r.agents.stop(issueTask(remote, 12)).then((result) => {
+    remoteStopped = true
+    return result
+  })
+  await settle()
+  assert.equal(remoteStopped, true)
+  assert.deepEqual(await remoteStop, { closed: [], failed: [] })
+  const localStop = r.agents.stop(issueTask(PROJECT, 12))
+  orca.launchGate = null
+  const other = await r.agents.launch(onRemote(12, 'reviewer'))
+  assert.ok(other.ok, JSON.stringify(other))
+  held.open()
+  const reviewer = await waiting
+  assert.ok(reviewer.ok, JSON.stringify(reviewer))
+  assert.deepEqual(await localStop, { closed: [local.terminalId, reviewer.launch.terminalId], failed: [] })
+  assert.equal(orca.terminals.get(other.launch.terminalId)?.open, true)
+  await r.worker.deactivate()
+})
+
+test('Записи запуска читаются каждая сама по себе: без task.md запуск останавливается, нечитаемая запись — ошибка этого запуска, а остальные терминалы закрыты, и после перезапуска воркера', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const task = issueTask(PROJECT, 30)
+  const first = await launched(r, 30, 'implementer')
+  const second = await launched(r, 30, 'reviewer')
+  const third = await launched(r, 30, 'solver')
+  assert.deepEqual([first.terminalId, second.terminalId, third.terminalId], ['terminal-1', 'terminal-2', 'terminal-3'])
+  await r.worker.deactivate()
+
+  // The task's launch directories cannot be listed: the stop says so and closes nothing; it does not reject.
+  const agentsDir = first.dir.slice(0, first.dir.lastIndexOf('/'))
+  const unlisted = await mount(orca, {
+    machine: {
+      ...orca.machine,
+      listNames: (path) => {
+        throw new Error(`EACCES: permission denied, scandir '${path}'`)
+      },
+    },
+  })
+  assert.throws(() => unlisted.agents.launches(task), /EACCES/)
+  assert.deepEqual(await unlisted.agents.stop(task), {
+    closed: [],
+    failed: [
+      { launch: null, terminalId: null, error: `the launches of issue-30 could not be listed: EACCES: permission denied, scandir '${agentsDir}'` },
+    ],
+  })
+  assert.deepEqual(closes(orca), [])
+  await unlisted.worker.deactivate()
+
+  // Launch 1 lost its task file, launch 2's answer cannot be read: launch 1 and 3 are stopped all the same, launch 2
+  // is an error with the reason.
+  const firstLaunching = orca.machine.files.get(`${first.dir}/launching.json`)
+  orca.machine.files.delete(first.taskFile)
+  const denied = `EACCES: permission denied, open '${second.dir}/launch.json'`
+  const machine: Machine = {
+    ...orca.machine,
+    readText: (path) => {
+      if (path === `${second.dir}/launch.json`) throw new Error(denied)
+      return orca.machine.readText(path)
+    },
+  }
+  const restarted = await mount(orca, { machine })
+  assert.deepEqual(
+    restarted.agents.launches(task).map((record) => [record.number, record.outcome, record.terminalId, record.agent]),
+    [
+      [1, 'launched', 'terminal-1', 'codex'],
+      [2, 'unreadable', null, 'claude'],
+      [3, 'launched', 'terminal-3', 'gemini'],
+    ],
+  )
+  assert.deepEqual(await restarted.agents.stop(task), {
+    closed: ['terminal-1', 'terminal-3'],
+    failed: [
+      {
+        launch: 2,
+        terminalId: null,
+        error: `the records of launch 2 (the agent "claude") cannot be read: launch.json: ${denied}: its terminal, if any, is unknown`,
+      },
+    ],
+  })
+  assert.equal(orca.terminals.get('terminal-2')?.open, true)
+  // A new launch takes the number after the largest launch directory, not the one whose task file is gone; launch
+  // 1's records stay as they were.
+  const fourth = await restarted.agents.launch(request(30, 'implementer'))
+  assert.ok(fourth.ok && fourth.launch.number === 4, JSON.stringify(fourth))
+  assert.equal(orca.machine.files.get(`${first.dir}/launching.json`), firstLaunching)
+  assert.ok(!orca.machine.files.has(first.taskFile))
+  await restarted.worker.deactivate()
+
+  // Readable again after a restart: the stop closes launch 2's terminal and the new one, and not 1 and 3 again.
+  const again = await mount(orca)
+  assert.deepEqual(await again.agents.stop(task), { closed: ['terminal-2', 'terminal-4'], failed: [] })
+  assert.deepEqual(closes(orca), ['terminal-1', 'terminal-3', 'terminal-2', 'terminal-4'])
+  await again.worker.deactivate()
+})
+
+test('Остановка, которую начал taskText запуска, отклоняет этот запуск до запроса к Orca: терминал не открыт, после остановки задача запускается снова', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const task = issueTask(PROJECT, 43)
+  const stops: Promise<StopResult>[] = []
+  const result = await r.agents.launch({
+    ...request(43, 'implementer'),
+    taskText: (files) => {
+      // The caller's own code starts a stop of the task while the launch writes its task file.
+      stops.push(r.agents.stop(task))
+      return request(43, 'implementer').taskText(files)
+    },
+  })
+  const error = 'the agent "codex" (agents.implementer in .agent-queue.json) was not launched: the agents of issue-43 are being stopped'
+  assert.deepEqual(result, { ok: false, kind: 'launch-failed', role: 'implementer', agent: 'codex', error })
+  assert.equal(stops.length, 1)
+  assert.deepEqual(await stops[0], { closed: [], failed: [] })
+  assert.deepEqual(orca.host.callsOf('agent.launch'), [])
+  assert.equal(orca.terminals.size, 0)
+  assert.deepEqual(r.agents.launches(task).map((record) => [record.number, record.outcome, record.error]), [[1, 'failed', error]])
+  // After the stop the task launches again, as launch 2.
+  const again = await r.agents.launch(request(43, 'implementer'))
+  assert.ok(again.ok && again.launch.number === 2, JSON.stringify(again))
+  await r.worker.deactivate()
+})
+
+test('Номер запуска — следующий после наибольшего каталога запусков задачи: после 1000 запусков, отказы в том числе, задача запускается снова', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const task: TaskRef = { project: PROJECT, key: 'mvp-start' }
+  // 1000 earlier launches of the start agent, every one refused by Orca.
+  for (let n = 1; n <= 1000; n++) {
+    const dir = launchDir(r, 'mvp-start', n)
+    orca.machine.files.set(`${dir}/task.md`, '# Старт MVP\n')
+    orca.machine.files.set(
+      `${dir}/launching.json`,
+      JSON.stringify({ role: 'start', agent: 'opencode', language: 'ru', workspaceId: 'workspace-main-checkout', launchedAt: n }),
+    )
+    orca.machine.files.set(`${dir}/launch.json`, JSON.stringify({ terminalId: null, error: 'action_failed: Orca is busy' }))
+  }
+  const start = await r.agents.launch({
+    task,
+    role: 'start',
+    agents: AGENTS,
+    language: 'ru',
+    workspaceId: 'workspace-main-checkout',
+    taskText: () => '# Старт MVP\n',
+  })
+  assert.ok(start.ok, JSON.stringify(start))
+  assert.equal(start.launch.number, 1001)
+  assert.equal(start.launch.dir, launchDir(r, 'mvp-start', 1001))
+  const records = r.agents.launches(task)
+  assert.equal(records.length, 1001)
+  assert.deepEqual(
+    records.slice(-2).map((record) => [record.number, record.outcome, record.terminalId]),
+    [
+      [1000, 'failed', null],
+      [1001, 'launched', 'terminal-1'],
+    ],
+  )
+  assert.deepEqual(await r.agents.stop(task), { closed: ['terminal-1'], failed: [] })
   await r.worker.deactivate()
 })

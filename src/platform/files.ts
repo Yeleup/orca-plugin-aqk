@@ -1,7 +1,7 @@
-// The file operations of the real machine: whether a file can be run, reading a text file, and creating a file only if
-// it is absent, in a way no reader ever sees half written.
+// The file operations of the real machine: whether a file can be run, reading a text file, the names in a directory,
+// and creating a file only if it is absent, in a way no reader ever sees half written.
 import { randomUUID } from 'node:crypto'
-import { accessSync, constants, linkSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { accessSync, constants, linkSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { errorCode } from './errors'
 import type { Platform } from './machine'
@@ -19,6 +19,15 @@ export function isRunnableFile(path: string, system: Platform): boolean {
 export function readText(path: string): string | null {
   try {
     return readFileSync(path, 'utf8')
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return null
+    throw error
+  }
+}
+
+export function listNames(path: string): string[] | null {
+  try {
+    return readdirSync(path)
   } catch (error) {
     if (errorCode(error) === 'ENOENT') return null
     throw error

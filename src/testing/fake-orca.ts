@@ -3,9 +3,10 @@
 // workspaces' terminals, the ones the plugin opened with `agent.launch` and the ones the owner opened, the focused
 // workspace, and a fake computer with a clock that moves only when the test moves it. It refuses what Orca 1.4.274
 // refuses (out/main/index.js of its app.asar): `terminal.close` of a terminal the plugin neither opened nor has in the
-// focused workspace — action_failed, as for a terminal that is no longer there. `agent.launch` opens the agent's
-// terminal and answers (`launchGate` holds the answer back), `terminal.close` waits for `closeGate`; `terminal.list`
-// names the open terminals of a workspace, and says the list is cut short while `listTruncated` is set.
+// focused workspace — action_failed, as for a terminal that is no longer there. `agent.launch` shows the test its
+// params the moment it is called (`onLaunch`, before any wait), opens the agent's terminal and answers (`launchGate`
+// holds the answer back); `terminal.close` waits for `closeGate`; `terminal.list` names the open terminals of a
+// workspace, and says the list is cut short while `listTruncated` is set.
 import { hostError, mockHost, type MockHost } from 'orca/testing'
 import type { Platform } from '../platform/machine'
 import { fakeMachine, type FakeClock, type FakeMachine } from './fake-machine'
@@ -29,6 +30,8 @@ export type FakeOrca = {
   readonly terminals: Map<string, FakeTerminal>
   // The workspace the owner looks at.
   focused: string | null
+  // Called with the params of each `agent.launch` as Orca gets the call, before it waits or opens anything.
+  onLaunch: ((params: { workspaceId: string; agent: string; prompt?: string }) => void) | null
   // While set, `agent.launch` answers only once the promise settles.
   launchGate: Promise<void> | null
   // While set, `terminal.close` answers only once the promise settles.
@@ -47,6 +50,7 @@ export function fakeOrca(options: { readonly platform?: Platform; readonly resul
   const host = mockHost({
     results: {
       'agent.launch': async (params: { workspaceId: string; agent: string; prompt?: string }) => {
+        fake.onLaunch?.(params)
         const gate = fake.launchGate
         if (gate !== null) await gate
         const id = `terminal-${++opened}`
@@ -85,6 +89,7 @@ export function fakeOrca(options: { readonly platform?: Platform; readonly resul
     clock: machine.clock,
     terminals,
     focused: null,
+    onLaunch: null,
     launchGate: null,
     closeGate: null,
     listTruncated: false,

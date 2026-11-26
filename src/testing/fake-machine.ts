@@ -120,6 +120,18 @@ export function fakeMachine(options: FakeMachineOptions): FakeMachine {
       const key = find(path)
       return key === undefined ? null : (files.get(key) ?? null)
     },
+    // A directory exists while a file is in it (or deeper): the names of what is right inside it, in order.
+    listNames: (path) => {
+      const separators = windows ? /[\\/]/ : /\//
+      const parts = (file: string) => file.split(separators).filter((part) => part !== '')
+      const dir = parts(path)
+      const names = new Set<string>()
+      for (const file of files.keys()) {
+        const inside = parts(file)
+        if (inside.length > dir.length && dir.every((part, at) => same(part, inside[at] ?? ''))) names.add(inside[dir.length] ?? '')
+      }
+      return names.size === 0 ? null : [...names].sort()
+    },
     createText: async (path, text) => {
       if (options.createError) throw options.createError
       if (find(path) !== undefined) return false

@@ -11,7 +11,7 @@
 import { homedir } from 'node:os'
 import { posix, win32, type PlatformPath } from 'node:path'
 import { cwd, env, execPath, platform } from 'node:process'
-import { createText, isRunnableFile, readText } from './files'
+import { createText, isRunnableFile, listNames, readText } from './files'
 import { startProcess } from './process'
 
 export type Platform = 'linux' | 'darwin' | 'win32'
@@ -69,6 +69,9 @@ export type Machine = {
   isRunnableFile(path: string): boolean
   // The text of a file, or null when there is no such file.
   readText(path: string): string | null
+  // The names in a directory (files and directories), or null when there is no such directory. Throws on any other
+  // failure (no access, not a directory).
+  listNames(path: string): string[] | null
   // Creates the file with exactly this text unless the file exists, creating its directory first. True when this call
   // created it, false when it was already there; a reader never sees it half written. Throws on any other failure.
   createText(path: string, text: string): Promise<boolean>
@@ -91,6 +94,7 @@ export function realMachine(overrides: Partial<Machine> = {}): Machine {
     now: () => Date.now(),
     isRunnableFile: (path) => isRunnableFile(path, system),
     readText,
+    listNames,
     createText: (path, text) => createText(path, text),
     start: startProcess,
     ...overrides,
