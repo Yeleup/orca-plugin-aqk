@@ -16,7 +16,9 @@
 // - stop: closes the terminals the plugin opened for this task and has not closed yet, by the launch records, and no
 //   other terminal. It waits for the task's launches under way: one that has not asked Orca yet is refused, the
 //   terminal of one Orca is launching is closed once Orca answers; a launch of the task asked for while the stop runs
-//   is refused.
+//   is refused. The same for the sends to the task's agents (a message, or asking Orca again about one): one asked for
+//   before the stop that has not written anything yet is refused, one under way ends before the stop closes its
+//   terminal, and while the stop runs a message is an error with nothing written and Orca is not asked again.
 // - state: working, blocked, waiting or done. When `agents.list` of the launch's workspace names the launch's terminal,
 //   its answer is Orca's current state and since when (`stateStartedAt`); otherwise the latest `agent.status.changed`
 //   of that terminal this worker heard, whose start is known only when the event carries the main agent's state equal
@@ -37,10 +39,10 @@
 //   waits for a person — a permission, a trust prompt; anything else or nothing: the task did not reach it), by which
 //   the caller blocks the task with «сбой агента». A turn seen in time is no failure, however long the agent then
 //   works. A message is delivered the same way, with a mark of its own (started-<k>): its turn started when Orca's
-//   receipt said so (`turn_started`), when Orca showed a `working` that began no earlier than the message's send was
-//   recorded (its start known: the list, or an event with the main agent's state), or when the message's report file
-//   appeared; no turn DELIVERY_DEADLINE_MS after its terminal took the line (the time its outcome was recorded) — the
-//   failed delivery with what Orca shows of the agent, as for the task.
+//   receipt said so (`turn_started`), when Orca showed a `working` that began after the message's send was recorded —
+//   later than its millisecond (its start known: the list, or an event with the main agent's state) —, or when the
+//   message's report file appeared; no turn DELIVERY_DEADLINE_MS after its terminal took the line (the time its outcome
+//   was recorded) — the failed delivery with what Orca shows of the agent, as for the task.
 // - message: its text goes into the file message-<k>.md of the launch, and one line in the project's language naming
 //   that file and its own report file report-<k>.md is typed with Enter into the agent's terminal — only through Orca's
 //   CLI (src/platform/orca-terminal.ts), one way for any terminal of an agent, in a background worktree or the active
@@ -49,42 +51,47 @@
 //   worktree and the focus of Orca's window never move for a message (`terminal.focus`, `workspace.open`). Each run of
 //   the CLI carries the request id of the message, a UUID of the plugin: the same id again makes Orca repeat the
 //   outcome, or type the line then if it never saw the request, never twice. Only into the terminal of an agent the
-//   plugin launched: before every run of the CLI — the first send and every asking again — one check: the terminal is
-//   the one of the launch's record (launch.json) and the plugin has not closed it; otherwise the CLI does not run.
-//   An empty message is an error, and nothing is written. The send is recorded (sending-<k>.json) before the line is
-//   typed; its outcome (message-<k>.json) once it is known. «Not sent» only on proof that the line of this request was
-//   not typed: the CLI not found or not started, or Orca refusing the line itself on the first send; a receipt saying
-//   the terminal did not take it, in any attempt; the check failing on the first send — then not even the message's
-//   files are written. Anything else is unknown, also every refusal of asking again: nothing is recorded, the message
-//   stays the last input, and the next reading of the report asks Orca again with the same id, unless a send of it runs
-//   in this worker now. The sends of one launch and the askings again run one at a time, in the order of their
-//   numbers; while the outcome of a message is unknown, a new one is an error and nothing of it is written. The caller
-//   gets «taken» with the message's report file and whether the turn started, or an error with the reason and its
-//   kind: not sent, or unknown.
+//   plugin launched: before every run of the CLI — the first send and every asking again, before the search for the CLI
+//   (its `status` is a run too) and again right before `terminal send` — one check: the launch's directory is the real
+//   directory of its task and number in the data directory (no link or file on the way or in its place), its record
+//   (launch.json) a regular file there naming this terminal, and the plugin has not closed it; otherwise the CLI does
+//   not run. An empty message is an error, and nothing is written. The send is recorded (sending-<k>.json) before the
+//   line is typed; its outcome (message-<k>.json) once it is known. «Not sent» only on proof that the line of this
+//   request was not typed: the CLI not found or not started, or Orca refusing the line itself (in the form of Orca's
+//   refusal) on the first send; a receipt saying the terminal did not take it, in any attempt; the check failing on the
+//   first send — before the message's files, then none of them is written (a stop of the task waits for a send under
+//   way, so within one worker the check right before `terminal send` fails only when another worker closed the terminal
+//   meanwhile). Anything else is unknown, also every refusal of asking again: nothing is recorded, the message stays
+//   the last input, and the next reading of the report asks Orca again with the same id, unless a send of it runs in
+//   this worker now. The sends of one launch and the askings again run one at a time, in the order of their numbers;
+//   while the outcome of a message is unknown, a new one is an error and nothing of it is written. A send is under way
+//   in this worker from before its record can be seen until its outcome is settled. The caller gets «taken» with the
+//   message's report file and whether the turn started, or an error with the reason and its kind: not sent, or unknown.
 // - report: on the plugin's last input to the agent — the last message whose send is recorded and is not proven unsent,
-//   else the task. While that message's outcome is not known, the reading says why and waits. The report is read only
-//   from the last input's report file (report.md of the task, report-<k>.md of message k), by one rule: ready only when
-//   that report file is there, `agents.list` names the agent in «done», and that «done» began (`stateStartedAt`) no
-//   earlier than the file's last write, as precise as the file system keeps it
-//   (a fraction of a millisecond is not dropped) — an equal time is ready. The agent writes its report during its turn,
-//   so the «done» of that turn begins after the file's last write; an earlier «done» — of an earlier turn, from a late
-//   answer of the list, shown with an old start — began before it, and a file written after the «done» began is the
-//   draft of a turn still going on. Only the list confirms: an event never makes a report ready (it may lack the start,
-//   come late, or tell the end of the agent's session rather than of a turn), and an agent the list does not name has
-//   no confirmed report — the case «the agent is gone from Orca» of the watchdog (Ф10), after a restart of the worker
-//   as before. The text and the time of the file are read after Orca's answer, with nothing waited for or written
-//   between them and the reply, the time after the text — a file changed in between has the later time, so «not ready»
-//   — and the text read is the one returned. The rule assumes one computer: the data directory and Orca on it, so the
-//   file's time and `stateStartedAt` come from one clock; the report is written by the agent itself. Readiness is a
-//   reading at the moment of Orca's answer: the answer of `agents.list` this reading got and the report file read after
-//   it (the text, then the time) decide — nothing is waited for or written between that read of the file and the reply,
-//   a wait between Orca's answer and the last read of the file is allowed — and what Orca shows after its answer (the
-//   agent gone from the list, a new turn that left the file as it was) does not change it: the next reading shows it.
-//   The last input is read again after the last wait of the reading — Orca's answer, or a start mark it kept — so a
-//   message sent meanwhile is the input of this report (its outcome not recorded yet: the reading waits for it, with no
-//   new request to Orca), and from that read to the reply nothing is waited for. When the line was typed the layer does
-//   not find out: readiness does not depend on it. A message taken while the agent was still in its earlier turn does
-//   not make that turn's «done» confirm it: that «done» began before the last write of the message's report file.
+//   else the task. While that message's outcome is not known, the reading says why and waits — its start still kept on
+//   disk when its report file is there or a turn began after its send. The report is read only from the last input's
+//   report file (report.md of the task, report-<k>.md of message k), by one rule: ready only when that report file is
+//   there, `agents.list` names the agent in «done», and that «done» began (`stateStartedAt`) no earlier than the file's
+//   last write, as precise as the file system keeps it (a fraction of a millisecond is not dropped) — an equal time is
+//   ready. The agent writes its report during its turn, so the «done» of that turn begins after the file's last write;
+//   an earlier «done» — of an earlier turn, from a late answer of the list, shown with an old start — began before it,
+//   and a file written after the «done» began is the draft of a turn still going on. Only the list confirms: an event
+//   never makes a report ready (it may lack the start, come late, or tell the end of the agent's session rather than of
+//   a turn), and an agent the list does not name has no confirmed report — the case «the agent is gone from Orca» of
+//   the watchdog (Ф10), after a restart of the worker as before. The text and the time of the file are read after
+//   Orca's answer, with nothing waited for or written between them and the reply, the time after the text — a file
+//   changed in between has the later time, so «not ready» — and the text read is the one returned. The rule assumes one
+//   computer: the data directory and Orca on it, so the file's time and `stateStartedAt` come from one clock; the
+//   report is written by the agent itself. Readiness is a reading at the moment of Orca's answer: the answer of
+//   `agents.list` this reading got and the report file read after it (the text, then the time) decide — nothing is
+//   waited for or written between that read of the file and the reply, a wait between Orca's answer and the last read
+//   of the file is allowed — and what Orca shows after its answer (the agent gone from the list, a new turn that left
+//   the file as it was) does not change it: the next reading shows it. The last input is read again after the last wait
+//   of the reading — Orca's answer, or a start mark it kept — so a message sent meanwhile is the input of this report
+//   (its outcome not recorded yet: the reading waits for it, with no new request to Orca), and from that read to the
+//   reply nothing is waited for. When the line was typed the layer does not find out: readiness does not depend on it.
+//   A message taken while the agent was still in its earlier turn does not make that turn's «done» confirm it: that
+//   «done» began before the last write of the message's report file.
 // After a restart of the worker only the disk is kept: the events the former worker heard are gone, and an event of a
 // launch the new worker does not know yet (before its first reading of that launch's state or report) leaves no mark.
 //
@@ -350,7 +357,7 @@ export class Agents {
   // The terminals in which Orca has shown an agent's turn (`working`, in an event or in `agents.list`).
   private readonly turns = new Set<string>()
   // The latest start of a turn Orca showed in each terminal, when its start is known (`agents.list`, or an event with
-  // the main agent's state): a turn on a message is one that began no earlier than the message's send was recorded.
+  // the main agent's state): a turn on a message is one that began after the message's send was recorded.
   private readonly turnFrom = new Map<string, number>()
   // The launches this worker knows, by their terminal: a turn heard in one is kept on disk at once.
   private readonly known = new Map<string, AgentLaunch>()
@@ -359,8 +366,8 @@ export class Agents {
   // The messages whose line is being typed — a first send or asking again — in this worker now, by launch and number.
   private readonly typing = new Set<string>()
   // The sends of each launch (a message, or asking again about one), one at a time in the order asked, by its
-  // directory: the tail of its queue.
-  private readonly sends = new Map<string, Promise<void>>()
+  // directory: the tail of its queue, and the task's agents directory (a stop of the task waits for them).
+  private readonly sends = new Map<string, { readonly task: string; readonly tail: Promise<void> }>()
 
   constructor(options: AgentsOptions) {
     this.host = options.host
@@ -397,18 +404,21 @@ export class Agents {
     return running
   }
 
-  // Stops the agents of the task (taken as it is now): refuses its new launches while it runs, waits for its launches
-  // under way, then closes every terminal the plugin opened for the task and has not closed yet — and no other
-  // terminal. A launch the plugin has closed (its `closed` mark is there) is done, whatever else its records say. A
-  // terminal Orca refuses to close counts as closed when a complete list of its workspace no longer names it. A launch
-  // whose terminal is unknown — Orca's answer not recorded, its records unreadable — is reported with the reason, and the
-  // other launches are stopped all the same. Rejects only for a task key that is not one.
+  // Stops the agents of the task (taken as it is now): refuses its new launches and messages while it runs, waits for
+  // its launches under way and for the sends to its agents asked for before it (a message, or asking Orca again about
+  // one: one that has not written anything yet is refused, one under way ends first), then closes every terminal the
+  // plugin opened for the task and has not closed yet — and no other terminal. A launch the plugin has closed (its
+  // `closed` mark is there) is done, whatever else its records say. A terminal Orca refuses to close counts as closed
+  // when a complete list of its workspace no longer names it. A launch whose terminal is unknown — Orca's answer not
+  // recorded, its records unreadable — is reported with the reason, and the other launches are stopped all the same.
+  // Rejects only for a task key that is not one.
   async stop(task: TaskRef): Promise<StopResult> {
     const place = this.place(task)
     const key = place.dir
     this.stopping.set(key, (this.stopping.get(key) ?? 0) + 1)
     try {
       await Promise.all([...(this.pending.get(key) ?? [])].map((running) => running.catch(() => undefined)))
+      await Promise.all([...this.sends.values()].filter((queue) => queue.task === key).map((queue) => queue.tail))
       let records: LaunchRecord[]
       try {
         records = this.records(place)
@@ -457,8 +467,8 @@ export class Agents {
   // Orca's event `agent.status.changed`: the state of the agent in the event's terminal. Its start is known only from
   // the main agent's state equal to the event's; a late event of a state that began before the one already heard, both
   // starts known, does not replace it. A turn (`working`) in the terminal of a launch this worker knows is kept on disk
-  // at once as the start of its task — and of its last message, when the turn began no earlier than that message's send
-  // was recorded.
+  // at once as the start of its task — and of its last message, when the turn began after that message's send was
+  // recorded.
   onStatus(event: StatusEvent): void {
     const terminalId = event.terminalId
     if (terminalId === undefined || terminalId === '') return
@@ -514,13 +524,21 @@ export class Agents {
       // meanwhile is the input this report is about. From this read to the reply nothing waits.
       const input = this.lastInput(launch)
       if (input.message !== null && input.message.outcome === null) {
-        // Its outcome is not known: the report waits for it, with no new request to Orca in this reading.
+        // Its outcome is not known: the report waits for it, with no new request to Orca in this reading. The start of
+        // the agent on it — its report file there, or a turn begun after its send was recorded — is kept on disk all
+        // the same, and then the last input and its file are read again.
+        const started = kept.has(input.n) || this.startedOnDisk(launch, input.n)
         const file = this.readReportFile(input.reportFile)
+        if (!started && (file.text !== null || this.turnOn(launch, input))) {
+          await this.keepStarted(launch, input.n)
+          kept.add(input.n)
+          continue
+        }
         return {
           ready: false,
           state,
           listed,
-          started: this.startedOnDisk(launch, input.n),
+          started,
           reportFile: input.reportFile,
           reportExists: file.text !== null && file.writtenAt !== null,
           writtenAfterDone: false,
@@ -530,7 +548,7 @@ export class Agents {
       }
       // The start of the input is settled after Orca's answer and before its report file is read for the reply. On
       // disk already: started. Not yet, while the agent has started on it — a turn this worker saw (Orca's answer
-      // included; for a message, one that began no earlier than its send was recorded, or the start in Orca's receipt),
+      // included; for a message, one that began after its send was recorded, or the start in Orca's receipt),
       // or the report file read here — it is kept on disk first (a mark that cannot be read or kept is an error), and
       // the last input and its file are read again. So the reply's `started` is the mark on disk, and from the reads it
       // is given on to the reply nothing waits and nothing is written: the text first, then the time of the file's last
@@ -568,10 +586,17 @@ export class Agents {
   // before the line is typed and its outcome (message-<k>.json) once known. Only into the terminal of this launch's
   // record that the plugin has not closed: another terminal (the owner's, another agent's) is an error, nothing is
   // written and nothing runs. The sends of one launch run one at a time in the order asked; while the outcome of the
-  // previous message is not known, a new one is an error and nothing of it is written. An empty message is an error.
+  // previous message is not known, a new one is an error and nothing of it is written. While a stop of the task runs, a
+  // message is an error and nothing of it is written; a stop begun once it has written its files waits for it. An empty
+  // message is an error.
   message(launch: AgentLaunch, text: string): Promise<MessageResult> {
     if (text.trim() === '') return Promise.resolve(unsent('the message is empty'))
-    return this.oneAtATime(launch, async () => {
+    const taskDir = this.taskDir(launch)
+    if (taskDir === null) return Promise.resolve(unsent(this.notOwnTerminal(launch) ?? `not a launch of the plugin: ${launch.dir}`))
+    if (this.isStopping(taskDir)) return Promise.resolve(unsent(stoppingMessages(launch)))
+    return this.oneAtATime(launch, taskDir, async () => {
+      // A stop of the task begun while this waited for the sends before it: nothing of the message is written.
+      if (this.isStopping(taskDir)) return unsent(stoppingMessages(launch))
       const foreign = this.notOwnTerminal(launch)
       if (foreign !== null) return unsent(foreign)
       this.know(launch)
@@ -708,51 +733,54 @@ export class Agents {
     // One line: a line break would submit it before its end. Without its send recorded, message k is no input.
     if (/[\r\n]/.test(line)) return unsent(`message ${k}: the paths of its files break the one-line message`)
     const sending: SendingJson = { line, requestId: randomUUID(), sentAt: this.machine.now(), reportFile }
+    // Under way in this worker from before its send record can be seen until its outcome is settled: a reading of the
+    // report meanwhile waits for the outcome, and does not ask Orca itself.
+    const key = typingKey(launch, k)
+    this.typing.add(key)
     try {
-      await this.createRecord(launch.dir, sendingName(k), sending)
-    } catch (error) {
-      return unsent(`the send of message ${k} could not be recorded: ${errorMessage(error)}`)
+      try {
+        await this.createRecord(launch.dir, sendingName(k), sending)
+      } catch (error) {
+        return unsent(`the send of message ${k} could not be recorded: ${errorMessage(error)}`)
+      }
+      return await this.deliver(launch, k, sending, 'first')
+    } finally {
+      this.typing.delete(key)
     }
-    return this.deliver(launch, k, sending, 'first')
   }
 
   // Types the recorded line of message k into the launch's terminal as its request, and records the outcome once it is
   // known: the first send (from message), or asking again about a send whose outcome is not known (from report — the
   // same request id makes Orca repeat the outcome, or type the line then if it never saw the request). The boundary is
-  // checked right before the CLI runs. «Not taken» is recorded only on proof that the line of this request was not
+  // checked before every run of the CLI: before its search (whose `status` is a run too), and again once it is found,
+  // right before `terminal send`. «Not taken» is recorded only on proof that the line of this request was not
   // typed: on the first send, the boundary failing, the CLI not found or not started, or Orca refusing the line itself;
   // in any attempt, Orca's receipt saying the terminal did not take it. Asking again, no refusal decides anything: the
   // outcome stays unknown and nothing is written.
   private async deliver(launch: AgentLaunch, k: number, sending: SendingJson, attempt: 'first' | 'again'): Promise<MessageResult> {
-    const key = typingKey(launch, k)
-    this.typing.add(key)
-    try {
-      const target = `message ${k} to the agent "${launch.agent}" in terminal ${launch.terminalId}`
-      const unknown = (reason: string): MessageResult => ({ ok: false, outcome: 'unknown', error: `the outcome of ${target} is unknown: ${reason}` })
-      const notTaken = async (reason: string): Promise<MessageResult> => {
-        try {
-          await this.createRecord(launch.dir, outcomeName(k), { accepted: false, turnStarted: false, at: this.machine.now(), error: reason })
-        } catch (error) {
-          return unknown(`it was not sent (${reason}), but this could not be recorded (${errorMessage(error)}), so a reading of the report asks Orca about it again`)
-        }
-        return unsent(`${target} was not sent: ${reason}`)
-      }
-      const foreign = this.notOwnTerminal(launch)
-      if (foreign !== null) return attempt === 'first' ? notTaken(foreign) : unknown(foreign)
-      const sent = await this.terminalInput(launch.terminalId, sending.line, sending.requestId)
-      if (!sent.ok) return attempt === 'first' && sent.delivery === 'not-sent' ? notTaken(sent.error) : unknown(sent.error)
-      if (!sent.accepted) return notTaken(`the terminal did not take the line: ${sent.refusedReason ?? 'Orca gave no reason'}`)
+    const target = `message ${k} to the agent "${launch.agent}" in terminal ${launch.terminalId}`
+    const unknown = (reason: string): MessageResult => ({ ok: false, outcome: 'unknown', error: `the outcome of ${target} is unknown: ${reason}` })
+    const notTaken = async (reason: string): Promise<MessageResult> => {
       try {
-        await this.createRecord(launch.dir, outcomeName(k), { accepted: true, turnStarted: sent.turnStarted, at: this.machine.now(), error: null })
+        await this.createRecord(launch.dir, outcomeName(k), { accepted: false, turnStarted: false, at: this.machine.now(), error: reason })
       } catch (error) {
-        return unknown(`its terminal took the line, but this could not be recorded (${errorMessage(error)}), so a reading of the report asks Orca about it again`)
+        return unknown(`it was not sent (${reason}), but this could not be recorded (${errorMessage(error)}), so a reading of the report asks Orca about it again`)
       }
-      // The start Orca saw, kept as a mark too; when the disk refuses it, a reading of the report keeps it or says why.
-      if (sent.turnStarted) await this.keepStarted(launch, k).catch(() => undefined)
-      return { ok: true, reportFile: sending.reportFile, started: sent.turnStarted }
-    } finally {
-      this.typing.delete(key)
+      return unsent(`${target} was not sent: ${reason}`)
     }
+    const foreign = this.notOwnTerminal(launch)
+    if (foreign !== null) return attempt === 'first' ? notTaken(foreign) : unknown(foreign)
+    const sent = await this.terminalInput(launch.terminalId, sending.line, sending.requestId, () => this.notOwnTerminal(launch))
+    if (!sent.ok) return attempt === 'first' && sent.delivery === 'not-sent' ? notTaken(sent.error) : unknown(sent.error)
+    if (!sent.accepted) return notTaken(`the terminal did not take the line: ${sent.refusedReason ?? 'Orca gave no reason'}`)
+    try {
+      await this.createRecord(launch.dir, outcomeName(k), { accepted: true, turnStarted: sent.turnStarted, at: this.machine.now(), error: null })
+    } catch (error) {
+      return unknown(`its terminal took the line, but this could not be recorded (${errorMessage(error)}), so a reading of the report asks Orca about it again`)
+    }
+    // The start Orca saw, kept as a mark too; when the disk refuses it, a reading of the report keeps it or says why.
+    if (sent.turnStarted) await this.keepStarted(launch, k).catch(() => undefined)
+    return { ok: true, reportFile: sending.reportFile, started: sent.turnStarted }
   }
 
   // The last message's outcome not known and no send of it running in this worker now: Orca is asked again with its
@@ -760,12 +788,23 @@ export class Agents {
   private async askAgain(launch: AgentLaunch): Promise<{ readonly n: number; readonly error: string } | null> {
     const before = this.lastInput(launch)
     const message = before.message
-    if (message === null || message.outcome !== null || this.typing.has(typingKey(launch, before.n))) return null
-    const result = await this.oneAtATime(launch, async (): Promise<MessageResult | null> => {
-      // Settled while this waited for the sends before it: nothing to ask.
+    const key = typingKey(launch, before.n)
+    if (message === null || message.outcome !== null || this.typing.has(key)) return null
+    // While a stop of the task runs, Orca is not asked: the stop closes the terminal.
+    const taskDir = this.taskDir(launch)
+    const stopping = { n: before.n, error: `the outcome of message ${before.n} to the agent is not known yet: ${stoppingMessages(launch)}` }
+    if (taskDir !== null && this.isStopping(taskDir)) return stopping
+    const result = await this.oneAtATime(launch, taskDir ?? launch.dir, async (): Promise<MessageResult | null> => {
+      if (taskDir !== null && this.isStopping(taskDir)) return { ok: false, outcome: 'unknown', error: stopping.error }
+      // Settled, or being typed, while this waited for the sends before it: nothing to ask.
       const current = this.lastInput(launch)
-      if (current.n !== before.n || current.message === null || current.message.outcome !== null) return null
-      return this.deliver(launch, before.n, message.sending, 'again')
+      if (current.n !== before.n || current.message === null || current.message.outcome !== null || this.typing.has(key)) return null
+      this.typing.add(key)
+      try {
+        return await this.deliver(launch, before.n, message.sending, 'again')
+      } finally {
+        this.typing.delete(key)
+      }
     })
     return result !== null && !result.ok ? { n: before.n, error: result.error } : null
   }
@@ -852,55 +891,77 @@ export class Agents {
     throw new Error(`no free message number in ${launch.dir} in ${RESERVE_ATTEMPTS} attempts`)
   }
 
-  // The boundary of every line typed through Orca's CLI, checked right before each run of it (the first send and every
-  // asking again): the launch is the plugin's — its directory is the one of its task and number in the data directory —
-  // its record of Orca's answer (launch.json) names this very terminal, and the plugin has not closed it. Null when it
-  // holds; otherwise why nothing may be typed into the terminal.
+  // The boundary of every line typed through Orca's CLI, checked before each run of it (the first send and every
+  // asking again, before the search for the CLI and right before `terminal send`): the launch is the plugin's — its
+  // directory is the one of its task and number in the data directory, reached through real directories only (a link
+  // or a file on the way, or a link in place of the launch's directory, is none of the plugin's launches), its record
+  // of Orca's answer (launch.json) a regular file there naming this very terminal — and the plugin has not closed it
+  // (no `closed` mark there). Null when it holds; otherwise why nothing may be typed into the terminal.
   private notOwnTerminal(launch: AgentLaunch): string | null {
     const refused = (why: string) => `the terminal ${launch.terminalId} is not one the plugin may type into: ${why}; nothing is typed into it`
+    const which = `launch ${launch.number} of ${launch.task.key}`
+    let place: TaskPlace
     let dir: string
     try {
-      dir = this.launchFiles(this.place(launch.task), launch.number).dir
+      place = this.place(launch.task)
+      dir = this.launchFiles(place, launch.number).dir
     } catch (error) {
       return refused(errorMessage(error))
     }
-    if (dir !== launch.dir) return refused(`the launch's directory ${launch.dir} is not the one of launch ${launch.number} of ${launch.task.key} (${dir})`)
+    if (dir !== launch.dir) return refused(`the launch's directory ${launch.dir} is not the one of ${which} (${dir})`)
+    let entries: DirectoryEntry[] | null
+    try {
+      const entry = this.agentsEntries(place)?.find((each) => this.sameName(each.name, String(launch.number)))
+      if (entry === undefined) return refused(`${which} has no record of a terminal Orca opened`)
+      if (entry.kind !== 'directory') return refused(`${dir} is a link or a file, not the directory of ${which}`)
+      entries = this.machine.listEntries(dir)
+    } catch (error) {
+      return refused(`the records of ${which} cannot be read: ${errorMessage(error)}`)
+    }
+    const has = (name: string) => (entries ?? []).find((each) => this.sameName(each.name, name))
+    const record = has(LAUNCH_FILE)
+    if (record === undefined) return refused(`${which} has no record of a terminal Orca opened`)
+    const path = dataPath(this.machine, dir, LAUNCH_FILE)
+    if (record.kind !== 'file') return refused(`${path} is a link or a directory, not the record of ${which}`)
     let recorded: LaunchJson | null
     try {
-      recorded = parseLaunch(this.machine.readText(dataPath(this.machine, dir, LAUNCH_FILE)))
+      recorded = parseLaunch(this.machine.readText(path))
     } catch (error) {
-      return refused(`the record of launch ${launch.number} cannot be read: ${errorMessage(error)}`)
+      return refused(`the record of ${which} cannot be read: ${errorMessage(error)}`)
     }
-    if (recorded === null) return refused(`launch ${launch.number} of ${launch.task.key} has no record of a terminal Orca opened`)
+    if (recorded === null) return refused(`${which} has no record of a terminal Orca opened`)
     if (recorded.terminalId !== launch.terminalId) {
-      return refused(`it is not the terminal of launch ${launch.number} of ${launch.task.key}, which is ${recorded.terminalId ?? 'none'}`)
+      return refused(`it is not the terminal of ${which}, which is ${recorded.terminalId ?? 'none'}`)
     }
-    let closed: boolean
-    try {
-      closed = this.machine.readText(dataPath(this.machine, dir, CLOSED_FILE)) !== null
-    } catch (error) {
-      return refused(`whether the plugin has closed it cannot be read: ${errorMessage(error)}`)
-    }
-    if (closed) return refused(`the plugin has closed it (launch ${launch.number} of ${launch.task.key})`)
+    if (has(CLOSED_FILE) !== undefined) return refused(`the plugin has closed it (${which})`)
     return null
   }
 
   // Runs `body` once every earlier send of the launch has ended: the sends of one launch — messages, and asking again
   // about one — never overlap, and go in the order asked.
-  private async oneAtATime<T>(launch: AgentLaunch, body: () => Promise<T>): Promise<T> {
-    const previous = this.sends.get(launch.dir) ?? Promise.resolve()
+  private async oneAtATime<T>(launch: AgentLaunch, task: string, body: () => Promise<T>): Promise<T> {
+    const previous = this.sends.get(launch.dir)?.tail ?? Promise.resolve()
     let release = () => {}
     const done = new Promise<void>((resolve) => {
       release = resolve
     })
     const tail = previous.then(() => done)
-    this.sends.set(launch.dir, tail)
+    this.sends.set(launch.dir, { task, tail })
     await previous
     try {
       return await body()
     } finally {
       release()
-      if (this.sends.get(launch.dir) === tail) this.sends.delete(launch.dir)
+      if (this.sends.get(launch.dir)?.tail === tail) this.sends.delete(launch.dir)
+    }
+  }
+
+  // The agents directory of the launch's task, or null when its task is no task of the plugin.
+  private taskDir(launch: AgentLaunch): string | null {
+    try {
+      return this.place(launch.task).dir
+    } catch {
+      return null
     }
   }
 
@@ -934,16 +995,16 @@ export class Agents {
   }
 
   // Whether a turn of the agent on the input is known besides its mark: for the task, any turn Orca showed in the
-  // launch's terminal; for a message, the start in Orca's receipt, or a turn that began no earlier than the message's
-  // send was recorded.
+  // launch's terminal; for a message, the start in Orca's receipt, or a turn that began after the message's send was
+  // recorded — later than its millisecond: one begun in the same millisecond may have begun before the record.
   private turnOn(launch: AgentLaunch, input: Input): boolean {
     if (input.message === null) return this.turns.has(launch.terminalId)
     const from = this.turnFrom.get(launch.terminalId)
-    return input.message.outcome?.turnStarted === true || (from !== undefined && from >= input.message.sending.sentAt)
+    return input.message.outcome?.turnStarted === true || (from !== undefined && from > input.message.sending.sentAt)
   }
 
   // The turns Orca showed in the launch's terminal, kept on disk with no caller to tell: the start of the task, and of
-  // the last message when a turn began no earlier than its send was recorded (or Orca's receipt saw it start). A record
+  // the last message when a turn began after its send was recorded (or Orca's receipt saw it start). A record
   // that cannot be read leaves the marks to the next reading of the report.
   private keepTurnLater(launch: AgentLaunch): void {
     if (!this.turns.has(launch.terminalId)) return
@@ -1172,6 +1233,11 @@ function launchNumber(name: string): number | null {
 
 function stoppingReason(task: TaskRef): string {
   return `the agents of ${task.key} are being stopped`
+}
+
+// A message, or asking Orca again about one, while a stop of the launch's task runs.
+function stoppingMessages(launch: AgentLaunch): string {
+  return `${stoppingReason(launch.task)}: nothing more is typed into their terminals`
 }
 
 // A launch refused before anything of it is written.

@@ -9,6 +9,9 @@ import { orcaCliTerminalInput, TERMINAL_SEND_TIMEOUT_MS, WAIT_SUBMIT_SECONDS } f
 const CLI = '/home/avery/.local/bin/orca-ide'
 const REQUEST = '6f1c2a4e-8b3d-4c5e-9a7b-1c2d3e4f5a6b'
 
+// The caller's check right before `terminal send`: the send may go.
+const go = () => null
+
 // A computer whose Orca CLI answers `status` as a running Orca and `terminal send` as the test says.
 function machineWith(send: (request: StartRequest) => FakeAnswer, executables: string[] = [CLI]) {
   return fakeMachine({
@@ -27,7 +30,6 @@ function receipt(stages: string[], accepted = true, refusedReason?: string): Fak
       ok: true,
       result: {
         send: { handle: 'term_1', accepted, ...(refusedReason ? { refusedReason } : {}), prompt: { requestId: REQUEST, stages } },
-        mutation: { requestId: REQUEST, replayed: false },
       },
     }),
   }
@@ -39,12 +41,12 @@ function refusal(code: string, message: string, data?: Record<string, unknown>):
 }
 
 async function sendWith(answer: FakeAnswer) {
-  return orcaCliTerminalInput(machineWith(() => answer))('term_1', 'x', REQUEST)
+  return orcaCliTerminalInput(machineWith(() => answer))('term_1', 'x', REQUEST, go)
 }
 
 test('CLI Orca вводит строку в терминал по handle как запрос плагина с id и ждёт начала хода: квитанция с turn_started — ход начат, без него — ещё нет, accepted false — терминал не принял с причиной Orca', async () => {
   const started = machineWith(() => receipt(['input_accepted', 'turn_started']))
-  assert.deepEqual(await orcaCliTerminalInput(started)('term_1', 'Прочитайте файл `/data/message-1.md`.', REQUEST), {
+  assert.deepEqual(await orcaCliTerminalInput(started)('term_1', 'Прочитайте файл `/data/message-1.md`.', REQUEST, go), {
     ok: true,
     accepted: true,
     refusedReason: null,
@@ -73,8 +75,8 @@ test('CLI Orca вводит строку в терминал по handle как 
   assert.equal(started.starts[1]?.timeoutMs, TERMINAL_SEND_TIMEOUT_MS)
   // The CLI found once serves the next sends of the same input: one search, one run per send.
   const input = orcaCliTerminalInput(started)
-  await input('term_1', 'a', REQUEST)
-  await input('term_1', 'b', REQUEST)
+  await input('term_1', 'a', REQUEST, go)
+  await input('term_1', 'b', REQUEST, go)
   assert.deepEqual(started.starts.slice(2).map((start) => start.args.slice(0, 2).join(' ')), ['status --json', 'terminal send', 'terminal send'])
 
   assert.deepEqual(await sendWith(receipt(['input_accepted'])), { ok: true, accepted: true, refusedReason: null, turnStarted: false })
@@ -91,7 +93,7 @@ test('CLI Orca: отказ Orca в самой строке (incompatible_runtime
   const codes = ['incompatible_runtime', 'terminal_handle_stale', 'agent_prompt_blocked', 'invalid_argument']
   for (const code of codes) {
     const machine = machineWith(() => refusal(code, `Orca refused: ${code}. This attempt sent no input.`))
-    assert.deepEqual(await orcaCliTerminalInput(machine)('term_1', 'x', REQUEST), {
+    assert.deepEqual(await orcaCliTerminalInput(machine)('term_1', 'x', REQUEST, go), {
       ok: false,
       delivery: 'not-sent',
       error: `orca terminal send: ${code}: Orca refused: ${code}. This attempt sent no input. (exit 1)`,
@@ -103,7 +105,7 @@ test('CLI Orca: отказ Orca в самой строке (incompatible_runtime
 
   // No CLI on the computer: nothing runs, the reason names where it was looked for.
   const none = machineWith(() => receipt(['input_accepted']), [])
-  const missing = await orcaCliTerminalInput(none)('term_1', 'x', REQUEST)
+  const missing = await orcaCliTerminalInput(none)('term_1', 'x', REQUEST, go)
   assert.ok(!missing.ok && missing.delivery === 'not-sent' && missing.error.startsWith("Orca's CLI is not found: "), JSON.stringify(missing))
   assert.ok(!missing.ok && missing.error.includes(`${CLI}: no such file`), JSON.stringify(missing))
   assert.deepEqual(none.starts, [])
@@ -113,21 +115,41 @@ test('CLI Orca: отказ Orca в самой строке (incompatible_runtime
   const base = machineWith(() => receipt(['input_accepted']))
   const flaky = { ...base, isRunnableFile: (path: string) => present && base.isRunnableFile(path) }
   const input = orcaCliTerminalInput(flaky)
-  assert.ok((await input('term_1', 'a', REQUEST)).ok)
+  assert.ok((await input('term_1', 'a', REQUEST, go)).ok)
   present = false
-  assert.deepEqual(await input('term_1', 'b', REQUEST), { ok: false, delivery: 'not-sent', error: `orca terminal send: ${CLI}: no such program` })
+  assert.deepEqual(await input('term_1', 'b', REQUEST, go), { ok: false, delivery: 'not-sent', error: `orca terminal send: ${CLI}: no such program` })
   present = true
-  assert.ok((await input('term_1', 'c', REQUEST)).ok)
+  assert.ok((await input('term_1', 'c', REQUEST, go)).ok)
   assert.equal(base.starts.filter((start) => start.args[0] === 'status').length, 2)
   const denied = machineWith(() => ({ startError: { code: 'EACCES', message: 'spawn EACCES' } }))
-  assert.deepEqual(await orcaCliTerminalInput(denied)('term_1', 'x', REQUEST), {
+  assert.deepEqual(await orcaCliTerminalInput(denied)('term_1', 'x', REQUEST, go), {
     ok: false,
     delivery: 'not-sent',
     error: `orca terminal send: ${CLI}: spawn EACCES`,
   })
 })
 
-test('CLI Orca: runtime_unavailable, deliveryOutcome unknown при любом коде, другой отказ, ответ без JSON, таймаут и ответ без логического accepted — исход неизвестен', async () => {
+test('CLI Orca: проверка вызывающего — после поиска CLI и его status, прямо перед terminal send: отказ — terminal send не запускается, строка не отправлена с причиной проверки', async () => {
+  const machine = machineWith(() => receipt(['input_accepted', 'turn_started']))
+  const order: string[] = []
+  const recorded = { ...machine, start: (request: StartRequest) => (order.push(request.args.slice(0, 2).join(' ')), machine.start(request)) }
+  const input = orcaCliTerminalInput(recorded)
+  const refuse = () => {
+    order.push('check')
+    return 'the plugin has closed the terminal'
+  }
+  assert.deepEqual(await input('term_1', 'x', REQUEST, refuse), { ok: false, delivery: 'not-sent', error: 'the plugin has closed the terminal' })
+  assert.deepEqual(order, ['status --json', 'check'])
+  // The same input once the check lets it go: the CLI found before, then the check, then the one run.
+  const pass = () => {
+    order.push('check')
+    return null
+  }
+  assert.ok((await input('term_1', 'x', REQUEST, pass)).ok)
+  assert.deepEqual(order, ['status --json', 'check', 'check', 'terminal send'])
+})
+
+test('CLI Orca: runtime_unavailable, deliveryOutcome unknown при любом коде и в любом ответе, другой отказ, ответ не в форме отказа Orca (без логического ok, код без сообщения, выход 0, успех с ошибкой), ответ без JSON, таймаут и ответ без логического accepted — исход неизвестен', async () => {
   const unknown = async (answer: FakeAnswer) => {
     const result = await sendWith(answer)
     assert.ok(!result.ok && result.delivery === 'unknown', JSON.stringify(result))
@@ -138,10 +160,34 @@ test('CLI Orca: runtime_unavailable, deliveryOutcome unknown при любом �
     await unknown(refusal('runtime_unavailable', 'Orca closed the connection before responding')),
     'orca terminal send: runtime_unavailable: Orca closed the connection before responding (exit 1)',
   )
-  // Orca itself calls the outcome unknown: unknown whatever the code, a refusal of the line itself included.
+  // Orca itself calls the outcome unknown: unknown whatever the code, a refusal of the line itself included — and also
+  // in an answer that otherwise reads as the terminal's no.
   for (const code of ['terminal_handle_stale', 'incompatible_runtime', 'runtime_error']) {
-    await unknown(refusal(code, 'Orca cannot prove whether the prompt was delivered', { deliveryOutcome: 'unknown' }))
+    assert.equal(
+      await unknown(refusal(code, 'Orca cannot prove whether the prompt was delivered', { deliveryOutcome: 'unknown' })),
+      `orca terminal send: ${code}: Orca cannot prove whether the prompt was delivered (exit 1)`,
+    )
   }
+  const contradictory = JSON.stringify({
+    ok: true,
+    result: { send: { handle: 'term_1', accepted: false, refusedReason: 'the terminal is read-only' } },
+    error: { code: 'runtime_error', message: 'Orca cannot prove whether the prompt was delivered', data: { deliveryOutcome: 'unknown' } },
+  })
+  assert.equal(await unknown({ code: 1, stdout: contradictory }), 'orca terminal send: runtime_error: Orca cannot prove whether the prompt was delivered (exit 1)')
+  // A refusal of the line itself proves nothing outside the form of Orca's refusal: no boolean `ok`, a code without
+  // its message, a failed answer with exit 0, a success that carries an error.
+  const malformed: FakeAnswer[] = [
+    { code: 1, stdout: JSON.stringify({ error: { code: 'invalid_argument', message: '--text is empty' } }) },
+    { code: 1, stdout: JSON.stringify({ ok: 'false', error: { code: 'invalid_argument', message: '--text is empty' } }) },
+    { code: 1, stdout: JSON.stringify({ ok: false, error: { code: 'terminal_handle_stale' } }) },
+    { code: 0, stdout: JSON.stringify({ ok: false, error: { code: 'agent_prompt_blocked', message: 'the agent shows a permission prompt' } }) },
+    { code: 1, stdout: JSON.stringify({ ok: false, error: 'incompatible_runtime' }) },
+    {
+      code: 0,
+      stdout: JSON.stringify({ ok: true, result: { send: { accepted: false } }, error: { code: 'invalid_argument', message: '--text is empty' } }),
+    },
+  ]
+  for (const answer of malformed) await unknown(answer)
   assert.equal(await unknown(refusal('runtime_error', 'the connection to Orca dropped')), 'orca terminal send: runtime_error: the connection to Orca dropped (exit 1)')
   assert.equal(await unknown({ code: 1, stdout: JSON.stringify({ ok: false }) }), 'orca terminal send: not ok (exit 1)')
   assert.equal(await unknown({ code: 2, stderr: 'segmentation fault\n' }), 'orca terminal send answered no JSON (exit 2): segmentation fault')

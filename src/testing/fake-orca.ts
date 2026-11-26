@@ -16,12 +16,14 @@
 //
 // Orca's CLI (`cli`, at a known path of Ф14 on each system, answering `status --json` as Orca 1.4.274 does) answers
 // `terminal send` like Orca's: the line goes into the open terminal of the handle (`typed`), the receipt names the stage
-// `turn_started` while `turnStarts` is set, and a request id it has seen repeats the first outcome without typing again.
+// `turn_started` while `turnStarts` is set, and a request id it has seen repeats the first receipt without typing again.
 // A handle no open terminal has: `terminal_handle_stale`, nothing typed. The test steers the next sends: `cliRefusals` —
 // Orca refuses without typing and the request stays unseen; `cliAnswers` — the answer as given, nothing typed, the
 // request unseen; `loseAnswers` — the CLI does what Orca does (types, or repeats the outcome) and then ends without an
 // answer, stopped at its timeout; `cliGate` — the line is typed at once and the answer held back; `cliHoldNext` — the
-// next send waits before Orca handles it. While `cliPresent` is false (`cli: false`) the computer has no Orca CLI.
+// next send waits before Orca handles it; `sendDurationMs` — the time a send takes after the line is typed;
+// `statusGate` — the answer of `status` held back. While `cliPresent` is false (`cli: false`) the computer has no Orca
+// CLI.
 import { hostError, mockHost, type MockHost } from 'orca/testing'
 import type { Platform } from '../platform/machine'
 import { FAKE_HOME, fakeClock, fakeMachine, orcaStatusAnswer, type FakeAnswer, type FakeClock, type FakeMachine } from './fake-machine'
@@ -81,6 +83,11 @@ export type FakeOrca = {
   cliGate: Promise<void> | null
   // While set, the next CLI send waits for it before Orca handles it; that send takes it.
   cliHoldNext: Promise<void> | null
+  // While set, the CLI's `status` answers only once the promise settles.
+  statusGate: Promise<void> | null
+  // How long a CLI send Orca handles takes after the line is typed (or the outcome repeated): the clock moves by it
+  // before the answer.
+  sendDurationMs: number
   // The agent of a terminal as `agents.list` names it from now on: its state, and since when.
   list(terminalId: string, state: FakeAgentState, stateStartedAt: number): void
   // `agents.list` no longer names the agent of the terminal.
@@ -138,7 +145,7 @@ export function fakeOrca(
       return { timedOut: true, signal: 'SIGKILL' }
     }
     const seen = requestId === undefined ? undefined : requests.get(requestId)
-    if (seen !== undefined) return lost() ?? { code: 0, stdout: seen }
+    if (seen !== undefined) return lost() ?? { code: 0, stdout: seen, durationMs: fake.sendDurationMs }
     const terminal = terminals.get(handle)
     if (terminal === undefined || !terminal.open) {
       return {
@@ -148,22 +155,21 @@ export function fakeOrca(
     }
     terminal.typed.push(text)
     const stages = fake.turnStarts && request.args.includes('--wait-submit') ? ['input_accepted', 'turn_started'] : ['input_accepted']
-    const receipt = (replayed: boolean) =>
-      JSON.stringify({
-        id: `cli-${++answered}`,
-        ok: true,
-        result: {
-          send: {
-            handle,
-            accepted: true,
-            bytesWritten: text.length + 1,
-            prompt: { requestId: requestId ?? null, stages, provider: terminal.agent ?? 'unsupported', observation: 'supported' },
-          },
-          mutation: { requestId: requestId ?? null, replayed },
+    // Orca's receipt; a request id seen again gets the same one.
+    const receipt = JSON.stringify({
+      id: `cli-${++answered}`,
+      ok: true,
+      result: {
+        send: {
+          handle,
+          accepted: true,
+          bytesWritten: text.length + 1,
+          prompt: { requestId: requestId ?? null, stages, provider: terminal.agent ?? 'unsupported', observation: 'supported' },
         },
-      })
-    if (requestId !== undefined) requests.set(requestId, receipt(true))
-    return lost() ?? { code: 0, stdout: receipt(false) }
+      },
+    })
+    if (requestId !== undefined) requests.set(requestId, receipt)
+    return lost() ?? { code: 0, stdout: receipt, durationMs: fake.sendDurationMs }
   }
 
   const base = fakeMachine({ platform, clock, executables: [cli], answer })
@@ -171,6 +177,8 @@ export function fakeOrca(
     ...base,
     isRunnableFile: (path) => (path === cli ? fake.cliPresent : base.isRunnableFile(path)),
     start: async (request) => {
+      const status = fake.statusGate
+      if (request.args[0] === 'status' && status !== null) await status
       const sending = request.args[0] === 'terminal'
       const hold = fake.cliHoldNext
       if (sending && hold !== null) {
@@ -264,6 +272,8 @@ export function fakeOrca(
     loseAnswers: 0,
     cliGate: null,
     cliHoldNext: null,
+    statusGate: null,
+    sendDurationMs: 0,
     list: (terminalId, state, stateStartedAt) => {
       listed.set(terminalId, { state, stateStartedAt })
     },

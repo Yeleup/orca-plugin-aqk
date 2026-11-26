@@ -18,17 +18,23 @@
 // no send without the request id: an Orca that cannot honor it refuses before typing anything (`incompatible_runtime`),
 // and on such an Orca the plugin's messages do not reach agents.
 //
+// The caller's own check runs once the CLI is found, right before `terminal send` starts: when it refuses, nothing runs
+// and the line is not sent (the agents layer checks there that the terminal is still its own).
+//
 // The outcome of one run:
-// - accepted — Orca's receipt: `result.send.accepted` true (and whether `turn_started` is among its stages), or false
-//   with Orca's reason: the terminal did not take the line;
-// - not sent — proven that the line of this request was not typed: the CLI is not found or did not start, or Orca
-//   refused the line itself (`terminal_handle_stale`, `invalid_argument`, `agent_prompt_blocked`,
-//   `incompatible_runtime`);
+// - any answer in which Orca itself calls the outcome unknown (`error.data.deliveryOutcome: "unknown"`, whatever else
+//   it says) — unknown, before anything else;
+// - accepted — Orca's receipt, in the form of a success (`ok: true`, no error): `result.send.accepted` true (and
+//   whether `turn_started` is among its stages), or false with Orca's reason: the terminal did not take the line;
+// - not sent — proven that the line of this request was not typed: the CLI is not found or did not start, the
+//   caller's check refused, or Orca refused the line itself in the form of Orca's refusal (`ok: false`, an `error`
+//   with its code and message, a non-zero exit) with one of `terminal_handle_stale`, `invalid_argument`,
+//   `agent_prompt_blocked`, `incompatible_runtime`;
 // - unknown — anything else: no JSON, a timeout, `runtime_unavailable` (Orca's CLI answers it both before the request
-//   leaves and after the connection closed behind it), any other refusal, any answer in which Orca itself calls the
-//   outcome unknown (`error.data.deliveryOutcome: "unknown"`, whatever the code), an answer without a true or false
-//   `accepted`. When this run asked again about an earlier one, only a receipt decides: the agents layer reads every
-//   refusal of it as «unknown».
+//   leaves and after the connection closed behind it), any other refusal, an answer in neither form (no boolean `ok`,
+//   a success with an error, a refusal without its code or with exit 0), a success without a true or false `accepted`.
+//   When this run asked again about an earlier one, only a receipt decides: the agents layer reads every refusal of it
+//   as «unknown».
 import type { Machine } from './machine'
 import { findOrcaCli } from './orca-cli'
 import { runProgram, type RunResult } from './run'
@@ -61,18 +67,28 @@ export type TerminalSendResult =
   // lost, or Orca failed or could not be reached; the same request id asks about it again.
   | { readonly ok: false; readonly delivery: 'not-sent' | 'unknown'; readonly error: string }
 
-// Types `line` and Enter into the terminal `terminalId` as the request `requestId` (a UUID): one run of the CLI.
-export type TerminalInput = (terminalId: string, line: string, requestId: string) => Promise<TerminalSendResult>
+// Types `line` and Enter into the terminal `terminalId` as the request `requestId` (a UUID): one run of the CLI. `check`
+// runs once the CLI is found, right before `terminal send`: a reason it returns means nothing runs and the line is not
+// sent with that reason; null lets the send go.
+export type TerminalInput = (
+  terminalId: string,
+  line: string,
+  requestId: string,
+  check: () => string | null,
+) => Promise<TerminalSendResult>
 
 // The terminal input of this computer's Orca CLI, found by Ф14 at the first call and kept while it starts.
 export function orcaCliTerminalInput(machine: Machine): TerminalInput {
   let cli: string | null = null
-  return async (terminalId, line, requestId) => {
+  return async (terminalId, line, requestId, check) => {
     if (cli === null) {
       const search = await findOrcaCli(machine)
       if (!search.found) return { ok: false, delivery: 'not-sent', error: `Orca's CLI is not found: ${search.reason}` }
       cli = search.file
     }
+    // Nothing waits between the caller's check and the start of `terminal send`.
+    const refused = check()
+    if (refused !== null) return { ok: false, delivery: 'not-sent', error: refused }
     const result = await runProgram(machine, cli, terminalSendArgs(terminalId, line, requestId), {
       timeoutMs: TERMINAL_SEND_TIMEOUT_MS,
     })
@@ -118,24 +134,33 @@ export function terminalSendOutcome(result: RunResult): TerminalSendResult {
       error: `orca terminal send answered no JSON (exit ${result.code})${said ? `: ${said}` : ''}`,
     }
   }
-  if (field(answer, 'ok') !== true) {
-    const error = field(answer, 'error')
-    const code = field(error, 'code')
-    const message = field(error, 'message')
-    const orcaUnknown = field(field(error, 'data'), 'deliveryOutcome') === 'unknown'
-    const named = typeof code === 'string' ? code : null
-    const said = `${named === null ? '' : `${named}: `}${typeof message === 'string' ? message : 'not ok'}`
+  const ok = field(answer, 'ok')
+  const error = field(answer, 'error')
+  const code = field(error, 'code')
+  const message = field(error, 'message')
+  const exit = `(exit ${result.code})`
+  const said = `${typeof code === 'string' ? `${code}: ` : ''}${typeof message === 'string' ? message : 'not ok'}`
+  // Orca itself calls the outcome unknown: unknown, whatever else the answer says.
+  if (field(field(error, 'data'), 'deliveryOutcome') === 'unknown') {
+    return { ok: false, delivery: 'unknown', error: `orca terminal send: ${said} ${exit}` }
+  }
+  if (ok === false) {
+    // Only Orca's refusal in its own form — its code and message, a failed exit — proves anything.
+    const refusal = typeof code === 'string' && typeof message === 'string' && result.code !== 0
     return {
       ok: false,
-      delivery: named !== null && NOT_SENT_CODES.has(named) && !orcaUnknown ? 'not-sent' : 'unknown',
-      error: `orca terminal send: ${said} (exit ${result.code})`,
+      delivery: refusal && NOT_SENT_CODES.has(code) ? 'not-sent' : 'unknown',
+      error: `orca terminal send: ${said} ${exit}`,
     }
+  }
+  if (ok !== true || error !== undefined) {
+    return { ok: false, delivery: 'unknown', error: `orca terminal send answered neither a receipt nor a refusal of Orca ${exit}` }
   }
   const send = field(field(answer, 'result'), 'send')
   const accepted = field(send, 'accepted')
   // Only Orca's receipt decides: without a yes or no of the terminal the outcome is not known.
   if (typeof accepted !== 'boolean') {
-    return { ok: false, delivery: 'unknown', error: `orca terminal send answered without the terminal's receipt (exit ${result.code})` }
+    return { ok: false, delivery: 'unknown', error: `orca terminal send answered without the terminal's receipt ${exit}` }
   }
   const reason = field(send, 'refusedReason')
   const stages = field(field(send, 'prompt'), 'stages')
