@@ -813,7 +813,7 @@ test('Остановка, которую начал taskText запуска, о�
   await r.worker.deactivate()
 })
 
-test('Номер запуска — следующий после наибольшего каталога запусков задачи: после 1000 запусков, отказы в том числе, задача запускается снова', async () => {
+test('Номер запуска — следующий после наибольшего каталога запусков задачи: после 1000 запусков, отказы в том числе, задача запускается снова; два запуска сразу — два номера', async () => {
   const orca = fakeOrca()
   const r = await mount(orca)
   const task: TaskRef = { project: PROJECT, key: 'mvp-start' }
@@ -849,4 +849,32 @@ test('Номер запуска — следующий после наиболь
   )
   assert.deepEqual(await r.agents.stop(task), { closed: ['terminal-1'], failed: [] })
   await r.worker.deactivate()
+
+  // Two launches of one task at once, on a disk that takes its time: both find number 1 free, one creates its task
+  // file there, the other finds it taken and takes number 2 — each with its own task file.
+  const slow: Machine = {
+    ...orca.machine,
+    createText: async (path, text) => {
+      await settle()
+      return orca.machine.createText(path, text)
+    },
+  }
+  const racing = await mount(orca, { machine: slow })
+  const results = await Promise.all([racing.agents.launch(request(5, 'implementer')), racing.agents.launch(request(5, 'reviewer'))])
+  const launches = results.map((result) => {
+    assert.ok(result.ok, JSON.stringify(result))
+    return result.launch
+  })
+  assert.deepEqual(launches.map((launch) => launch.number).sort(), [1, 2])
+  for (const launch of launches) {
+    assert.equal(orca.machine.files.get(launch.taskFile), request(5, launch.role).taskText(launch))
+  }
+  assert.deepEqual(
+    racing.agents.launches(issueTask(PROJECT, 5)).map((record) => [record.number, record.outcome]),
+    [
+      [1, 'launched'],
+      [2, 'launched'],
+    ],
+  )
+  await racing.worker.deactivate()
 })
