@@ -26,6 +26,10 @@ export type StartRequest = {
   readonly env: Env
   // Windows: the arguments go to the process as written (cmd.exe /d /s /c "…"), without Node's quoting.
   readonly windowsVerbatimArguments?: boolean
+  // Text the process reads on its standard input (as UTF-8), which is closed after it; without it the standard input
+  // is empty. Long texts go this way rather than as an argument: a command line has a length limit (32767 characters
+  // on Windows).
+  readonly input?: string
   // Stops the process and the processes it started after this many milliseconds; `timedOut` says it was stopped.
   readonly timeoutMs?: number
   // A file that gets all the output, both streams in the order they come, as raw bytes.

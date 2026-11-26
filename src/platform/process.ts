@@ -1,4 +1,6 @@
 // Starting a process on the real machine: its exit, its output and a timeout.
+// - Input: the request's `input` is written to the standard input as UTF-8, which is then closed; without it the
+//   standard input is empty. A process that exits without reading it all is no failure of the start.
 // - Output: the bytes of both streams go, in the order they arrive, to `outputFile` when the request names one (the
 //   full output of a test run, TZ «Данные»). A write that fails (a full disk …) stops the file and the run reports it
 //   (`outputError`); it never escapes as an exception. In memory each stream keeps at most `maxOutput` bytes: its
@@ -128,7 +130,7 @@ export function startProcess(request: StartRequest, io: ProcessIo = REAL_IO): Pr
       child = spawn(request.file, request.args, {
         cwd: request.cwd,
         env: { ...request.env },
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: [request.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
         // macOS and Linux: a process group of its own, so a timeout stops the processes it started too.
         detached: !io.windows,
         windowsHide: true,
@@ -137,6 +139,12 @@ export function startProcess(request: StartRequest, io: ProcessIo = REAL_IO): Pr
     } catch (error) {
       finish({ code: null, signal: null, startError: { code: errorCode(error), message: errorMessage(error) } })
       return
+    }
+    // The input, then the end of it. A process that exits without reading it all closes the pipe (EPIPE): its exit
+    // and output tell what happened, the write error itself is dropped.
+    if (request.input !== undefined && child.stdin) {
+      child.stdin.on('error', () => undefined)
+      child.stdin.end(request.input)
     }
     const take = (kept: KeptOutput) => (chunk: Uint8Array) => {
       if (settled) return

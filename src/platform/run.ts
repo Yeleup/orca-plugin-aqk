@@ -16,6 +16,8 @@ export type RunOptions = {
   // A file that gets the full output, both streams as they come (StartRequest.outputFile).
   readonly outputFile?: string
   readonly maxOutput?: number
+  // Text for the standard input (StartRequest.input).
+  readonly input?: string
 }
 
 export type RunErrorKind =
@@ -264,7 +266,13 @@ async function startTimed(
   }
   const started = machine.now()
   const outcome = await machine
-    .start({ ...request, timeoutMs: options.timeoutMs, outputFile: options.outputFile, maxOutput: options.maxOutput })
+    .start({
+      ...request,
+      timeoutMs: options.timeoutMs,
+      outputFile: options.outputFile,
+      maxOutput: options.maxOutput,
+      ...(options.input === undefined ? {} : { input: options.input }),
+    })
     .catch((error: unknown) => ({
       code: null,
       signal: null,
