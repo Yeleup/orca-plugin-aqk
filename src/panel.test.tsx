@@ -20,6 +20,7 @@ import { catalogs, format, LANGUAGE_SETTING, type Language, type MessageKey } fr
 import type { Project } from './protocol'
 import { loadLanguage } from './ui/language'
 import { openScreen, SCREENS } from './ui/navigation'
+import { withTemporaryHome } from './testing/temporary-home'
 import * as worker from './worker'
 
 // The panel Orca opens from its right sidebar: the entry of the manifest's components panel `agent-queue`.
@@ -380,25 +381,28 @@ test('Каркас панели: выбор проекта — подключё�
   assertClean(panel)
 })
 
+// The real worker keeps its data directory and coordinator id in a temporary home (src/testing/temporary-home.ts).
 test('Каркас панели: панель с настоящим воркером — запрос projects.list доходит до воркера, «Очередь» без проектов показывает меню', async () => {
-  const running = await mountWorker(worker)
-  const asked: unknown[] = []
-  const host = mockHost({
-    requests: {
-      'projects.list': async (input) => {
-        asked.push(input ?? null)
-        return running.request('projects.list', input)
+  await withTemporaryHome(async () => {
+    const running = await mountWorker(worker)
+    const asked: unknown[] = []
+    const host = mockHost({
+      requests: {
+        'projects.list': async (input) => {
+          asked.push(input ?? null)
+          return running.request('projects.list', input)
+        },
       },
-    },
+    })
+    const shown = await show(host)
+    assert.deepEqual(asked, [null])
+    assert.deepEqual(headings(shown), ['Agent Queue'])
+    assert.equal(shown.find({ role: 'combobox' }), null)
+    assert.deepEqual(buttons(shown), ['Project check', 'Start MVP', 'Settings', 'Connect project'])
+    assertClean(shown)
+    assert.deepEqual(running.refusals, [])
+    await running.deactivate()
   })
-  const shown = await show(host)
-  assert.deepEqual(asked, [null])
-  assert.deepEqual(headings(shown), ['Agent Queue'])
-  assert.equal(shown.find({ role: 'combobox' }), null)
-  assert.deepEqual(buttons(shown), ['Project check', 'Start MVP', 'Settings', 'Connect project'])
-  assertClean(shown)
-  assert.deepEqual(running.refusals, [])
-  await running.deactivate()
 })
 
 test('Каркас панели: светлая и тёмная тема Orca — панель рисуется без ошибок и отказов', async () => {
