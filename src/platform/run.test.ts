@@ -5,7 +5,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { env, execPath, kill, platform } from 'node:process'
-import { fakeClock, fakeMachine } from '../testing/fake-machine'
+import { fakeClock, fakeMachine, orcaWorkerEnv } from '../testing/fake-machine'
 import { realMachine, realPlatform, type Machine } from './machine'
 import { decodeOutput } from './process'
 import { projectTestCommand, runProgram, runProjectTests, runShell } from './run'
@@ -97,10 +97,17 @@ test('команда не найдена → ошибка с причиной, �
     assert.equal(program.code, null)
     assert.equal(program.file, null)
 
-    const shell = await runShell(realMachine({ env: { ...env, PATH: dir, Path: undefined }, cwd: dir }), 'agent-queue-missing-tool --version', { cwd: dir })
-    assert.equal(shell.error?.kind, 'not_found', JSON.stringify(shell))
-    assert.match(shell.error?.reason ?? '', /agent-queue-missing-tool/)
-    assert.notEqual(shell.code, 0)
+    const lineMachine = realMachine({ env: { ...env, PATH: dir, Path: undefined }, cwd: dir })
+    const shell = await runShell(lineMachine, 'agent-queue-missing-tool --version', { cwd: dir })
+    assert.notEqual(shell.code, 0, JSON.stringify(shell))
+    if (shell.code === (windows ? 9009 : 127)) {
+      assert.equal(shell.error?.kind, 'not_found', JSON.stringify(shell))
+      assert.match(shell.error?.reason ?? '', /agent-queue-missing-tool/)
+    } else {
+      // cmd.exe /c may say «not found» with exit 1: a failed run, the shell's message (it names the command) kept.
+      assert.ok(windows, `sh exited ${shell.code} for a missing command, not 127`)
+      assert.match(shell.stderr, /agent-queue-missing-tool/)
+    }
 
     const path = await runProgram(machine, join(dir, 'no-such-dir', 'tool'), [])
     assert.equal(path.error?.kind, 'not_found')
@@ -108,7 +115,7 @@ test('команда не найдена → ошибка с причиной, �
   })
 })
 
-test('запуск команды: программа из PATH по правилам системы — на win32 с PATHEXT; .cmd через cmd.exe, аргументы экранированы один раз, у cmd-shim npm — дважды', async () => {
+test('запуск команды: программа из PATH по правилам системы — на win32 с PATHEXT; .cmd и .bat через cmd.exe, аргументы по правилам batch-файлов: кавычки с удвоенной кавычкой внутри, % без раскрытия', async () => {
   const shim = 'C:\\work\\demo-shop\\node_modules\\.bin\\eslint.cmd'
   const win = fakeMachine({
     platform: 'win32',
@@ -116,29 +123,28 @@ test('запуск команды: программа из PATH по прави�
     executables: ['C:\\Program Files\\Demo Tools\\demo-tool.cmd', 'C:\\Tools\\git.exe', shim],
   })
   await runProgram(win, 'git', ['status', '--short'])
-  await runProgram(win, 'demo-tool', ['say', 'a & b', '50%', 'say "hi"', 'dir\\'])
-  await runProgram(win, shim, ['--fix', 'a b'])
+  await runProgram(win, 'demo-tool', ['say', 'a & b', '50%', 'say "a & b" now', 'dir\\', ''])
+  await runProgram(win, shim, ['--fix', 'a b', '%PATH%'])
+  const cmd = (line: string) => ({
+    file: 'C:\\Windows\\System32\\cmd.exe',
+    args: ['/e:ON', '/v:OFF', '/d', '/c', `"${line}"`],
+    windowsVerbatimArguments: true,
+  })
   assert.deepEqual(
     win.starts.map(({ file, args, windowsVerbatimArguments }) => ({ file, args, windowsVerbatimArguments })),
     [
       { file: 'C:\\Tools\\git.exe', args: ['status', '--short'], windowsVerbatimArguments: undefined },
-      {
-        file: 'C:\\Windows\\System32\\cmd.exe',
-        args: [
-          '/d',
-          '/s',
-          '/c',
-          '"C:\\Program^ Files\\Demo^ Tools\\demo-tool.cmd ^"say^" ^"a^ ^&^ b^" ^"50^%^" ^"say^ \\^"hi\\^"^" ^"dir\\\\^""',
-        ],
-        windowsVerbatimArguments: true,
-      },
-      {
-        file: 'C:\\Windows\\System32\\cmd.exe',
-        args: ['/d', '/s', '/c', `"${shim} ^^^"--fix^^^" ^^^"a^^^ b^^^""`],
-        windowsVerbatimArguments: true,
-      },
+      cmd('"C:\\Program Files\\Demo Tools\\demo-tool.cmd" say "a & b" "50%%cd:~,%" "say ""a & b"" now" "dir\\\\" ""'),
+      // npm's cmd-shims follow the same rules: the arguments stay inside quotes when %* is read again.
+      cmd(`"${shim}" --fix "a b" "%%cd:~,%PATH%%cd:~,%"`),
     ],
   )
+
+  // A line break cannot reach a batch file intact: refused before anything starts.
+  const refused = await runProgram(win, 'demo-tool', ['two\nlines'])
+  assert.equal(refused.error?.kind, 'start_failed')
+  assert.match(refused.error?.reason ?? '', /cannot hold a line break/)
+  assert.equal(win.starts.length, 3)
 
   const linux = fakeMachine({ platform: 'linux', env: { PATH: '/usr/local/bin:/usr/bin' }, executables: ['/usr/bin/git'] })
   const result = await runProgram(linux, 'git', ['log', '-1'])
@@ -150,32 +156,50 @@ test('запуск команды: программа из PATH по прави�
 type TestContext = { skip(message?: string): void }
 const testWithContext = test as unknown as (name: string, fn: (t: TestContext) => unknown) => Promise<void>
 
-testWithContext('запуск команды на Windows: обычный .cmd получает аргументы через %1 и %~1, обёртка с %* передаёт их программе без изменений', async (t) => {
+testWithContext('запуск команды на Windows: обычный .cmd получает %~1 без изменений; обёртка и cmd-shim npm передают %* программе без изменений', async (t) => {
   if (!windows) {
     t.skip('только Windows: cmd.exe и .cmd')
     return
   }
   await withTempDir(async (dir) => {
-    const args = ['plain', 'a & b', '50%', '(paren)', 'semi;colon', 'two  spaces', 'x|y<z>']
-    // A batch file that keeps each %~1 in a variable (set "v=…" and !v! keep & | < > as text) and writes it out.
+    // A batch file that keeps each %~1 in a variable (set "v=…" and !v! keep & | < > % as text) and writes it out.
+    const plainArgs = ['plain', 'a & b', '50%', '%PATH%', '(paren)', 'semi;colon', 'two  spaces', 'x|y<z>']
     const plainLog = join(dir, 'plain.log')
-    const sets = args.map((_, i) => `set "a${i + 1}=%~${i + 1}"`).join('\r\n')
-    const echoes = args.map((_, i) => `>>"${plainLog}" echo(!a${i + 1}!`).join('\r\n')
+    const sets = plainArgs.map((_, i) => `set "a${i + 1}=%~${i + 1}"`).join('\r\n')
+    const echoes = plainArgs.map((_, i) => `>>"${plainLog}" echo(!a${i + 1}!`).join('\r\n')
     writeFileSync(join(dir, 'plain.cmd'), `@echo off\r\nsetlocal EnableDelayedExpansion\r\n${sets}\r\n${echoes}\r\n`)
-    // A wrapper that hands %* to a program, as the CLI launchers do; the program writes the arguments it got.
-    const wrapperLog = join(dir, 'wrapper.json')
-    writeFileSync(join(dir, 'print-args.js'), `require('fs').writeFileSync(${JSON.stringify(wrapperLog)}, JSON.stringify(process.argv.slice(2)))\n`)
-    writeFileSync(join(dir, 'wrapper.cmd'), `@"${execPath}" "%~dp0print-args.js" %*\r\n`)
-
     const machine = realMachine({ cwd: dir })
-    const plain = await runProgram(machine, join(dir, 'plain.cmd'), args)
+    const plain = await runProgram(machine, join(dir, 'plain.cmd'), plainArgs)
     assert.equal(plain.code, 0, JSON.stringify(plain))
-    assert.deepEqual(readFileSync(plainLog, 'utf8').split(/\r?\n/).filter((line) => line !== ''), args)
+    assert.deepEqual(readFileSync(plainLog, 'utf8').split(/\r?\n/).filter((line) => line !== ''), plainArgs)
 
-    const forwarded = [...args, 'say "hi"', 'dir\\', 'caret^x']
-    const wrapper = await runProgram(machine, join(dir, 'wrapper.cmd'), forwarded)
-    assert.equal(wrapper.code, 0, JSON.stringify(wrapper))
-    assert.deepEqual(JSON.parse(readFileSync(wrapperLog, 'utf8')), forwarded)
+    // Spaces, quotes and & in one value, % that must not expand, a trailing backslash, an empty argument …
+    const forwarded = [
+      ...plainArgs,
+      'say "a & b" now',
+      '"quoted"',
+      'dir\\',
+      'caret^x',
+      '',
+      'end) & echo broken',
+    ]
+    const printer = join(dir, 'print-args.js')
+    const printed = join(dir, 'printed.json')
+    writeFileSync(printer, `require('fs').writeFileSync(${JSON.stringify(printed)}, JSON.stringify(process.argv.slice(2)))\n`)
+    // A wrapper outside node_modules\.bin that hands %* on, and an npm cmd-shim of the old form, %* inside ( ).
+    writeFileSync(join(dir, 'wrapper.cmd'), `@"${execPath}" "%~dp0print-args.js" %*\r\n`)
+    mkdirSync(join(dir, 'node_modules', '.bin'), { recursive: true })
+    writeFileSync(
+      join(dir, 'node_modules', '.bin', 'print-args.cmd'),
+      `@IF EXIST "%~dp0\\node.exe" (\r\n  "%~dp0\\node.exe" "%~dp0\\..\\..\\print-args.js" %*\r\n) ELSE (\r\n  @SETLOCAL\r\n` +
+        `  "${execPath}" "%~dp0\\..\\..\\print-args.js" %*\r\n)\r\n`,
+    )
+    for (const program of [join(dir, 'wrapper.cmd'), join(dir, 'node_modules', '.bin', 'print-args.cmd')]) {
+      rmSync(printed, { force: true })
+      const result = await runProgram(machine, program, forwarded)
+      assert.equal(result.code, 0, JSON.stringify(result))
+      assert.deepEqual(JSON.parse(readFileSync(printed, 'utf8')), forwarded, program)
+    }
   })
 })
 
@@ -196,36 +220,33 @@ test('запуск команды: время начала и длительно
   assert.equal(machine.starts[0]?.timeoutMs, 5000)
 })
 
-test('команда не найдена на Windows: cmd.exe вышел с 9009 или с 1, а первого слова нет ни среди команд cmd.exe, ни в каталоге, ни в PATH → ошибка с причиной; настоящий выход с 1 — без ошибки', async () => {
-  const exits: Record<string, number> = {
-    'agent-queue-missing-tool --flag': 1,
-    'other-missing-tool': 9009,
-    'npm run test:windows': 1,
-    'exit /b 1': 1,
-    'build --all': 1,
+test('«команда не найдена» решает вердикт оболочки: 127 у sh, 9009 у cmd.exe; любой другой выход — результат самой команды с её кодом и выводом', async () => {
+  const lines: Record<string, { code: number; stderr?: string }> = {
+    'other-missing-tool --flag': { code: 9009, stderr: "'other-missing-tool' is not recognized as an internal or external command." },
+    'cd C:\\work && missing-tool': { code: 9009 },
+    // A real program behind a variable that exits with 1, and cmd.exe saying «not found» with exit 1: both stay the
+    // command's own failed result, with the code and the shell's message.
+    '"%TOOLS%\\check.exe" --strict': { code: 1, stderr: 'check: 2 problems\r\n' },
+    'agent-queue-missing-tool': { code: 1, stderr: "'agent-queue-missing-tool' is not recognized as an internal or external command.\r\n" },
+    'exit /b 1': { code: 1 },
   }
   const win = fakeMachine({
     platform: 'win32',
-    env: { Path: 'C:\\Tools', PATHEXT: '.COM;.EXE;.BAT;.CMD', ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
-    executables: ['C:\\Tools\\npm.cmd', 'C:\\work\\demo-shop\\build.bat'],
-    answer: (request) => {
-      const line = (request.args[3] ?? '').replace(/^"|"$/g, '')
-      return { code: exits[line] ?? 0, stderr: `'${line.split(' ')[0]}' is not recognized as a command.\r\n` }
-    },
+    env: { Path: 'C:\\Tools', ComSpec: 'C:\\Windows\\System32\\cmd.exe', TOOLS: 'C:\\Tools' },
+    answer: (request) => lines[(request.args[3] ?? '').replace(/^"|"$/g, '')] ?? {},
   })
   const run = (line: string) => runShell(win, line, { cwd: 'C:\\work\\demo-shop' })
-  const missing = await run('agent-queue-missing-tool --flag')
-  assert.equal(missing.code, 1)
-  assert.equal(missing.error?.kind, 'not_found', JSON.stringify(missing))
-  assert.match(missing.error?.reason ?? '', /agent-queue-missing-tool \(exit 1\)/)
-  const other = await run('other-missing-tool')
-  assert.equal(other.code, 9009)
-  assert.equal(other.error?.kind, 'not_found')
-  // A program in PATH, a command of cmd.exe and a batch file of the run's directory that exit with 1: their own result.
-  for (const line of ['npm run test:windows', 'exit /b 1', 'build --all']) {
+  for (const line of ['other-missing-tool --flag', 'cd C:\\work && missing-tool']) {
+    const result = await run(line)
+    assert.equal(result.code, 9009, line)
+    assert.equal(result.error?.kind, 'not_found', line)
+  }
+  assert.match((await run('other-missing-tool --flag')).error?.reason ?? '', /exit 9009\): 'other-missing-tool' is not recognized/)
+  for (const line of ['"%TOOLS%\\check.exe" --strict', 'agent-queue-missing-tool', 'exit /b 1']) {
     const result = await run(line)
     assert.equal(result.code, 1, line)
     assert.equal(result.error, null, line)
+    assert.equal(result.stderr, lines[line]?.stderr ?? '', line)
   }
 
   const linux = fakeMachine({ platform: 'linux', answer: (request) => ({ code: request.args[1] === 'missing-tool' ? 127 : 1 }) })
@@ -365,6 +386,71 @@ test('тайм-аут: останавливается всё дерево про
         alive = false
       }
     }
+    // Stopped here if the tree was not: a failed test, not one that keeps the test run waiting.
+    if (alive) kill(grandchild, 'SIGKILL')
     assert.equal(alive, false, `the child ${grandchild} of the stopped program still runs`)
   })
+})
+
+test('окружение внешних команд на Windows: APPDATA и LOCALAPPDATA, которых Orca не даёт воркеру, — из домашнего каталога, gh находит свой каталог', async () => {
+  const full = {
+    USERPROFILE: 'C:\\Users\\Avery',
+    Path: 'C:\\Tools',
+    PATHEXT: '.COM;.EXE;.BAT;.CMD',
+    SystemRoot: 'C:\\Windows',
+    APPDATA: 'C:\\Users\\Avery\\AppData\\Roaming',
+    LOCALAPPDATA: 'C:\\Users\\Avery\\AppData\\Local',
+  }
+  const workerEnv = orcaWorkerEnv(full, 'win32')
+  assert.equal(workerEnv.APPDATA, undefined)
+  const win = fakeMachine({ platform: 'win32', env: workerEnv, executables: ['C:\\Tools\\gh.exe'] })
+  await runProgram(win, 'gh', ['auth', 'status'])
+  await runShell(win, 'npm test')
+  for (const start of win.starts) {
+    assert.equal(start.env.APPDATA, 'C:\\Users\\Avery\\AppData\\Roaming')
+    assert.equal(start.env.LOCALAPPDATA, 'C:\\Users\\Avery\\AppData\\Local')
+    assert.equal(start.env.PATH, 'C:\\Tools')
+  }
+  // Values the worker or the run has are kept.
+  const own = fakeMachine({ platform: 'win32', env: { ...workerEnv, AppData: 'D:\\Roaming' }, executables: ['C:\\Tools\\gh.exe'] })
+  await runProgram(own, 'gh', ['auth', 'status'], { env: { LOCALAPPDATA: 'E:\\Local' } })
+  const env0 = own.starts[0]?.env ?? {}
+  assert.deepEqual(
+    Object.entries(env0).filter(([name]) => /^(appdata|localappdata)$/i.test(name)),
+    [['AppData', 'D:\\Roaming'], ['LOCALAPPDATA', 'E:\\Local']],
+  )
+  // macOS and Linux: the environment as it is.
+  const linuxEnv = orcaWorkerEnv({ HOME: '/home/avery', PATH: '/usr/bin' }, 'linux')
+  const linux = fakeMachine({ platform: 'linux', env: linuxEnv, executables: ['/usr/bin/gh'] })
+  await runProgram(linux, 'gh', ['auth', 'status'])
+  assert.deepEqual(linux.starts[0]?.env, linuxEnv)
+})
+
+testWithContext('окружение внешних команд на Windows: настоящий поддельный gh в окружении воркера Orca видит APPDATA профиля', async (t) => {
+  if (!windows) {
+    t.skip('только Windows: APPDATA')
+    return
+  }
+  await withTempDir(async (dir) => {
+    writeFileSync(join(dir, 'gh.cmd'), `@"${execPath}" -e "process.stdout.write(process.env.APPDATA || '')"\r\n`)
+    const workerEnv = orcaWorkerEnv({ ...env, PATH: dir, Path: undefined }, 'win32')
+    const result = await runProgram(realMachine({ env: workerEnv }), 'gh', ['auth', 'status'])
+    assert.equal(result.code, 0, JSON.stringify(result))
+    assert.equal(result.stdout, join(env.USERPROFILE ?? '', 'AppData', 'Roaming'))
+  })
+})
+
+test('запуск программы на Windows: путь с расширением запускается как задан, даже если PATHEXT его не знает; имя без расширения — с расширениями PATHEXT', async () => {
+  const cli = 'C:\\Users\\Avery\\AppData\\Local\\Programs\\Orca\\resources\\bin\\orca.exe'
+  const win = fakeMachine({
+    platform: 'win32',
+    env: { Path: 'C:\\Tools', PATHEXT: '.CMD;.BAT', COMSPEC: 'C:\\Windows\\System32\\cmd.exe' },
+    executables: [cli, 'C:\\Tools\\orca.exe', 'C:\\Tools\\orca.cmd'],
+  })
+  await runProgram(win, cli, ['status', '--json'])
+  await runProgram(win, 'orca', ['status', '--json'])
+  assert.deepEqual(
+    win.starts.map(({ file, args }) => [file, ...args].join(' ')),
+    [`${cli} status --json`, 'C:\\Windows\\System32\\cmd.exe /e:ON /v:OFF /d /c ""C:\\Tools\\orca.cmd" status --json"'],
+  )
 })

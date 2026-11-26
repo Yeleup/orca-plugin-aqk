@@ -43,6 +43,10 @@ export type StartOutcome = {
   // True when the middle of a stream was left out of `stdout` or `stderr` (`outputFile` has it all).
   readonly truncated: boolean
   readonly timedOut: boolean
+  // Why `outputFile` lacks output (it could not be written whole), or null.
+  readonly outputError: string | null
+  // After a timeout: why the processes the started one started may still run, or null.
+  readonly stopError: string | null
   // Set when the process could not be started (e.g. ENOENT): Node's code and message.
   readonly startError: { readonly code: string | null; readonly message: string } | null
 }

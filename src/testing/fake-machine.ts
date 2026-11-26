@@ -137,6 +137,8 @@ export function fakeMachine(options: FakeMachineOptions): FakeMachine {
         stderr: answer.stderr ?? '',
         truncated: answer.truncated ?? false,
         timedOut: answer.timedOut ?? false,
+        outputError: answer.outputError ?? null,
+        stopError: answer.stopError ?? null,
         startError: answer.startError ?? null,
       }
     },

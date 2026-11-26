@@ -61,13 +61,13 @@ export function isScreenReader(machine: Pick<Machine, 'platform'>, command: stri
 // Where Orca's installation puts its CLI on each system, in the order they are tried. From the code of Orca 1.4.274
 // (out/main of its app.asar: the CLI installer, the bundled CLI of each system, the deb/rpm after-install script):
 // - First, on every system, the CLI of the very Orca that runs the worker: the worker is forked from Orca's main
-//   process, so `execPath` is Orca's executable and its resources hold the CLI — <dir>/resources/bin/orca-ide on Linux,
-//   <dir>\resources\bin\orca.exe on Windows (any install directory, e.g. NSIS /D), <App>.app/Contents/Resources/bin/orca
-//   on macOS.
+//   process, so `execPath` is Orca's executable and its resources hold the CLI — <dir>/resources/bin/orca-ide on
+//   Linux, <dir>\resources\bin\orca.exe on Windows (any install directory, e.g. NSIS /D),
+//   <App>.app/Contents/Resources/bin/orca on macOS.
 // - Linux: ~/.local/bin/orca-ide — the command Orca registers; <XDG cache>/orca/appimage/launcher/orca-ide (by default
 //   ~/.cache/…) — the stable launcher of the AppImage; /usr/bin/orca-ide — the link the deb and rpm packages make; the
-//   CLI inside those packages in /opt/Orca, /opt/orca-ide or /opt/orca. XDG_CACHE_HOME counts only when the worker has it
-//   (folders.ts).
+//   CLI inside those packages in /opt/Orca, /opt/orca-ide or /opt/orca. XDG_CACHE_HOME counts only when the worker has
+//   it (folders.ts).
 // - macOS: /usr/local/bin/orca, or ~/.local/bin/orca where /usr/local/bin is missing — the command Orca registers;
 //   Orca.app in /Applications or ~/Applications.
 // - Windows: Orca in <Local AppData>\Programs\Orca (per user; %LOCALAPPDATA% when the worker has it, otherwise

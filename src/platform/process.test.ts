@@ -1,0 +1,138 @@
+// Starting real processes with parts of the system replaced (ProcessIo): a disk that writes little at a time or fails, a
+// Windows run on any system with a taskkill that fails or a console code page, and the decoding of Windows output.
+import { assert, test } from 'orca/testing'
+import { mkdtempSync, readFileSync, rmSync, writeSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { execPath, kill } from 'node:process'
+import { realMachine } from './machine'
+import { askCodePage, decodeOutput, REAL_IO, startProcess, type ProcessIo } from './process'
+import { runProgram } from './run'
+
+async function withTempDir(body: (dir: string) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-queue-process-'))
+  try {
+    await body(dir)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// This computer, its processes started with `io`.
+function machineWith(io: ProcessIo) {
+  return realMachine({ start: (request) => startProcess(request, io) })
+}
+
+const PRINT = "process.stdout.write('A'.repeat(1000) + '\\n'); process.stderr.write('B'.repeat(500) + '\\n')"
+
+test('файл вывода: запись по частям доходит до конца; отказ диска после открытия файла — результат с причиной, воркер не падает', async () => {
+  await withTempDir(async (dir) => {
+    // The system writes at most 7 bytes at a time: every byte still reaches the file.
+    const short = join(dir, 'short.log')
+    const piecemeal: ProcessIo = {
+      ...REAL_IO,
+      write: (fd, bytes, offset) => writeSync(fd, bytes, offset, Math.min(7, bytes.length - offset)),
+    }
+    const whole = await runProgram(machineWith(piecemeal), execPath, ['-e', PRINT], { outputFile: short })
+    assert.equal(whole.error, null, JSON.stringify(whole.error))
+    const text = readFileSync(short, 'utf8')
+    assert.equal(text.length, 1001 + 501)
+    assert.ok(text.includes('A'.repeat(1000)) && text.includes('B'.repeat(500)))
+
+    // The disk fills up after 100 bytes: the run says so, its output in memory is whole, nothing is thrown.
+    const full = join(dir, 'full.log')
+    let written = 0
+    const filling: ProcessIo = {
+      ...REAL_IO,
+      write: (fd, bytes, offset) => {
+        if (written >= 100) throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' })
+        const count = writeSync(fd, bytes, offset, Math.min(100 - written, bytes.length - offset))
+        written += count
+        return count
+      },
+    }
+    const cut = await runProgram(machineWith(filling), execPath, ['-e', PRINT], { outputFile: full })
+    assert.equal(cut.code, 0)
+    assert.equal(cut.error?.kind, 'output_failed')
+    assert.match(cut.error?.reason ?? '', /ENOSPC: no space left on device.*lacks the rest of the output/)
+    assert.equal(cut.stdout, `${'A'.repeat(1000)}\n`)
+    assert.equal(readFileSync(full, 'utf8').length, 100)
+
+    // Closing the file fails: the same.
+    const closing: ProcessIo = {
+      ...REAL_IO,
+      close: (fd) => {
+        REAL_IO.close(fd)
+        throw Object.assign(new Error('EIO: i/o error, close'), { code: 'EIO' })
+      },
+    }
+    const unclosed = await runProgram(machineWith(closing), execPath, ['-e', PRINT], { outputFile: join(dir, 'close.log') })
+    assert.equal(unclosed.error?.kind, 'output_failed')
+    assert.match(unclosed.error?.reason ?? '', /EIO: i\/o error, close/)
+  })
+})
+
+test('тайм-аут на Windows: taskkill запустился, но вышел с ошибкой — остановлен хотя бы запущенный процесс, причина в результате', async () => {
+  // A taskkill that fails: Node.js run with taskkill's arguments exits 1 (there is no script «/pid»).
+  const io: ProcessIo = { ...REAL_IO, windows: true, taskkill: () => execPath }
+  const began = Date.now()
+  const script = "process.stdout.write(process.pid + '\\n'); setInterval(() => {}, 1000)"
+  const result = await runProgram(machineWith(io), execPath, ['-e', script], { timeoutMs: 1000 })
+  assert.ok(Date.now() - began < 15_000, `the result took ${Date.now() - began} ms`)
+  assert.equal(result.error?.kind, 'timed_out')
+  assert.match(result.error?.reason ?? '', /stopped after 1000 ms without an answer; taskkill exited 1/)
+  assert.match(result.error?.reason ?? '', /only the started process was stopped/)
+  const pid = Number(result.stdout.trim())
+  let alive = true
+  for (let i = 0; i < 30 && alive; i++) {
+    try {
+      kill(pid, 0)
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    } catch {
+      alive = false
+    }
+  }
+  if (alive) kill(pid, 'SIGKILL')
+  assert.equal(alive, false, `the started process ${pid} still runs`)
+})
+
+test('вывод на Windows: кодовая страница консоли спрашивается только для вывода не в UTF-8, со своим пределом времени', async () => {
+  let asked = 0
+  const io: ProcessIo = {
+    ...REAL_IO,
+    windows: true,
+    codePage: async () => {
+      asked++
+      return 866
+    },
+  }
+  const machine = machineWith(io)
+  const utf8 = await runProgram(machine, execPath, ['-e', "process.stdout.write('Ошибка: файл не найден\\n')"])
+  assert.equal(utf8.stdout, 'Ошибка: файл не найден\n')
+  const empty = await runProgram(machine, execPath, ['-e', ''])
+  assert.equal(empty.stdout, '')
+  assert.equal(asked, 0, 'the code page was asked for UTF-8 or empty output')
+  // «Ошибка» in code page 866.
+  const oem = await runProgram(machine, execPath, ['-e', 'process.stdout.write(Buffer.from([0x8e, 0xe8, 0xa8, 0xa1, 0xaa, 0xa0]))'])
+  assert.equal(oem.stdout, 'Ошибка')
+  assert.equal(asked, 1)
+
+  // The question itself: the number after localized words; no answer within the limit — none, and the query stops.
+  const say = (text: string) => askCodePage(execPath, ['-e', `process.stdout.write(${JSON.stringify(text)})`], 10_000)
+  assert.equal(await say('Active code page: 850\r\n'), 850)
+  assert.equal(await say('Текущая кодовая страница: 866\r\n'), 866)
+  assert.equal(await say('no number'), null)
+  const began = Date.now()
+  assert.equal(await askCodePage(execPath, ['-e', 'setInterval(() => {}, 1000)'], 300), null)
+  assert.ok(Date.now() - began < 5_000, `a hanging chcp held the result for ${Date.now() - began} ms`)
+})
+
+test('вывод на Windows: все OEM-страницы консоли — 437, 850, 858 и другие по таблицам, 866 и азиатские через TextDecoder', () => {
+  // 0x9B: ¢ in 437, ø in 850; 0xD5: ı in 850, € in 858; 0x80: Ç in both.
+  assert.equal(decodeOutput(new Uint8Array([0x80, 0x9b, 0x41]), 437), 'Ç¢A')
+  assert.equal(decodeOutput(new Uint8Array([0x80, 0x9b, 0xd5]), 850), 'Çøı')
+  assert.equal(decodeOutput(new Uint8Array([0xd5]), 858), '€')
+  assert.equal(decodeOutput(new Uint8Array([0x8e, 0xe8, 0xa8, 0xa1, 0xaa, 0xa0]), 866), 'Ошибка')
+  // A code page nobody knows: UTF-8 with replacement characters (the output file keeps the bytes).
+  assert.equal(decodeOutput(new Uint8Array([0x41, 0x9b]), 12345), 'A�')
+})

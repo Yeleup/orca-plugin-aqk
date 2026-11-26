@@ -287,3 +287,16 @@ test('К14.5 (поиск): CLI, который не отвечает и держ
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('К14.5 (поиск): без PATH и с урезанным PATHEXT (без .EXE) — orca.exe установки Orca находится и проверяется', async () => {
+  const cli = 'C:\\Users\\Avery\\AppData\\Local\\Programs\\Orca\\resources\\bin\\orca.exe'
+  const machine = fakeMachine({
+    platform: 'win32',
+    env: { PATHEXT: '.CMD;.BAT', USERPROFILE: 'C:\\Users\\Avery' },
+    executables: [cli],
+    answer: answers([cli]),
+  })
+  const search = await findOrcaCli(machine)
+  assert.deepEqual(started(machine), [`${cli} status --json`])
+  assert.ok(search.found && search.file === cli && search.source === 'known path', JSON.stringify(search))
+})

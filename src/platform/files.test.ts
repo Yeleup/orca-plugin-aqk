@@ -1,10 +1,10 @@
-// Creating a file only if absent (the coordinator id's file), on the real disk: with hard links, and on a file system
-// without them, where the finished text is renamed under a lock.
+// Creating a file only if absent (the coordinator id's file), on the real disk: the finished text gets its name by a
+// hard link only, so an existing file is never replaced; without hard links nothing is created.
 import { assert, test } from 'orca/testing'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, utimesSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createText, LOCK_STALE_MS, type PublishOps } from './files'
+import { createText } from './files'
 
 async function withTempDir(body: (dir: string) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'agent-queue-files-'))
@@ -15,49 +15,30 @@ async function withTempDir(body: (dir: string) => Promise<void>): Promise<void> 
   }
 }
 
-// A file system without hard links; each rename is checked first: the name is free and the file is finished.
-function withoutHardLinks(path: string, text: string, renames: string[]): PublishOps {
-  return {
-    link: () => {
-      throw Object.assign(new Error('operation not supported'), { code: 'ENOTSUP' })
-    },
-    rename: (from, to) => {
-      assert.equal(to, path)
-      assert.equal(existsSync(to), false, 'the name was taken before the rename')
-      assert.equal(readFileSync(from, 'utf8'), text, 'the file was renamed before it was written whole')
-      renames.push(to)
-      renameSync(from, to)
-    },
-  }
-}
-
-test('создание файла: с жёсткими ссылками — только если его нет, без временных файлов рядом', async () => {
+test('создание файла: только если его нет — из нескольких писателей сразу ровно один, существующий файл не заменяется, временных файлов не остаётся', async () => {
   await withTempDir(async (dir) => {
     const path = join(dir, 'state', 'coordinator-id')
-    assert.equal(await createText(path, 'first\n'), true)
-    assert.equal(await createText(path, 'second\n'), false)
-    assert.equal(readFileSync(path, 'utf8'), 'first\n')
+    const texts = ['first\n', 'second\n', 'third\n', 'fourth\n']
+    const created = await Promise.all(texts.map((text) => createText(path, text)))
+    assert.equal(created.filter(Boolean).length, 1, JSON.stringify(created))
+    const winner = texts[created.indexOf(true)]
+    assert.equal(readFileSync(path, 'utf8'), winner)
+    assert.equal(await createText(path, 'later\n'), false)
+    assert.equal(readFileSync(path, 'utf8'), winner)
     assert.deepEqual(readdirSync(join(dir, 'state')), ['coordinator-id'])
   })
 })
 
-test('создание файла без жёстких ссылок: готовый файл получает имя переименованием под блокировкой; занятое имя и брошенная блокировка', async () => {
+test('создание файла без жёстких ссылок: ошибка с причиной, файл не создаётся и ничего не заменяется', async () => {
   await withTempDir(async (dir) => {
     const path = join(dir, 'coordinator-id')
-    const renames: string[] = []
-    assert.equal(await createText(path, 'first\n', withoutHardLinks(path, 'first\n', renames)), true)
-    assert.equal(await createText(path, 'second\n', withoutHardLinks(path, 'second\n', renames)), false)
-    assert.deepEqual(renames, [path])
-    assert.equal(readFileSync(path, 'utf8'), 'first\n')
-    assert.deepEqual(readdirSync(dir), ['coordinator-id'])
-
-    // A writer died holding the lock, before its rename: the next start takes the old lock over and publishes.
-    const next = join(dir, 'next-id')
-    mkdirSync(`${next}.lock`)
-    const old = (Date.now() - LOCK_STALE_MS - 5_000) / 1000
-    utimesSync(`${next}.lock`, old, old)
-    assert.equal(await createText(next, 'third\n', withoutHardLinks(next, 'third\n', renames)), true)
-    assert.equal(readFileSync(next, 'utf8'), 'third\n')
-    assert.deepEqual(readdirSync(dir).sort(), ['coordinator-id', 'next-id'])
+    const noLinks = {
+      link: () => {
+        throw Object.assign(new Error('operation not supported'), { code: 'ENOTSUP' })
+      },
+    }
+    await assert.rejects(createText(path, 'first\n', noLinks), /the file system has no hard links \(ENOTSUP\)/)
+    assert.equal(existsSync(path), false)
+    assert.deepEqual(readdirSync(dir), [])
   })
 })
