@@ -674,6 +674,101 @@ test('Настройки: запись последней правки отка�
   }
 })
 
+const INTERVAL_FIELD = { label: 'Интервал проверки очереди, минут' }
+const NOTIFICATIONS_SWITCH = { label: 'Уведомления о мержах' }
+const INTERVAL_ERROR = `Введите целое число минут, не меньше ${MIN_INTERVAL_MINUTES}`
+const REFUSAL_RU = { tone: 'danger', text: 'Не удалось сохранить: хранилище плагина недоступно' }
+
+/** The interval field holds `text` with its error, marked. */
+function assertFieldError(panel: TestPanel, text: string, where: string): void {
+  assert.equal(panel.valueOf(INTERVAL_FIELD), text, `${where}: в поле не то, что набрано`)
+  assert.equal(panel.find(INTERVAL_FIELD)?.props.invalid, true, `${where}: поле не помечено`)
+  assert.ok(panel.find({ type: 'Text', text: INTERVAL_ERROR }), `${where}: нет ошибки у поля`)
+}
+
+test('Настройки: запись числа закончилась, когда в поле уже текст с ошибкой («50» → «50x») → «Сохранено.» не появляется; отказ в записи — сразу «Не удалось сохранить»', async () => {
+  for (const refused of [false, true]) {
+    const where = refused ? 'отказ в записи 50' : '50 сохранено'
+    const writes = heldSettings(RU)
+    const panel = await open(hostWith({ results: writes.results }))
+    await openSettings(panel)
+    assert.equal(panel.valueOf(INTERVAL_FIELD), '5')
+
+    // «0» after «5»: the write of 50 is held back.
+    const typingNumber = await drawnAfter(() => panel.type(INTERVAL_FIELD, '0'))
+    await writes.written(1)
+    assert.equal(panel.valueOf(INTERVAL_FIELD), '50')
+    // «x» after it — a separate input event: text with an error, nothing more to write.
+    const typingError = await drawnAfter(() => panel.type(INTERVAL_FIELD, 'x'))
+    assertFieldError(panel, '50x', `${where}, после «x»`)
+    assert.deepEqual(callouts(panel), [], `${where}: строка после «x»`)
+    assert.deepEqual(
+      writes.held.map((write) => [write.key, write.value]),
+      [[SETTING_KEYS.queueCheckInterval, 50]],
+    )
+
+    // The write of 50 ends: the field keeps «50x» with its error; saved — no line, refused — the refusal at once.
+    await redrawnAfter(() => {
+      if (refused) writes.held[0]?.refuse('хранилище плагина недоступно')
+      else writes.held[0]?.land()
+    })
+    await typingNumber.acting
+    await typingError.acting
+    assert.equal(writes.held.length, 1, `${where}: в хранилище ушла не одна запись`)
+    assert.equal(writes.store[SETTING_KEYS.queueCheckInterval], refused ? undefined : 50, where)
+    assert.equal(parseSettings(writes.store).queueCheckInterval, refused ? 5 : 50, where)
+    assertFieldError(panel, '50x', `${where}, после конца записи`)
+    assert.deepEqual(callouts(panel), refused ? [REFUSAL_RU] : [], `${where}: строка после конца записи`)
+    assertClean(panel)
+  }
+})
+
+test('Настройки: запись другой настройки закончилась, когда в поле интервала текст с ошибкой → «Сохранено…» не появляется', async () => {
+  const writes = heldSettings(RU)
+  const panel = await open(hostWith({ results: writes.results }))
+  await openSettings(panel)
+
+  // «Уведомления о мержах» off: the write is held back.
+  const toggling = await drawnAfter(() => panel.toggle(NOTIFICATIONS_SWITCH))
+  await writes.written(1)
+  // «x» after «5» in the field — a separate input event.
+  const typing = await drawnAfter(() => panel.type(INTERVAL_FIELD, 'x'))
+  assertFieldError(panel, '5x', 'после «x»')
+  assert.deepEqual(callouts(panel), [])
+
+  // The switch's write is saved: the switch is off and saved, the field keeps «5x» with its error, no line.
+  await redrawnAfter(() => writes.held[0]?.land())
+  await toggling.acting
+  await typing.acting
+  assert.equal(panel.valueOf(NOTIFICATIONS_SWITCH), false)
+  assert.equal(writes.store[SETTING_KEYS.mergeNotifications], false)
+  assertFieldError(panel, '5x', 'после конца записи')
+  assert.deepEqual(callouts(panel), [], 'строка «Сохранено…» при тексте с ошибкой в поле')
+  assert.equal(writes.held.length, 1)
+  assertClean(panel)
+})
+
+test('Настройки: в поле интервала текст с ошибкой → переключатель сохраняется без строки «Сохранено…»; верное число в поле — снова «Сохранено.»', async () => {
+  const host = hostWith({ settings: RU })
+  const panel = await open(host)
+  await openSettings(panel)
+  await panel.type(INTERVAL_FIELD, 'x')
+  assertFieldError(panel, '5x', 'после «x»')
+
+  await panel.toggle(NOTIFICATIONS_SWITCH)
+  assert.equal(stored(host)[SETTING_KEYS.mergeNotifications], false)
+  assert.equal(panel.valueOf(NOTIFICATIONS_SWITCH), false)
+  assertFieldError(panel, '5x', 'после переключателя')
+  assert.deepEqual(callouts(panel), [], 'строка «Сохранено…» при тексте с ошибкой в поле')
+
+  await panel.type(INTERVAL_FIELD, '10', { replace: true })
+  assert.equal(stored(host)[SETTING_KEYS.queueCheckInterval], 10)
+  assert.equal(panel.valueOf(INTERVAL_FIELD), '10')
+  assert.equal(panel.find({ type: 'Text', text: INTERVAL_ERROR }), null)
+  assert.deepEqual(callouts(panel), [{ tone: 'success', text: SAVED_RU }])
+  assertClean(panel)
+})
+
 test('Настройки: English → Русский при выключенных переключателях — строка русского кадра о них; English → «Saved.» во всех четырёх английских кадрах', async () => {
   const cases: [boolean, boolean, string][] = [
     [false, true, NOTIFICATIONS_OFF_RU], // nastroyki-english-uv → nastroyki-uvedomleniya-vykl

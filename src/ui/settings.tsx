@@ -3,8 +3,9 @@
 // the selected project's .agent-queue.json and .agent-queue.md in Orca's editor (through the worker). A change is saved
 // at once: each control shows the person's latest change while its write is on its way; when that write ends, the
 // control shows the saved value, or after a refusal the previous one again — never one a failed write did not save.
-// A new change takes away the line above the settings; «Сохранено» (with what the switches now mean, where the frames
-// say so) comes only once nothing the screen shows is still on its way, «Не удалось сохранить: <ошибка>» at once.
+// A new change takes away the line above the settings. «Сохранено» (with what the switches now mean, where the frames
+// say so) comes only once everything the screen shows is written: no write on its way, no typed text with an error in
+// the interval field, no refusal since the last change. «Не удалось сохранить: <ошибка>» comes at once.
 import { atom, Button, Callout, Input, plugin, read, Row, Select, set, settings, Stack, Switch, Text } from 'orca'
 import { LANGUAGES, type Language, type MessageKey } from '../i18n/catalog'
 import { PROJECT_FILES, type Project, type ProjectFile } from '../protocol'
@@ -124,9 +125,10 @@ async function write<N extends SettingName>(at: Route, name: N, value: PluginSet
 /**
  * The write of change `edit` of `name` ended with `notice`. A later change of `name` on its way has the last word: this
  * end changes neither the control nor the line. Otherwise the control shows what Orca keeps now — the new value after
- * a save, the previous one after a refusal — and the line says so: a refusal at once; «Сохранено» only once no other
- * write is on its way, and never over a refusal of this round of changes. The interval's field lets go of its text
- * only if this change typed it.
+ * a save, the previous one after a refusal. The interval's field lets go of its text only if this change typed it. The
+ * line: a refusal at once; «Сохранено» only when, after this end, no write is on its way and the field holds no typed
+ * text (one with an error stays until the next change), and never over a refusal since the last change; otherwise the
+ * line stays as it was.
  */
 function settle(at: Route, name: SettingName, edit: number, notice: Notice): void {
   if (read(route) !== at) return
@@ -135,9 +137,9 @@ function settle(at: Route, name: SettingName, edit: number, notice: Notice): voi
   const pending: Record<string, unknown> = { ...here.pending }
   delete pending[name]
   const field = here.field?.edit === edit ? null : here.field
-  const settled = Object.keys(pending).length === 0
+  const written = Object.keys(pending).length === 0 && field === null
   const shown =
-    notice.kind !== 'saved' ? notice : settled && here.notice?.kind !== 'saveError' ? notice : here.notice
+    notice.kind !== 'saved' ? notice : written && here.notice?.kind !== 'saveError' ? notice : here.notice
   set(visit, { ...here, notice: shown, pending: pending as Pending, field })
 }
 
