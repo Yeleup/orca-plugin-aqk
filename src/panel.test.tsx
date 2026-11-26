@@ -1,13 +1,79 @@
-// The panel's frame (task panel-shell): the screens, «Назад», the project selector, the common loading and error states
-// and the interface languages. Orca's mock host stands in for Orca and, where a test says so, for the worker; the
-// project names are invented.
+// The panel's frame (task panel-shell): the screens, «Назад», the project selector, the common loading and error states,
+// the interface languages and a layout not built for one width. The panel under test is the module the manifest's
+// panel names as its entry, as Orca opens it from the right sidebar. Orca's mock host stands in for Orca and, where a
+// test says so, for the worker; the project names are invented.
 import { settings } from 'orca'
-import { afterEach, assert, hostError, mockHost, mount, mountWorker, test, type TestPanel } from 'orca/testing'
+import {
+  afterEach,
+  assert,
+  hostError,
+  mockHost,
+  mount,
+  mountWorker,
+  test,
+  type TestPanel,
+  type TestQuery,
+  type TreeSnapshot,
+} from 'orca/testing'
+import manifest from '../orca-plugin.json' with { type: 'json' }
 import { catalogs, format, LANGUAGE_SETTING, type Language, type MessageKey } from './i18n/catalog'
-import * as panelModule from './panel'
 import type { Project } from './protocol'
+import { loadLanguage } from './ui/language'
 import { openScreen, SCREENS } from './ui/navigation'
 import * as worker from './worker'
+
+// The panel Orca opens from its right sidebar: the entry of the manifest's components panel `agent-queue`.
+const declared = manifest.contributes.panels.find((contribution) => contribution.id === 'agent-queue')
+if (!declared || declared.ui !== 'components') {
+  throw new Error('orca-plugin.json: no components panel agent-queue in contributes.panels')
+}
+const panelModule = (await import(`../${declared.entry}`)) as typeof import('./panel')
+const DeclaredPanel = panelModule.default
+
+// Every draw of the panel lets the waiters of `nextDraw()` go on. A draw is synchronous — the panel computes its tree and
+// Orca's test runtime takes it at once — so a test that awaits `nextDraw()` sees exactly what the panel drew, with no
+// timer. The panel itself is the declared module, unchanged, inside this observer.
+let drawWaiters: (() => void)[] = []
+function nextDraw(): Promise<void> {
+  return new Promise((resolve) => drawWaiters.push(resolve))
+}
+const observedPanel = {
+  setup: panelModule.setup,
+  default: () => {
+    for (const resolve of drawWaiters.splice(0)) resolve()
+    return <DeclaredPanel />
+  },
+}
+
+/** An answer of the fake worker or host that the test holds back and then lets through with `open`. */
+type Gate<T> = { promise: Promise<T>; open(value: T): void }
+function gate<T>(): Gate<T> {
+  let open: (value: T) => void = () => {}
+  const promise = new Promise<T>((resolve) => {
+    open = resolve
+  })
+  return { promise, open }
+}
+
+/**
+ * Presses `target` while the fake worker holds `held` back: `between()` looks at the panel as it is drawn after the
+ * press and before the answer, then the answer goes through and the panel settles. If the panel drew nothing before
+ * the answer, nothing is left to run and Node's test runner fails the test.
+ */
+async function pressWhileWaiting<T>(
+  panel: TestPanel,
+  target: TestQuery,
+  held: Gate<T>,
+  answer: T,
+  between: () => void,
+): Promise<void> {
+  const drawn = nextDraw()
+  const pressing = panel.press(target)
+  await drawn
+  between()
+  held.open(answer)
+  await pressing
+}
 
 type ProjectsAnswer = { projects: Project[] }
 
@@ -35,10 +101,14 @@ async function open(options: {
 }
 
 /** Mounts the panel, after closing the one a test opened before. */
-async function show(host: ReturnType<typeof mockHost>, theme?: 'light' | 'dark'): Promise<TestPanel> {
+async function show(
+  host: ReturnType<typeof mockHost>,
+  theme?: 'light' | 'dark',
+  target: Parameters<typeof mount>[0] = observedPanel,
+): Promise<TestPanel> {
   await view?.unmount()
   view = undefined
-  view = await mount(panelModule, { host, theme })
+  view = await mount(target, { host, theme })
   return view
 }
 
@@ -53,16 +123,6 @@ function buttons(panel: TestPanel): string[] {
 /** The panel's requests to the worker, in order. */
 function requests(panel: TestPanel): unknown[] {
   return panel.host.callsOf('plugin.request')
-}
-
-/**
- * Inside a worker answer: lets the panel draw what it set before asking (the test runtime draws on its next turn of the
- * event loop, then waits for the answer), turn by turn until `drawn()` holds — at most 20 turns, no wall-clock wait.
- */
-async function untilDrawn(drawn: () => boolean): Promise<void> {
-  for (let turn = 0; turn < 20 && !drawn(); turn++) {
-    await new Promise((resolve) => setTimeout(resolve, 0))
-  }
 }
 
 function skeletons(panel: TestPanel): number {
@@ -182,6 +242,18 @@ test('Каркас панели: у каждого ключа английско
   }
 })
 
+/** Every word a drawn tree shows or names: text, and the label, title, description, placeholder, tooltip and options. */
+function textsIn(tree: TreeSnapshot | string | null): string[] {
+  if (tree === null) return []
+  if (typeof tree === 'string') return [tree]
+  const props = tree.props ?? {}
+  const named = ['label', 'title', 'description', 'placeholder', 'tooltip']
+    .map((name) => props[name])
+    .filter((value): value is string => typeof value === 'string')
+  const options = Array.isArray(props.options) ? (props.options as { label: string }[]).map((option) => option.label) : []
+  return [...named, ...options, ...(tree.children ?? []).flatMap(textsIn)]
+}
+
 // Every word the panel draws is a text of the current language's catalog (a `{name}` part is a value the screen puts
 // in), apart from data: the names of projects.
 function assertTextsFromCatalog(panel: TestPanel, language: Language, data: readonly string[], where: string): void {
@@ -191,23 +263,7 @@ function assertTextsFromCatalog(panel: TestPanel, language: Language, data: read
       const pattern = template.replace(/[.*+?^$()|[\]\\]/g, '\\$&').replace(/\{\w+\}/g, '.+')
       return new RegExp(`^${pattern}$`, 's').test(text)
     })
-  const seen: string[] = []
-  const walk = (node: unknown) => {
-    if (typeof node === 'string') {
-      seen.push(node)
-      return
-    }
-    if (!node || typeof node !== 'object') return
-    const { props, children } = node as { props?: Record<string, unknown>; children?: unknown[] }
-    for (const name of ['label', 'title', 'description', 'placeholder', 'tooltip']) {
-      if (typeof props?.[name] === 'string') seen.push(props[name] as string)
-    }
-    if (Array.isArray(props?.options)) {
-      for (const option of props.options as { label: string }[]) seen.push(option.label)
-    }
-    for (const child of children ?? []) walk(child)
-  }
-  walk(panel.tree())
+  const seen = textsIn(panel.tree())
   assert.ok(seen.length > 0, `${where}: нет текстов`)
   for (const text of seen) {
     assert.ok(data.includes(text) || fromCatalog(text), `${where} (${language}): «${text}» не из каталога строк`)
@@ -224,38 +280,34 @@ test('Каркас панели: ни одной строки экрана ми�
     }
 
     let calls = 0
-    let loading = false
+    const retry = gate<ProjectsAnswer>()
     const failing = await open({
       language,
-      list: async () => {
+      list: () => {
         calls++
         if (calls === 1) throw hostError('action_failed', 'worker stopped')
-        // The retry: the panel draws its loading rows while the worker has not answered.
-        await untilDrawn(() => skeletons(failing) > 0)
-        assert.ok(skeletons(failing) > 0, `${language}: при повторе нет заготовок строк`)
-        assertTextsFromCatalog(failing, language, [], 'загрузка')
-        loading = true
-        return { projects: [SHOP] }
+        return retry.promise
       },
     })
     assertTextsFromCatalog(failing, language, ['worker stopped'], 'ошибка')
-    await failing.press({ type: 'Button', text: format(language, 'state.retry') })
-    assert.ok(loading, 'повтор не дошёл до воркера')
+    // The retry: while the worker has not answered, the panel shows its loading rows.
+    await pressWhileWaiting(failing, { type: 'Button', text: format(language, 'state.retry') }, retry, { projects: [SHOP] }, () => {
+      assert.ok(skeletons(failing) > 0, `${language}: при повторе нет заготовок строк`)
+      assertTextsFromCatalog(failing, language, [], 'загрузка')
+    })
+    assert.equal(calls, 2, 'повтор не дошёл до воркера')
   }
 })
 
 test('Каркас панели: ответ воркера на plugin.request с ошибкой → экран в состоянии ошибки с «Повторить»; нажатие повторяет запрос', async () => {
   let calls = 0
-  let duringRetry: string[] = []
+  const retry = gate<ProjectsAnswer>()
   const panel = await open({
     language: 'ru',
-    list: async () => {
+    list: () => {
       calls++
       if (calls === 1) throw hostError('action_failed', 'каталог данных недоступен')
-      // While the worker has not answered the retry, the screen shows its loading rows.
-      await untilDrawn(() => skeletons(panel) > 0)
-      duringRetry = panel.summary()
-      return { projects: [SHOP, BLOG] }
+      return retry.promise
     },
   })
 
@@ -268,13 +320,16 @@ test('Каркас панели: ответ воркера на plugin.request �
   assert.equal(panel.find({ role: 'combobox' }), null)
   assert.deepEqual(requests(panel), [{ name: 'projects.list' }])
 
-  await panel.press({ type: 'Button', text: 'Повторить' })
-  assert.deepEqual(requests(panel), [{ name: 'projects.list' }, { name: 'projects.list' }], '«Повторить» не повторил запрос')
-  assert.ok(
-    duringRetry.filter((line) => line.startsWith('Skeleton')).length >= 3,
-    `при повторе нет заготовок строк: ${JSON.stringify(duringRetry)}`,
-  )
-  assert.ok(!duringRetry.some((line) => line.startsWith('Callout')), 'при повторе осталась прежняя ошибка')
+  // «Повторить»: the same request goes to the worker again, and until it answers the screen shows its loading rows
+  // instead of the old error.
+  await pressWhileWaiting(panel, { type: 'Button', text: 'Повторить' }, retry, { projects: [SHOP, BLOG] }, () => {
+    assert.deepEqual(requests(panel), [{ name: 'projects.list' }, { name: 'projects.list' }], '«Повторить» не повторил запрос')
+    const drawn = panel.summary()
+    assert.ok(drawn.filter((line) => line.startsWith('Skeleton')).length >= 3, `при повторе нет заготовок строк: ${JSON.stringify(drawn)}`)
+    assert.ok(!drawn.some((line) => line.startsWith('Callout')), 'при повторе осталась прежняя ошибка')
+    assert.deepEqual(buttons(panel), [], 'при повторе остались кнопки')
+  })
+  assert.equal(calls, 2)
 
   assert.equal(panel.find({ type: 'Callout' }), null, 'ошибка осталась после удачного повтора')
   assert.deepEqual(buttons(panel), MENU_RU)
@@ -353,4 +408,104 @@ test('Каркас панели: светлая и тёмная тема Orca �
     assert.deepEqual(buttons(panel), ['Project check', 'Start MVP', 'Settings', 'Connect project'], theme)
     assertClean(panel)
   }
+})
+
+/** Where a drawn tree gives an element a width in pixels: `width` or `minWidth` as a number. */
+function pixelWidths(tree: TreeSnapshot | string | null, path = ''): string[] {
+  if (tree === null || typeof tree === 'string') return []
+  const here = `${path}/${tree.type}`
+  const props = tree.props ?? {}
+  const found = ['width', 'minWidth']
+    .filter((name) => typeof props[name] === 'number')
+    .map((name) => `${here} ${name}=${String(props[name])}`)
+  return [...found, ...(tree.children ?? []).flatMap((child, index) => pixelWidths(child, `${here}[${index}]`))]
+}
+
+/** The rows of a drawn tree that hold all the buttons `labels` (the menu of «Очередь»). */
+function rowsHolding(tree: TreeSnapshot | string | null, labels: readonly string[]): TreeSnapshot[] {
+  if (tree === null || typeof tree === 'string') return []
+  const children = tree.children ?? []
+  const buttons = children
+    .filter((child): child is TreeSnapshot => typeof child !== 'string' && child.type === 'Button')
+    .map((button) => textsIn(button).join(' '))
+  const here = tree.type === 'Row' && labels.every((label) => buttons.includes(label)) ? [tree] : []
+  return [...here, ...children.flatMap((child) => rowsHolding(child, labels))]
+}
+
+test('Каркас панели: экраны не под одну ширину — ни у одного элемента нет ширины в пикселях (width, minWidth), ряд меню «Очереди» переносится', async () => {
+  const drawn: [string, TreeSnapshot | string | null][] = []
+
+  // Before the language is read: the panel component on its own, whose language nobody reads.
+  const blank = await show(mockHost({ requests: { 'projects.list': { projects: [SHOP] } } }), undefined, () => <DeclaredPanel />)
+  drawn.push(['до чтения языка', blank.tree()])
+
+  const panel = await open({ language: 'ru', projects: [SHOP, BLOG] })
+  for (const screen of SCREENS) {
+    openScreen(screen)
+    await panel.settled()
+    drawn.push([`экран ${screen}`, panel.tree()])
+  }
+  openScreen('queue')
+  await panel.settled()
+  const menus = rowsHolding(panel.tree(), MENU_RU)
+  assert.equal(menus.length, 1, `ряд меню «Очереди»: ${menus.length}`)
+  assert.equal(menus[0]?.props?.wrap, true, 'ряд меню «Очереди» не переносится (wrap)')
+
+  let calls = 0
+  const retry = gate<ProjectsAnswer>()
+  const failing = await open({
+    language: 'ru',
+    list: () => {
+      calls++
+      if (calls === 1) throw hostError('action_failed', 'worker stopped')
+      return retry.promise
+    },
+  })
+  drawn.push(['ошибка', failing.tree()])
+  await pressWhileWaiting(failing, { type: 'Button', text: 'Повторить' }, retry, { projects: [SHOP] }, () => {
+    assert.ok(skeletons(failing) > 0, 'при повторе нет заготовок строк')
+    drawn.push(['загрузка', failing.tree()])
+  })
+
+  assert.deepEqual(drawn.map(([where]) => where), [
+    'до чтения языка',
+    ...SCREENS.map((screen) => `экран ${screen}`),
+    'ошибка',
+    'загрузка',
+  ])
+  for (const [where, tree] of drawn) {
+    assert.ok(tree, `${where}: панель ничего не нарисовала`)
+    assert.deepEqual(pixelWidths(tree), [], `${where}: ширина в пикселях`)
+  }
+})
+
+test('Каркас панели: пока язык интерфейса не прочитан — заготовки строк без имени и без статуса, ни слова на языке Orca; прочитан «Русский» — заготовки с именем из русского каталога', async () => {
+  const languageRead = gate<{ settings: Record<string, string> }>()
+  const host = mockHost({
+    results: { 'settings.get': () => languageRead.promise },
+    requests: { 'projects.list': { projects: [SHOP] } },
+  })
+  // The panel's first draw: the panel component on its own, before anyone reads the language.
+  const panel = await show(host, undefined, () => <DeclaredPanel />)
+  const assertBlank = (when: string) => {
+    assert.equal(skeletons(panel), 0, `${when}: Skeleton — статус с именем на языке Orca`)
+    assert.deepEqual(textsIn(panel.tree()), [], `${when}: тексты до чтения языка`)
+    assert.ok(panel.findAll({ type: 'Box' }).length >= 5, `${when}: нет заготовок строк`)
+  }
+  assertBlank('до чтения')
+
+  // The read the panel's setup starts; Orca has not answered it yet.
+  const reading = loadLanguage()
+  assert.equal(host.callsOf('settings.get').length, 1)
+  assertBlank('пока настройка не ответила')
+
+  languageRead.open({ settings: { [LANGUAGE_SETTING]: 'ru' } })
+  await reading
+  await panel.settled()
+  assert.deepEqual(headings(panel), ['Agent Queue'])
+  const rows = panel.findAll({ type: 'Skeleton' })
+  assert.ok(rows.length >= 3, 'после чтения языка нет заготовок строк')
+  assert.deepEqual([...new Set(rows.map((row) => row.props.label))], ['Загрузка…'])
+  assertTextsFromCatalog(panel, 'ru', [], 'после чтения языка')
+  assertClean(panel)
 })

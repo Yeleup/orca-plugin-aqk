@@ -7,7 +7,7 @@ import { language, loadLanguage } from './ui/language'
 import { route } from './ui/navigation'
 import { connectedProjects, QueueScreen } from './ui/queue'
 import { ScreenFrame } from './ui/screens'
-import { LoadingRows } from './ui/states'
+import { BlankRows } from './ui/states'
 
 /** Runs once before the first render; what it pushes to `subscriptions` ends with the panel. */
 export function setup(ctx: PanelContext): void {
@@ -22,7 +22,8 @@ export function setup(ctx: PanelContext): void {
 }
 
 export default function Panel() {
-  if (read(language) === null) return <LoadingRows />
+  // Until the language is read nothing can be named from the catalogs: unnamed placeholder rows.
+  if (read(language) === null) return <BlankRows />
   const { screen } = read(route)
   if (screen === 'queue') return <QueueScreen />
   return <ScreenFrame screen={screen} />
