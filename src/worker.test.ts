@@ -78,7 +78,8 @@ test('id координатора создаётся один раз, после
   }
 })
 
-test('воркер стартует без вызовов хоста и отказов, в журнале — id координатора', async () => {
+// The delivery tests (tests/delivery.test.mjs) find this test by its name in a nested `make test`: keep the name.
+test('the worker starts without host calls or refusals', async () => {
   const machine = fakeMachine({ platform: 'linux' })
   const worker = await mountWorker({ default: (orca) => startWorker(orca, machine) })
   coordinatorOf(worker.logs)
