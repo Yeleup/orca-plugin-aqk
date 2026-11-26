@@ -21,8 +21,9 @@
 // Not sent — proven that the line of the request was not typed: the CLI is not found or did not start, or Orca refused
 // the line itself (`terminal_handle_stale`, `invalid_argument`, `agent_prompt_blocked`, `incompatible_runtime`).
 // Unknown — anything else: no JSON, a timeout, `runtime_unavailable` (Orca's CLI answers it both before the request
-// leaves and after the connection closed behind it), any other refusal, and every answer in which Orca itself calls the
-// outcome unknown (`error.data.deliveryOutcome: "unknown"`).
+// leaves and after the connection closed behind it), any other refusal, every answer in which Orca itself calls the
+// outcome unknown (`error.data.deliveryOutcome: "unknown"`), and an answer without the terminal's receipt (no
+// `result.send.accepted` true or false).
 import type { Machine } from './machine'
 import { findOrcaCli } from './orca-cli'
 import { runProgram, type RunResult } from './run'
@@ -42,6 +43,9 @@ export type TerminalSendResult =
       readonly refusedReason: string | null
       // Whether Orca saw the agent start a turn on the line within the wait.
       readonly turnStarted: boolean
+      // Whether Orca replayed the outcome of a request it had seen before (`mutation.replayed`): the line was typed by
+      // an earlier run with this request id, not by this one.
+      readonly replayed: boolean
     }
   // `not-sent`: proven that nothing was typed (no CLI, Orca refused the line). `unknown`: the line may have been typed —
   // the answer was lost, or Orca failed or could not be reached; the same request id asks about it again.
@@ -67,7 +71,7 @@ export function orcaCliTerminalInput(machine: Machine): TerminalInput {
         { timeoutMs: (WAIT_SUBMIT_SECONDS + 60) * 1000 },
       ),
     )
-    if (answer.ok) return answer
+    if (answer.ok) return { ok: true, accepted: answer.accepted, refusedReason: answer.refusedReason, turnStarted: answer.turnStarted, replayed: answer.replayed }
     // A CLI that could not be started is looked for again next time.
     if (answer.code === null && answer.delivery === 'not-sent') cli = null
     return { ok: false, delivery: answer.delivery, error: answer.error }
@@ -76,7 +80,13 @@ export function orcaCliTerminalInput(machine: Machine): TerminalInput {
 
 // The CLI's answer; `code` is Orca's error code, null when the CLI itself failed.
 type Parsed =
-  | { readonly ok: true; readonly accepted: boolean; readonly refusedReason: string | null; readonly turnStarted: boolean }
+  | {
+      readonly ok: true
+      readonly accepted: boolean
+      readonly refusedReason: string | null
+      readonly turnStarted: boolean
+      readonly replayed: boolean
+    }
   | { readonly ok: false; readonly delivery: 'not-sent' | 'unknown'; readonly error: string; readonly code: string | null }
 
 function parseSend(result: RunResult): Parsed {
@@ -112,7 +122,11 @@ function parseSend(result: RunResult): Parsed {
     }
   }
   const send = field(field(answer, 'result'), 'send')
-  const accepted = field(send, 'accepted') === true
+  const accepted = field(send, 'accepted')
+  // Only Orca's explicit receipt decides: without a yes or no of the terminal the outcome is not known.
+  if (typeof accepted !== 'boolean') {
+    return { ok: false, delivery: 'unknown', error: `orca terminal send answered without the terminal's receipt (exit ${result.code})`, code: null }
+  }
   const reason = field(send, 'refusedReason')
   const stages = field(field(send, 'prompt'), 'stages')
   return {
@@ -120,5 +134,6 @@ function parseSend(result: RunResult): Parsed {
     accepted,
     refusedReason: accepted ? null : typeof reason === 'string' ? reason : 'no reason given',
     turnStarted: Array.isArray(stages) && stages.includes('turn_started'),
+    replayed: field(field(field(answer, 'result'), 'mutation'), 'replayed') === true,
   }
 }

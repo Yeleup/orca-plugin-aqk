@@ -38,6 +38,7 @@ test('CLI Orca вводит строку в терминал по его handle 
     accepted: true,
     refusedReason: null,
     turnStarted: true,
+    replayed: false,
   })
   assert.deepEqual(started.starts.map((start) => [start.file, ...start.args]), [
     [CLI, 'status', '--json'],
@@ -64,13 +65,14 @@ test('CLI Orca вводит строку в терминал по его handle 
   assert.equal(started.starts.filter((start) => start.args[0] === 'status').length, 2)
 
   const queued = machineWith(() => receipt(['input_accepted']))
-  assert.deepEqual(await orcaCliTerminalInput(queued)('term_1', 'x', REQUEST), { ok: true, accepted: true, refusedReason: null, turnStarted: false })
+  assert.deepEqual(await orcaCliTerminalInput(queued)('term_1', 'x', REQUEST), { ok: true, accepted: true, refusedReason: null, turnStarted: false, replayed: false })
   const refused = machineWith(() => receipt(['input_accepted'], false, 'the terminal is read-only'))
   assert.deepEqual(await orcaCliTerminalInput(refused)('term_1', 'x', REQUEST), {
     ok: true,
     accepted: false,
     refusedReason: 'the terminal is read-only',
     turnStarted: false,
+    replayed: false,
   })
 })
 
@@ -138,3 +140,25 @@ test('CLI Orca: отказ в самой строке — не отправле�
     'unknown',
   )
 })
+
+test('CLI Orca: ответ без квитанции терминала (нет accepted да или нет) — исход неизвестен; повтор, который Orca отыграла, называет это', async () => {
+  for (const result of [{}, { send: {} }, { send: { accepted: 'yes' } }, { send: { accepted: null } }]) {
+    const answer = await orcaCliTerminalInput(machineWith(() => ({ code: 0, stdout: JSON.stringify({ ok: true, result }) })))('term_1', 'x', REQUEST)
+    assert.deepEqual(answer, { ok: false, delivery: 'unknown', error: "orca terminal send answered without the terminal's receipt (exit 0)" }, JSON.stringify(result))
+  }
+  const replayed = machineWith(() => ({
+    code: 0,
+    stdout: JSON.stringify({
+      ok: true,
+      result: { send: { handle: 'term_1', accepted: true, prompt: { requestId: REQUEST, stages: ['input_accepted'] } }, mutation: { requestId: REQUEST, replayed: true } },
+    }),
+  }))
+  assert.deepEqual(await orcaCliTerminalInput(replayed)('term_1', 'x', REQUEST), {
+    ok: true,
+    accepted: true,
+    refusedReason: null,
+    turnStarted: false,
+    replayed: true,
+  })
+})
+

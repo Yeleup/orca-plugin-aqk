@@ -750,6 +750,128 @@ test('Агент вне списка Orca после перезапуска во
   await restarted.worker.deactivate()
 })
 
+test('Повторный запрос исхода получил ответ CLI без квитанции терминала — исход не записан, отчёт ждёт, прежний отчёт не принимается', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const launch = await launched(r, 51, 'implementer')
+  await r.worker.emit('agent.status.changed', status(launch, 'working', launch.launchedAt + 1_000))
+  orca.machine.files.set(launch.reportFile, 'Отчёт на задание.\n')
+  await r.worker.emit('agent.status.changed', status(launch, 'done', launch.launchedAt + 2_000))
+  assert.equal((await r.agents.report(launch)).ready, true)
+  orca.clock.advance(5_000)
+
+  // The terminal takes the line and the answer is lost; asking again, the CLI answers ok without the terminal's receipt.
+  orca.loseAnswers = 1
+  const sent = await r.agents.message(launch, 'Замечание.')
+  assert.ok(!sent.ok && sent.outcome === 'unknown', JSON.stringify(sent))
+  const sending = sendingOf(orca, launch, 1)
+  await r.worker.emit('agent.status.changed', status(launch, 'done', orca.clock.now() + 100))
+  orca.cliAnswers.push({ code: 0, stdout: JSON.stringify({ ok: true, result: {} }) })
+  const waiting = await r.agents.report(launch)
+  assert.deepEqual(waiting, {
+    ready: false,
+    state: 'done',
+    started: false,
+    reportFile: sending.reportFile,
+    reportExists: false,
+    unresolved: `the outcome of message 1 is unknown: the outcome of message 1 into the agent's terminal terminal-1: orca terminal send answered without the terminal's receipt (exit 0) is unknown`,
+    failure: null,
+  })
+  assert.equal(orca.machine.files.has(dataPath(orca.machine, launch.dir, 'message-1.json')), false)
+  // The next report gets Orca's receipt: the line was typed once.
+  const answered = await r.agents.report(launch)
+  assert.ok(!answered.ready && answered.unresolved === null && answered.reportFile === sending.reportFile, JSON.stringify(answered))
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [sending.line])
+  await r.worker.deactivate()
+})
+
+test('Сообщения одного запуска вводятся по порядку номеров: второе ждёт, пока CLI не ответит на первое', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const launch = await launched(r, 52, 'implementer')
+  orca.turnStarts = false
+  // The CLI process of the first message is held up before Orca handles it.
+  let release = () => {}
+  orca.cliHoldNext = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const first = r.agents.message(launch, 'Замечание 1.')
+  await settle()
+  const second = r.agents.message(launch, 'Замечание 2.')
+  await settle()
+  // Nothing of the second has gone ahead of the first.
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [])
+  release()
+  const [one, two] = await Promise.all([first, second])
+  assert.ok(one.ok && two.ok, JSON.stringify([one, two]))
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [sendingOf(orca, launch, 1).line, sendingOf(orca, launch, 2).line])
+  // The last input is the one typed last.
+  assert.equal((await r.agents.report(launch)).reportFile, two.reportFile)
+  await r.worker.deactivate()
+})
+
+test('Новое сообщение не уходит, пока исход прежнего неизвестен; когда отчёт узнал исход, уходит после него', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const launch = await launched(r, 53, 'implementer')
+  orca.cliRefusals.push({ code: 'runtime_unavailable', message: 'Orca is not reachable' })
+  const first = await r.agents.message(launch, 'Замечание 1.')
+  assert.ok(!first.ok && first.outcome === 'unknown', JSON.stringify(first))
+  assert.deepEqual(await r.agents.message(launch, 'Замечание 2.'), {
+    ok: false,
+    outcome: 'not-sent',
+    error: 'the outcome of message 1 is not known yet: a new message goes only once it is (a report asks Orca again)',
+  })
+  assert.equal(orca.machine.files.has(dataPath(orca.machine, launch.dir, 'message-2.md')), false)
+  assert.equal(cliSends(orca).length, 1)
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [])
+
+  // The report asks Orca again: the first line is typed now; then the second goes.
+  await r.agents.report(launch)
+  const second = await r.agents.message(launch, 'Замечание 2.')
+  assert.ok(second.ok, JSON.stringify(second))
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [sendingOf(orca, launch, 1).line, sendingOf(orca, launch, 2).line])
+  await r.worker.deactivate()
+})
+
+test('Строку сообщения впервые ввёл повторный запрос: «done», начавшийся до этого ввода, отчёт на сообщение не подтверждает', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const launch = await launched(r, 54, 'implementer')
+  await r.worker.emit('agent.status.changed', status(launch, 'working', launch.launchedAt + 1_000))
+  orca.clock.advance(5_000)
+  orca.turnStarts = false
+  // The first send does not reach Orca: nothing is typed.
+  orca.cliRefusals.push({ code: 'runtime_unavailable', message: 'Orca is not reachable' })
+  const sent = await r.agents.message(launch, 'Замечание.')
+  assert.ok(!sent.ok && sent.outcome === 'unknown', JSON.stringify(sent))
+  const sending = sendingOf(orca, launch, 1)
+  // The agent ends its turn on the task after the send was recorded, and Orca keeps listing that «done».
+  orca.list(launch.terminalId, 'done', sending.sentAt + 1_000)
+  orca.clock.advance(60_000)
+  // Asking again, Orca, which never saw the request, types the line now; the agent already has a draft of the report.
+  orca.machine.files.set(sending.reportFile, 'Черновик отчёта на замечание.\n')
+  const askedAt = orca.clock.now()
+  assert.deepEqual(await r.agents.report(launch), {
+    ready: false,
+    state: 'done',
+    started: true,
+    reportFile: sending.reportFile,
+    reportExists: true,
+    unresolved: null,
+    failure: null,
+  })
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [sending.line])
+  const outcome = JSON.parse(orca.machine.files.get(dataPath(orca.machine, launch.dir, 'message-1.json')) ?? '{}') as { typedFrom: number }
+  assert.equal(outcome.typedFrom, askedAt)
+  // The agent's turn on the message, then its end: ready.
+  orca.list(launch.terminalId, 'working', askedAt + 100)
+  assert.equal((await r.agents.report(launch)).ready, false)
+  orca.list(launch.terminalId, 'done', askedAt + 5_000)
+  assert.deepEqual(await r.agents.report(launch), { ready: true, text: 'Черновик отчёта на замечание.\n', reportFile: sending.reportFile })
+  await r.worker.deactivate()
+})
+
 test('Начало хода хранится на диске: после перезапуска воркера «blocked» без отчёта — не сбой доставки; агент, не начавший ход, — сбой с состоянием Orca', async () => {
   const orca = fakeOrca()
   const first = await mount(orca)

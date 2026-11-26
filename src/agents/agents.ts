@@ -32,7 +32,11 @@
 //   saying the terminal did not take it. Otherwise (Orca unreachable, no answer, asking again refused) the outcome is
 //   unknown: the report waits, and the next report asks Orca again with the same request id, which replays the outcome
 //   — or types the line then, if Orca never saw the request — instead of typing it twice. Either way message() is an
-//   error with the reason.
+//   error with the reason. Only Orca's explicit receipt (the terminal took the line or not) decides an outcome. The
+//   sends of one launch run one at a time, and a new message is refused while an earlier one's outcome is unknown, so
+//   messages are typed in the order of their numbers and the newest number is the last input. A «done» counts for a
+//   message only if it began after the line could have been typed: after the send's record, or — when Orca's receipt
+//   shows that asking again typed the line itself — after that asking began.
 // - stop: closes the terminals the plugin opened for this task, and no other terminal; it waits for the task's launches
 //   still waiting for Orca, and a launch of the task asked for while the stop runs is refused.
 // - an agent Orca does not know, or a launch that fails: an error naming the agent and the reason (by it the later
@@ -45,7 +49,7 @@
 //   answer: the terminal it opened, or null and the error;
 // - message-<k>.md — a message's text, report-<k>.md — the agent's report on it; sending-<k>.json — the line, its
 //   request id and time, written before the line is typed; message-<k>.json — the outcome: whether the terminal took
-//   it, whether Orca saw a turn start, and when it was recorded;
+//   it, whether Orca saw a turn start, when it was recorded, and since when the line can have been typed;
 // - started-0 (the task), started-<k> (message k) — when the agent was seen starting on that input;
 // - closed — the plugin has closed the agent's terminal.
 // Every file is created once and never rewritten, so the records survive a restart of the worker: a new worker stops
@@ -188,8 +192,10 @@ type WorkerHost = OrcaWorkerApi['host']
 type LaunchingJson = { role: AgentRole; agent: string; language: GithubLanguage; workspaceId: string; launchedAt: number }
 type LaunchJson = { terminalId: string | null; error: string | null }
 type SendingJson = { sentAt: number; line: string; requestId: string; reportFile: string }
-// `at`: when the outcome was recorded — for a message the terminal took, when it took the line.
-type OutcomeJson = { taken: boolean; turnStarted: boolean; at: number; error: string | null }
+// `at`: when the outcome was recorded — for a message the terminal took, when it took the line. `typedFrom`: the time
+// before which the line was surely not typed — the send's record, or the start of the asking again whose receipt shows
+// it typed the line itself (Orca did not replay an earlier outcome).
+type OutcomeJson = { taken: boolean; turnStarted: boolean; at: number; typedFrom: number; error: string | null }
 
 // An input of the plugin to the agent: its task (n = 0) or message n.
 type Input = {
@@ -239,6 +245,8 @@ export class Agents {
   // The launches still waiting for Orca, and the stops under way, by the task's directory.
   private readonly pending = new Map<string, Set<Promise<LaunchResult>>>()
   private readonly stopping = new Map<string, number>()
+  // The sends of each launch (message, and asking again from report) run one at a time, in order, by its directory.
+  private readonly sends = new Map<string, Promise<void>>()
 
   constructor(options: AgentsOptions) {
     this.host = options.host
@@ -312,10 +320,15 @@ export class Agents {
       if (this.sending.has(`${launch.dir}#${before.n}`)) {
         return this.held(launch, before, `message ${before.n} is being typed into the agent's terminal`)
       }
-      const asked = await this.deliver(launch, before.n, before.sending, 'again')
+      const sending = before.sending
+      const asked = await this.oneAtATime(launch, async () => {
+        const current = this.lastInput(launch)
+        if (current.n !== before.n || current.resolved) return null
+        return this.deliver(launch, before.n, sending, 'again')
+      })
       const after = this.lastInput(launch)
       if (after.sending !== null && !after.resolved) {
-        const why = after.n === before.n && !asked.ok ? asked.error : 'not recorded'
+        const why = after.n === before.n && asked !== null && !asked.ok ? asked.error : 'not recorded'
         return this.held(launch, after, `the outcome of message ${after.n} is unknown: ${why}`)
       }
     }
@@ -358,9 +371,21 @@ export class Agents {
   async message(launch: AgentLaunch, text: string): Promise<MessageResult> {
     const notSent = (error: string): MessageResult => ({ ok: false, outcome: 'not-sent', error })
     if (text.trim() === '') return notSent('the message is empty')
-    const foreign = this.notOwnTerminal(launch)
-    if (foreign !== null) return notSent(foreign)
-    this.known.set(launch.terminalId, launch)
+    return this.oneAtATime(launch, async () => {
+      const foreign = this.notOwnTerminal(launch)
+      if (foreign !== null) return notSent(foreign)
+      this.known.set(launch.terminalId, launch)
+      // Messages are typed in the order of their numbers: none goes while an earlier one may still be typed later.
+      const last = this.lastInput(launch)
+      if (last.sending !== null && !last.resolved) {
+        return notSent(`the outcome of message ${last.n} is not known yet: a new message goes only once it is (a report asks Orca again)`)
+      }
+      return this.send(launch, text)
+    })
+  }
+
+  private async send(launch: AgentLaunch, text: string): Promise<MessageResult> {
+    const notSent = (error: string): MessageResult => ({ ok: false, outcome: 'not-sent', error })
     let k: number
     try {
       k = await this.reserve(launch.dir, (n) => `message-${n}.md`, () => text)
@@ -511,7 +536,8 @@ export class Agents {
     const key = `${launch.dir}#${k}`
     this.sending.add(key)
     try {
-      const outcome = (value: Omit<OutcomeJson, 'at'>) => this.createJson(launch.dir, `message-${k}.json`, { ...value, at: this.machine.now() })
+      const outcome = (value: Omit<OutcomeJson, 'at' | 'typedFrom'>, typedFrom = sending.sentAt) =>
+        this.createJson(launch.dir, `message-${k}.json`, { ...value, at: this.machine.now(), typedFrom })
       // The boundary of every input through the CLI, checked before each run of it.
       const foreign = this.notOwnTerminal(launch)
       if (foreign !== null) {
@@ -519,6 +545,8 @@ export class Agents {
         await outcome({ taken: false, turnStarted: false, error: foreign }).catch(() => false)
         return { ok: false, outcome: 'not-sent', error: foreign }
       }
+      // Asking again types the line only if Orca never saw the request: then not before now.
+      const attemptStart = this.machine.now()
       const sent = await this.terminalInput(launch.terminalId, sending.line, sending.requestId)
       if (!sent.ok) {
         const error = `message ${k} into the agent's terminal ${launch.terminalId}: ${sent.error}`
@@ -531,7 +559,8 @@ export class Agents {
         return { ok: false, outcome: 'not-sent', error: `the agent's terminal ${launch.terminalId} did not take message ${k}: ${sent.refusedReason}` }
       }
       try {
-        await outcome({ taken: true, turnStarted: sent.turnStarted, error: null })
+        const typedFrom = attempt === 'again' && !sent.replayed ? attemptStart : sending.sentAt
+        await outcome({ taken: true, turnStarted: sent.turnStarted, error: null }, typedFrom)
       } catch (error) {
         // Unrecorded, the message is not the agent's last input; the report waits and asks Orca again.
         return { ok: false, outcome: 'unknown', error: `message ${k} went into the agent's terminal, but its outcome could not be recorded: ${errorMessage(error)}` }
@@ -606,7 +635,7 @@ export class Agents {
       if (outcome !== null && !outcome.taken) continue
       last = {
         n,
-        at: sending.sentAt,
+        at: outcome?.typedFrom ?? sending.sentAt,
         deadlineFrom: outcome?.at ?? sending.sentAt,
         reportFile: sending.reportFile,
         sending,
@@ -615,6 +644,24 @@ export class Agents {
       }
     }
     return last
+  }
+
+  // Runs `body` once every earlier send of the launch has finished: the sends of one launch never overlap.
+  private async oneAtATime<T>(launch: AgentLaunch, body: () => Promise<T>): Promise<T> {
+    const previous = this.sends.get(launch.dir) ?? Promise.resolve()
+    let release = () => {}
+    const done = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const queued = previous.then(() => done)
+    this.sends.set(launch.dir, queued)
+    await previous
+    try {
+      return await body()
+    } finally {
+      release()
+      if (this.sends.get(launch.dir) === queued) this.sends.delete(launch.dir)
+    }
   }
 
   // The boundary of every input through Orca's CLI: the terminal is the one Orca opened for this launch (its
@@ -758,9 +805,15 @@ function parseSending(text: string | null): SendingJson | null {
 function parseOutcome(text: string | null): OutcomeJson | null {
   const json = parseJson(text)
   if (json === null) return null
-  const { taken, turnStarted, at, error } = json
-  if (typeof taken !== 'boolean' || typeof turnStarted !== 'boolean' || typeof at !== 'number' || (error !== null && typeof error !== 'string')) {
+  const { taken, turnStarted, at, typedFrom, error } = json
+  if (
+    typeof taken !== 'boolean' ||
+    typeof turnStarted !== 'boolean' ||
+    typeof at !== 'number' ||
+    typeof typedFrom !== 'number' ||
+    (error !== null && typeof error !== 'string')
+  ) {
     return null
   }
-  return { taken, turnStarted, at, error }
+  return { taken, turnStarted, at, typedFrom, error }
 }

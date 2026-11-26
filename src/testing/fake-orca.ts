@@ -10,7 +10,9 @@
 // it (`list`, or the worker's agent.status.changed). The CLI's `terminal send` answers like Orca's: the stage
 // `turn_started` when the agent starts a turn on the text (`turnStarts`); a request id it has seen replays the first
 // outcome without typing again. `cliGate` holds the CLI's answer back after the text is typed, `loseAnswers` makes it
-// type the text and then die without an answer, `cliRefusals` makes Orca refuse the next sends without typing anything;
+// type the text and then die without an answer, `cliRefusals` makes Orca refuse the next sends without typing anything,
+// `cliAnswers` makes the next sends answer as given without typing, `cliHoldNext` holds the next send before Orca
+// handles it;
 // `terminal.close` waits for `closeGate`, `agents.list` for `listGate`. While `cliPresent` is false (`cli: false`) the
 // computer has no Orca CLI at all.
 import { hostError, mockHost, type MockHost } from 'orca/testing'
@@ -55,6 +57,10 @@ export type FakeOrca = {
   listGate: Promise<void> | null
   // Orca's refusals of the next CLI sends, in order: each types nothing and leaves the request unseen.
   readonly cliRefusals: { code: string; message: string; data?: Record<string, unknown> }[]
+  // Answers of the next CLI sends as they are, in order: each types nothing and leaves the request unseen.
+  readonly cliAnswers: FakeAnswer[]
+  // While set, the next CLI send waits for it before Orca handles it (types the text); the send takes it.
+  cliHoldNext: Promise<void> | null
   // Whether the computer has Orca's CLI.
   cliPresent: boolean
   // The state `agents.list` reports for a terminal, and since when.
@@ -95,6 +101,8 @@ export function fakeOrca(
     const handle = flag('--terminal') ?? ''
     const text = flag('--text') ?? ''
     const requestId = flag('--retry-request')
+    const given = fake.cliAnswers.shift()
+    if (given !== undefined) return given
     const refusal = fake.cliRefusals.shift()
     if (refusal !== undefined) return { code: 1, stdout: JSON.stringify({ id: 'cli-0', ok: false, error: refusal }) }
     const replay = requestId === undefined ? undefined : requests.get(requestId)
@@ -140,6 +148,11 @@ export function fakeOrca(
     ...base,
     isRunnableFile: (path) => (path === cli ? fake.cliPresent : base.isRunnableFile(path)),
     start: async (request) => {
+      const hold = fake.cliHoldNext
+      if (hold !== null && request.args[0] === 'terminal') {
+        fake.cliHoldNext = null
+        await hold
+      }
       const gate = fake.cliGate
       if (gate === null || request.args[0] !== 'terminal') return base.start(request)
       // The text is typed at once; the answer waits.
@@ -216,6 +229,8 @@ export function fakeOrca(
     closeGate: null,
     listGate: null,
     cliRefusals: [],
+    cliAnswers: [],
+    cliHoldNext: null,
     cliPresent: options.cli !== false,
     list: (terminalId, state, stateStartedAt) => {
       listed.set(terminalId, { state, stateStartedAt })
