@@ -1,5 +1,7 @@
-// The manifest: the minimum Orca version (К2.7), Orca's own check of the manifest, the plugin's id and name (Ф14).
+// The manifest: the minimum Orca version (К2.7), Orca's own check of the manifest, the plugin's id and name (Ф14), the
+// panel and the interface language setting (task panel-shell).
 import { assert, test } from 'orca/testing'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { orca, pluginRoot, readJson, testEnv } from './helpers.mjs'
 
@@ -76,4 +78,32 @@ test('К2.7 (контроль): проверка диапазона читает
 test('К14.4 (манифест): в манифесте id agent-queue и имя «Agent Queue»', () => {
   assert.equal(manifest.id, 'agent-queue')
   assert.equal(manifest.name, 'Agent Queue')
+})
+
+// The panel Orca opens from its right sidebar: src/panel.test.tsx mounts this very entry, and Orca can open it only
+// while the manifest contributes it.
+test('Каркас панели (манифест): панель agent-queue «Agent Queue» на компонентах Orca, её точка входа есть и её монтируют тесты панели', () => {
+  const panels = manifest.contributes?.panels
+  assert.ok(Array.isArray(panels), 'orca-plugin.json: нет contributes.panels')
+  assert.deepEqual(panels.map((panel) => panel.id), ['agent-queue'])
+  const [panel] = panels
+  assert.equal(panel.title, 'Agent Queue')
+  assert.equal(panel.ui, 'components')
+  assert.equal(panel.entry, 'src/panel.tsx')
+  assert.ok(existsSync(join(pluginRoot, panel.entry)), `нет точки входа ${panel.entry}`)
+  assert.equal(Object.hasOwn(panel, 'width'), false)
+  const panelTest = readFileSync(join(pluginRoot, 'src', 'panel.test.tsx'), 'utf8')
+  assert.match(panelTest, /manifest\.contributes\.panels\.find\(\(contribution\) => contribution\.id === 'agent-queue'\)/)
+  assert.match(panelTest, /await import\(`\.\.\/\$\{declared\.entry\}`\)/)
+})
+
+test('Каркас панели (манифест): настройка «язык интерфейса» — English или Русский, по умолчанию English; доступ к своим настройкам', () => {
+  const settings = manifest.contributes?.settings ?? []
+  const language = settings.find((setting) => setting.key === 'interfaceLanguage')
+  assert.ok(language, 'orca-plugin.json: нет настройки interfaceLanguage')
+  assert.equal(language.type, 'string')
+  assert.deepEqual(language.enum, ['en', 'ru'])
+  assert.deepEqual(language.enumLabels, ['English', 'Русский'])
+  assert.equal(language.default, 'en')
+  assert.ok(manifest.capabilities.some((capability) => capability.kind === 'settings:own'), 'нет settings:own')
 })
