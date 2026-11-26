@@ -72,6 +72,7 @@ fi
 
 run=
 scratch=
+recorder_path=$PATH
 if [ -n "$results" ]; then
     temp="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"
     case "$temp" in
@@ -89,25 +90,23 @@ if [ -n "$results" ]; then
             ;;
     esac
     run="$scratch/run"
+    # Git for Windows mounts its paths noacl: there `mkdir -m 700` makes the directory and then fails to set its mode,
+    # and the recorder's start (`mkdir -m 700 <run> || return 0`) would note nothing. Where mkdir behaves so, start gets
+    # a mkdir that leaves the mode out: such a mount keeps no mode anyway.
+    if ! mkdir -m 700 "$scratch/probe" 2>/dev/null && [ -d "$scratch/probe" ]; then
+        real_mkdir="$(command -v mkdir)"
+        mkdir "$scratch/bin"
+        printf '%s\n' '#!/bin/sh' '# mkdir without -m MODE, for the recorder (scripts/make-test.sh).' \
+            'skip=' 'for arg do' '    shift' '    if [ -n "$skip" ]; then skip=; continue; fi' \
+            '    case "$arg" in -m) skip=1; continue ;; -m* | --mode=*) continue ;; esac' \
+            '    set -- "$@" "$arg"' 'done' "exec '$real_mkdir' \"\$@\"" >"$scratch/bin/mkdir"
+        chmod 755 "$scratch/bin/mkdir" 2>/dev/null
+        recorder_path="$scratch/bin:$PATH"
+    fi
 fi
 
 status=0
-case "$(uname -s)" in
-    MINGW* | MSYS* | CYGWIN*)
-        if [ -n "$run" ]; then
-            {
-                echo "DEBUG-RECORDER: sh=$(command -v sh) bash=$(command -v bash) git=$(command -v git) cygpath=$(command -v cygpath)"
-                echo "DEBUG-RECORDER: PATH=$PATH"
-                echo "DEBUG-RECORDER: results=$results run=$run pwd=$(pwd) pwdP=$(pwd -P)"
-                bash -c 'echo "DEBUG-RECORDER: bash $BASH_VERSION uname $(uname -a)"; echo "DEBUG-RECORDER: git rev-parse: $(git rev-parse --verify -q HEAD 2>&1; echo " code $?")"'
-                bash -x docker/test-result.sh start "$run" "$results" 2>&1 | sed 's/^/DEBUG-RECORDER-X: /'
-                ls -la "$run" 2>&1 | sed 's/^/DEBUG-RECORDER-LS: /'
-                for note in "$run"/*; do printf 'DEBUG-RECORDER-NOTE %s: %s\n' "$note" "$(cat "$note" 2>&1 | head -3 | tr '\n' '|')"; done
-            } >&2
-        fi
-        ;;
-esac
-[ -z "$run" ] || bash docker/test-result.sh start "$run" "$results"
+[ -z "$run" ] || PATH="$recorder_path" bash docker/test-result.sh start "$run" "$results"
 for step in $steps; do
     case "$step" in
         # The checks of the manifest Orca makes when it loads the plugin.

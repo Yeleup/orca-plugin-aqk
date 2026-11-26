@@ -363,6 +363,34 @@ deliveryTest('make test: временный каталог прогона для
   }
 })
 
+// Git for Windows mounts its paths noacl, where `mkdir -m 700` makes the directory and then fails to set the mode: the
+// recorder's start noted nothing there (windows-latest: «the start of the run was not noted»). Here a mkdir that does
+// the same stands first on PATH; `make test` still writes the full record of the run.
+deliveryTest('make test: mkdir -m создаёт каталог и падает на смене прав (так в Git для Windows) — запись итога всё равно полная', (temp, t) => {
+  if (windows) {
+    t.skip('на Windows так ведёт себя настоящий mkdir Git Bash: это проверяют К14.4 с записью итога')
+    return
+  }
+  const real = findCommand('mkdir')
+  assert.ok(real, 'mkdir не найден')
+  const { dir, sha } = preparedTree(temp)
+  const fakeBin = join(temp, 'noacl-mkdir')
+  mkdirSync(fakeBin)
+  const quote = (text) => `'${text.replaceAll("'", "'\\''")}'`
+  writeExecutable(fakeBin, 'mkdir', {
+    sh: '#!/bin/sh\nmode=\nfor arg do\n  shift\n  if [ "$mode" = next ]; then mode=set; continue; fi\n' +
+      '  case "$arg" in -m) mode=next; continue ;; -m* | --mode=*) mode=set; continue ;; esac\n' +
+      '  set -- "$@" "$arg"\ndone\n' +
+      `${quote(real)} "$@" || exit\n` +
+      '[ -z "$mode" ] || { echo "mkdir: cannot change permissions" >&2; exit 1; }\n',
+    cmd: '',
+  })
+  const results = join(temp, 'test-results')
+  const make = makeTest(dir, [`TEST_RESULT_DIR=${results}`], pathFirst(fakeBin))
+  assertGreenRun(make, 'с mkdir Git для Windows')
+  assertFullGreenRecord(results, sha, make, 'с mkdir Git для Windows')
+})
+
 // The recorder needs bash 4.4 or newer; with an older bash on PATH (macOS ships 3.2) `make test` stops and says so
 // instead of passing with no record.
 deliveryTest('make test: bash старше 4.4 в PATH — отказ до тестов, без записи итога', (temp, t) => {
