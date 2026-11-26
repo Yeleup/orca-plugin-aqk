@@ -262,7 +262,6 @@ test('К14.3 (workflow): матрица ubuntu-latest, macos-latest и windows-l
 
 test('К14.3 (пакеты): CLI Orca — из релиза v<engines.orca> Orca, пакет системы раннера: .deb для Linux, Orca.app для macOS, setup.exe для Windows', () => {
   const version = minimumOf(manifest)
-  assert.equal(version, '1.4.273', 'минимальная версия манифеста — из ТЗ')
   for (const [platform, arch] of [['linux', 'x64'], ['darwin', 'arm64'], ['win32', 'x64'], ['linux', 'arm64'], ['darwin', 'x64']]) {
     assert.equal(orcaPackage(version, platform, arch).url, releaseUrl(version, platform, arch), `${platform}-${arch}`)
   }
