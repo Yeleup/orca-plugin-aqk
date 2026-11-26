@@ -49,7 +49,11 @@ const CLOSED_FILE = 'closed'
 // another key of lower-case words joined by hyphens for other work (`mvp-start`).
 export type TaskRef = { readonly project: string; readonly key: string }
 
-const TASK_KEY = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+// A key of lower-case words joined by hyphens; one that begins with `issue-` is a queue task's, `issue-<N>` exactly, so
+// that no other key (`issue-007`) names the directory of a queue task's agents a second time.
+function isTaskKey(key: string): boolean {
+  return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(key) && (!key.startsWith('issue-') || /^issue-[1-9][0-9]*$/.test(key))
+}
 
 export function issueTask(project: string, issue: number): TaskRef {
   if (!Number.isInteger(issue) || issue < 1) throw new Error(`not an issue number: ${issue}`)
@@ -319,7 +323,7 @@ export class Agents {
   }
 
   private taskDir(task: TaskRef): string {
-    if (!TASK_KEY.test(task.key)) throw new Error(`not a task key: ${JSON.stringify(task.key)}`)
+    if (!isTaskKey(task.key)) throw new Error(`not a task key: ${JSON.stringify(task.key)}`)
     return dataPath(this.machine, this.dataDir, 'projects', dataName(task.project), task.key)
   }
 

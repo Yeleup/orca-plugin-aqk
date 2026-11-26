@@ -562,7 +562,9 @@ test('Ключ задачи не из слов и не issue-<N> — ошибк�
   const r = await mount(fakeOrca())
   assert.throws(() => issueTask(PROJECT, 0), /not an issue number: 0/)
   assert.throws(() => issueTask(PROJECT, 1.5), /not an issue number/)
-  for (const key of ['../issue-1', 'Issue-1', 'issue 1', 'issue_1', '-issue', 'issue-', 'issue--1', '', 'mvp/start', '..']) {
+  // Not words, or `issue-` without a plain issue number (`issue-007` would be issue 7's directory a second time).
+  const keys = ['../issue-1', 'Issue-1', 'issue 1', 'issue_1', '-issue', 'issue-', 'issue--1', '', 'mvp/start', '..']
+  for (const key of [...keys, 'issue-0', 'issue-007', 'issue-start']) {
     assert.throws(() => r.agents.launches({ project: PROJECT, key }), /not a task key/)
     await assert.rejects(r.agents.stop({ project: PROJECT, key }), /not a task key/)
     const failed = await r.agents.launch({ ...request(1, 'implementer'), task: { project: PROJECT, key } })
