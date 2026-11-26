@@ -21,7 +21,8 @@ orca-ide plugin install Yeleup/orca-plugin-aqk
 
 Orca ставит новейший тег версии `vX.Y.Z` (без тегов — ветку по умолчанию) и сначала показывает, какой доступ получит
 плагин: `trusted-worker` — свой процесс Node.js с правами пользователя. Установка завершается той же командой с
-`--approve <отпечаток>`, который Orca печатает. Когда плагин появится в каталоге Orca, его ставят и обновляют оттуда.
+`--approve <отпечаток>`, который Orca печатает. Когда плагин появится в каталоге Orca, его ставят и обновляют оттуда
+(запись каталога готовит команда релиза — раздел «Релиз»).
 
 ## Устройство
 
@@ -45,8 +46,11 @@ Orca ставит новейший тег версии `vX.Y.Z` (без тего
 - `src/*.test.ts(x)` — тесты плагина на `orca/testing` (поддельный хост Orca), их запускает `orca plugin test`;
   `src/panel.check.ts` — сценарии панели для `orca-ide plugin check .` (английский, русский, тёмная и светлая тема,
   ошибка, воркер как есть).
-- `tests/*.test.mjs` — тесты поставки: манифест, подготовка worktree, `plugin inspect` чистой выгрузки коммита.
+- `tests/*.test.mjs` — тесты поставки, workflow и релиза: манифест, подготовка worktree, `plugin inspect` чистой
+  выгрузки коммита, шаги workflow GitHub Actions, команда релиза.
 - `scripts/setup.mjs` — подготовка worktree (`setup` в `orca.yaml`).
+- `.github/workflows/plugin.yml` и `scripts/ci.mjs` — проверка плагина на трёх системах в GitHub Actions.
+- `scripts/release.mjs` — команда релиза: запись для каталога Orca.
 - `package.json` — только инструменты разработки (TypeScript для проверки типов).
 
 ## Разработка
@@ -81,6 +85,47 @@ bash 3.2 — поставьте новый (например `brew install bash`
 регистратору в виде оболочки (`cygpath -u` в Git Bash и MSYS2); если каталог не преобразовался, `make test`
 останавливается до тестов, а не идёт без записи. Фильтра по имени теста у `orca plugin test` нет:
 прогон с `test_args="--compact --filter=…"` запускает все тесты и записывается как отфильтрованный.
+
+## Проверка на трёх системах (GitHub Actions)
+
+Workflow `.github/workflows/plugin.yml` («Плагин на трёх системах») проверяет плагин на `ubuntu-latest`,
+`macos-latest` и `windows-latest` — на каждый push в `master`, на каждый pull request и вручную (Run workflow). На
+каждой системе:
+
+- ставит CLI Orca ровно минимальной версии из `engines.orca` манифеста (сейчас `>=1.4.273` — значит 1.4.273): пакет
+  Orca этой системы из релиза `v<версия>` (https://github.com/stablyai/orca/releases), CLI которого идёт под
+  Electron в режиме Node, как его запускает сама Orca. Поднимается `engines.orca` — workflow сам берёт новую версию;
+- готовит чекаут так, как Orca готовит worktree: `setup` из `orca.yaml`, на Windows — через `.cmd`, как его запускает
+  Orca;
+- на этом CLI гоняет `plugin validate`, проверку типов (`plugin types` и TypeScript по пути пакета) и `plugin test`;
+- проверяет поставку: `plugin inspect` чистой выгрузки коммита (`git archive`, без `node_modules` и `.orca`);
+- запускает `archive` из `orca.yaml` так же, как Orca, и ждёт код 0.
+
+Те же команды запускаются и вручную: `node scripts/ci.mjs orca-version` печатает версию CLI для проверки,
+`node scripts/ci.mjs install-orca <каталог>` ставит этот CLI (нужны curl и распаковщик пакета системы: `dpkg-deb`,
+`ditto` или `7z`), `node scripts/ci.mjs hook setup|archive` запускает скрипт `orca.yaml` так, как Orca на этой
+системе. Включить GitHub Actions в репозитории — дело владельца (у частного репозитория считаются минуты); тесты
+`make test` проверяют сам workflow-файл и его шаги с поддельным релизом Orca, без сети.
+
+## Релиз
+
+1. Поднять `version` в `orca-plugin.json` и закоммитить — это релизный коммит. Минимальная версия Orca — `engines.orca`
+   там же.
+2. Пометить его тегом `v<версия>` и запушить тег: Orca ставит из репозитория новейший тег версии.
+3. Построить запись для каталога Orca:
+
+   ```sh
+   node scripts/release.mjs            # релизный коммит — HEAD
+   node scripts/release.mjs v0.1.0     # или тег, ветка, любой коммит репозитория
+   ```
+
+   Команда клонирует репозиторий во временный каталог, переходит там на релизный коммит и запускает
+   `plugin release-entry` CLI Orca (`ORCA_CLI_COMMAND`, иначе `orca-ide` на Linux и `orca` на macOS и Windows).
+   Запись — версия из манифеста коммита, сам коммит, хеш его файлов, доступ и минимальная Orca — печатается в stdout
+   как JSON; незакоммиченные изменения в неё не попадают, а рабочий чекаут не меняется: ни файлы, ни ветка, ни
+   ссылки. Временный клон удаляется.
+4. Внести запись первой в `releases` плагина в `orca-catalog.json` каталога Orca — это делает владелец, со своего
+   аккаунта.
 
 ## Очередь агентов
 

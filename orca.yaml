@@ -10,6 +10,8 @@
 # The same hooks run on macOS, Linux and Windows: Orca runs them through bash on macOS and Linux and on Windows through
 # a .cmd file that calls each line in turn. So every line is one plain command, valid in both shells: no comments,
 # variables, pipes, redirections or conditions inside the scripts.
+#
+# The plugin's CI (.github/workflows/plugin.yml) runs both the same way on all three systems: scripts/ci.mjs hook.
 scripts:
   setup: |
     node scripts/setup.mjs

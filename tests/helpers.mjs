@@ -16,7 +16,10 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { findCommand, isScreenReader, orcaCliCommand } from '../scripts/tools.mjs'
+import { orcaHookRunner, orcaYamlScripts, runOrcaHook as runHook } from '../scripts/orca-hooks.mjs'
+import { findCommand, isScreenReader, orcaCliCommand, spawnCommand } from '../scripts/tools.mjs'
+
+export { orcaHookRunner, orcaYamlScripts }
 
 // The plugin folder: the directory of orca-plugin.json above this file.
 export const pluginRoot = (() => {
@@ -67,24 +70,20 @@ export function offlineNpmEnv(extra = {}) {
 // Runs a program the way a shell of this system finds it; on Windows a .cmd or .bat starts through cmd.exe.
 export function run(command, args, options = {}) {
   const env = options.env ?? process.env
-  const file = findCommand(command, env) ?? command
-  const viaCmd = process.platform === 'win32' && /\.(cmd|bat)$/i.test(file)
-  const spawnOptions = { ...options, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }
-  const result = viaCmd
-    ? spawnSync([file, ...args].map(quoteForCmd).join(' '), { ...spawnOptions, shell: true })
-    : spawnSync(file, args, spawnOptions)
+  const result = spawnCommand(command, args, { ...options, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  return outcome(`${command} ${args.join(' ')}`, result)
+}
+
+// What a test shows of a finished process: its exit code, its output, and the whole of it as one text.
+function outcome(what, result) {
   return {
     status: result.status,
     stdout: result.stdout ?? '',
     stderr: result.stderr ?? '',
     error: result.error,
-    output: `$ ${command} ${args.join(' ')}\nexit ${result.status}${result.error ? ` (${result.error.message})` : ''}\n` +
+    output: `$ ${what}\nexit ${result.status}${result.error ? ` (${result.error.message})` : ''}\n` +
       `--- stdout\n${result.stdout ?? ''}\n--- stderr\n${result.stderr ?? ''}`,
   }
-}
-
-function quoteForCmd(word) {
-  return /^[\w.:\\/=-]+$/.test(word) ? word : `"${word}"`
 }
 
 // Orca's CLI of this system (scripts/tools.mjs, as `make test` picks it). A bare `orca` on Linux is GNOME's screen
@@ -190,58 +189,11 @@ export function symlinksIn(dir) {
   return found.sort()
 }
 
-// The scripts of orca.yaml (`scripts:` — each one a block scalar `name: |` or a one-line plain value), by name.
-export function orcaYamlScripts(text) {
-  const lines = text.split(/\r?\n/)
-  const start = lines.findIndex((line) => /^scripts:\s*$/.test(line))
-  if (start < 0) throw new Error('orca.yaml has no scripts:')
-  const scripts = {}
-  for (let i = start + 1; i < lines.length; i++) {
-    const line = lines[i]
-    if (/^\S/.test(line)) break
-    const key = /^(\s+)([A-Za-z][\w-]*):\s*(.*)$/.exec(line)
-    if (!key) continue
-    const [, indent, name, value] = key
-    if (!/^\|[-+]?$/.test(value)) {
-      scripts[name] = value.trim()
-      continue
-    }
-    const body = []
-    while (i + 1 < lines.length && (lines[i + 1].trim() === '' || lines[i + 1].search(/\S/) > indent.length)) {
-      body.push(lines[++i])
-    }
-    while (body.length > 0 && body[body.length - 1].trim() === '') body.pop()
-    const contentIndent = Math.min(...body.filter((l) => l.trim() !== '').map((l) => l.search(/\S/)))
-    scripts[name] = body.map((l) => l.slice(contentIndent)).join('\n') + (value === '|-' ? '' : '\n')
-  }
-  return scripts
-}
-
-// The runner file Orca 1.4.273 writes for a hook of orca.yaml: on macOS and Linux a bash script with `set -e`, on Windows
-// a .cmd file that calls each line and stops at the first one that fails.
-export function orcaHookRunner(script, platform = process.platform) {
-  if (platform !== 'win32') return `#!/usr/bin/env bash\nset -e\n${script}\n`
-  let runner = '@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\n'
-  for (const line of script.split('\n').map((l) => l.replace(/\r$/, '').trim())) {
-    if (line.startsWith('#!')) throw new Error('Orca does not run a hook with a #! line through cmd.exe')
-    runner += line ? `call ${line}\r\nif errorlevel 1 exit /b %errorlevel%\r\n` : '\r\n'
-  }
-  return runner
-}
-
-// Runs a hook of orca.yaml in `cwd` as Orca does on this system: bash on macOS and Linux, cmd.exe on Windows.
+// Runs a hook of orca.yaml in `cwd` as Orca does on this system (scripts/orca-hooks.mjs): bash on macOS and Linux,
+// cmd.exe on Windows.
 export function runOrcaHook(name, script, cwd, env) {
-  const runnerDir = tempDir(`hook-${name}`)
-  try {
-    const windows = process.platform === 'win32'
-    const file = join(runnerDir.dir, windows ? `${name}.cmd` : `${name}.sh`)
-    writeFileSync(file, orcaHookRunner(script), 'utf8')
-    return windows
-      ? run(env.ComSpec ?? process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', file], { cwd, env })
-      : run('bash', [file], { cwd, env })
-  } finally {
-    runnerDir.remove()
-  }
+  const result = runHook(name, script, cwd, { env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  return outcome(`orca.yaml ${name}`, result)
 }
 
 // The preparation command of README: the one `npm ci …` line of its code blocks, as words.
