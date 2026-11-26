@@ -55,6 +55,20 @@ function requests(panel: TestPanel): unknown[] {
   return panel.host.callsOf('plugin.request')
 }
 
+/**
+ * Inside a worker answer: lets the panel draw what it set before asking (the test runtime draws on its next turn of the
+ * event loop, then waits for the answer), turn by turn until `drawn()` holds — at most 20 turns, no wall-clock wait.
+ */
+async function untilDrawn(drawn: () => boolean): Promise<void> {
+  for (let turn = 0; turn < 20 && !drawn(); turn++) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+}
+
+function skeletons(panel: TestPanel): number {
+  return panel.findAll({ type: 'Skeleton' }).length
+}
+
 function assertClean(panel: TestPanel): void {
   assert.deepEqual(panel.errors, [])
   assert.deepEqual(panel.warnings, [])
@@ -217,7 +231,8 @@ test('Каркас панели: ни одной строки экрана ми�
         calls++
         if (calls === 1) throw hostError('action_failed', 'worker stopped')
         // The retry: the panel draws its loading rows while the worker has not answered.
-        await new Promise((resolve) => setTimeout(resolve, 0))
+        await untilDrawn(() => skeletons(failing) > 0)
+        assert.ok(skeletons(failing) > 0, `${language}: при повторе нет заготовок строк`)
         assertTextsFromCatalog(failing, language, [], 'загрузка')
         loading = true
         return { projects: [SHOP] }
@@ -238,7 +253,7 @@ test('Каркас панели: ответ воркера на plugin.request �
       calls++
       if (calls === 1) throw hostError('action_failed', 'каталог данных недоступен')
       // While the worker has not answered the retry, the screen shows its loading rows.
-      await new Promise((resolve) => setTimeout(resolve, 0))
+      await untilDrawn(() => skeletons(panel) > 0)
       duringRetry = panel.summary()
       return { projects: [SHOP, BLOG] }
     },
