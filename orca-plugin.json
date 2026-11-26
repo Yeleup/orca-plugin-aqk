@@ -61,6 +61,11 @@
         "type": "boolean",
         "default": true
       }
+    ],
+    "events": [
+      {
+        "on": "agent.status.changed"
+      }
     ]
   },
   "capabilities": [
@@ -75,6 +80,9 @@
     },
     {
       "kind": "agent:launch"
+    },
+    {
+      "kind": "agent:read"
     },
     {
       "kind": "terminal:send"
