@@ -188,4 +188,3 @@ test('CLI Orca: время Enter из квитанции промпта аген
   assert.deepEqual(await read(undefined), [null, false])
   assert.deepEqual(await read({ enteredAt: '1768469400250' }), [null, false])
 })
-
