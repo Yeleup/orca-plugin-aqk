@@ -9,3 +9,13 @@ test('the worker starts without host calls or refusals', async () => {
   assert.deepEqual(worker.refusals, [])
   await worker.deactivate()
 })
+
+// Connecting projects is a later task (`connect`): until then the worker knows of none.
+test('Каркас панели: воркер отвечает панели на projects.list — подключённых проектов пока нет', async () => {
+  const worker = await mountWorker(main)
+  assert.deepEqual(await worker.request('projects.list', undefined, { panel: 'agent-queue' }), { projects: [] })
+  assert.deepEqual(worker.host.calls, [])
+  assert.deepEqual(worker.refusals, [])
+  assert.deepEqual(worker.posts, [])
+  await worker.deactivate()
+})

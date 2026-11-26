@@ -3,7 +3,7 @@
   "id": "agent-queue",
   "name": "Agent Queue",
   "version": "0.0.1",
-  "description": "The agent task queue of agent-queue-kit as an Orca plugin. A skeleton: its functions come with the MVP.",
+  "description": "The agent task queue of agent-queue-kit as an Orca plugin: a panel in Orca's right sidebar and its worker. A skeleton: its functions come with the MVP.",
   "license": "MIT",
   "repository": "https://github.com/Yeleup/orca-plugin-aqk",
   "engines": {
@@ -12,5 +12,37 @@
   "execution": "trusted-worker",
   "pluginApi": 1,
   "main": "src/worker.ts",
-  "capabilities": []
+  "contributes": {
+    "panels": [
+      {
+        "id": "agent-queue",
+        "title": "Agent Queue",
+        "icon": "layers",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "settings": [
+      {
+        "key": "interfaceLanguage",
+        "title": "Interface language",
+        "description": "Language of the texts of the Agent Queue panel.",
+        "type": "string",
+        "enum": [
+          "en",
+          "ru"
+        ],
+        "enumLabels": [
+          "English",
+          "Русский"
+        ],
+        "default": "en"
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "settings:own"
+    }
+  ]
 }
