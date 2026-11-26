@@ -10,8 +10,9 @@
 // it (`list`, or the worker's agent.status.changed). The CLI's `terminal send` answers like Orca's: the stage
 // `turn_started` when the agent starts a turn on the text (`turnStarts`); a request id it has seen replays the first
 // outcome without typing again. `cliGate` holds the CLI's answer back after the text is typed, `loseAnswers` makes it
-// type the text and then die without an answer; `terminal.close` waits for `closeGate`. Without `cli` the computer has
-// no Orca CLI at all.
+// type the text and then die without an answer, `cliRefusals` makes Orca refuse the next sends without typing anything;
+// `terminal.close` waits for `closeGate`, `agents.list` for `listGate`. While `cliPresent` is false (`cli: false`) the
+// computer has no Orca CLI at all.
 import { hostError, mockHost, type MockHost } from 'orca/testing'
 import type { Platform } from '../platform/machine'
 import { fakeClock, fakeMachine, FAKE_HOME, orcaStatusAnswer, type FakeAnswer, type FakeClock, type FakeMachine } from './fake-machine'
@@ -50,6 +51,12 @@ export type FakeOrca = {
   loseAnswers: number
   // While set, `terminal.close` answers only once the promise settles.
   closeGate: Promise<void> | null
+  // While set, `agents.list` answers only once the promise settles, with the states listed then.
+  listGate: Promise<void> | null
+  // Orca's refusals of the next CLI sends, in order: each types nothing and leaves the request unseen.
+  readonly cliRefusals: { code: string; message: string; data?: Record<string, unknown> }[]
+  // Whether the computer has Orca's CLI.
+  cliPresent: boolean
   // The state `agents.list` reports for a terminal, and since when.
   list(terminalId: string, state: AgentState, stateStartedAt: number): void
   unlist(terminalId: string): void
@@ -88,6 +95,8 @@ export function fakeOrca(
     const handle = flag('--terminal') ?? ''
     const text = flag('--text') ?? ''
     const requestId = flag('--retry-request')
+    const refusal = fake.cliRefusals.shift()
+    if (refusal !== undefined) return { code: 1, stdout: JSON.stringify({ id: 'cli-0', ok: false, error: refusal }) }
     const replay = requestId === undefined ? undefined : requests.get(requestId)
     if (replay !== undefined) {
       if (fake.loseAnswers > 0) {
@@ -126,9 +135,10 @@ export function fakeOrca(
     return { code: 0, stdout }
   }
 
-  const base = fakeMachine({ platform, clock, executables: options.cli === false ? [] : [cli], answer })
+  const base = fakeMachine({ platform, clock, executables: [cli], answer })
   const machine: FakeMachine = {
     ...base,
+    isRunnableFile: (path) => (path === cli ? fake.cliPresent : base.isRunnableFile(path)),
     start: async (request) => {
       const gate = fake.cliGate
       if (gate === null || request.args[0] !== 'terminal') return base.start(request)
@@ -179,11 +189,15 @@ export function fakeOrca(
         terminals: [...terminals.values()].filter((t) => t.open && t.workspaceId === params.workspaceId).map((t) => ({ id: t.id })),
         truncated: false,
       }),
-      'agents.list': (params: { workspaceId: string }) => ({
-        agents: [...terminals.values()]
-          .filter((t) => t.workspaceId === params.workspaceId && listed.has(t.id))
-          .map((t) => ({ terminalId: t.id, title: null, agent: t.agent, state: listed.get(t.id)?.state, stateStartedAt: listed.get(t.id)?.stateStartedAt })),
-      }),
+      'agents.list': async (params: { workspaceId: string }) => {
+        const gate = fake.listGate
+        if (gate !== null) await gate
+        return {
+          agents: [...terminals.values()]
+            .filter((t) => t.workspaceId === params.workspaceId && listed.has(t.id))
+            .map((t) => ({ terminalId: t.id, title: null, agent: t.agent, state: listed.get(t.id)?.state, stateStartedAt: listed.get(t.id)?.stateStartedAt })),
+        }
+      },
       ...options.results,
     },
   })
@@ -200,6 +214,9 @@ export function fakeOrca(
     cliGate: null,
     loseAnswers: 0,
     closeGate: null,
+    listGate: null,
+    cliRefusals: [],
+    cliPresent: options.cli !== false,
     list: (terminalId, state, stateStartedAt) => {
       listed.set(terminalId, { state, stateStartedAt })
     },
