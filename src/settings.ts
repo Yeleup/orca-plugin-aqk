@@ -26,8 +26,12 @@ export type PluginSettings = {
   readonly coordinator: boolean
 }
 
-/** The queue check interval: a whole number of minutes, at least this many (orca-plugin.json: integer, minimum). */
+/**
+ * The queue check interval: a whole number of minutes in this range (orca-plugin.json: integer, minimum, maximum). The
+ * top is no product limit, only the largest whole number a JSON number holds exactly.
+ */
 export const MIN_INTERVAL_MINUTES = 1
+export const MAX_INTERVAL_MINUTES = Number.MAX_SAFE_INTEGER
 
 export const DEFAULT_SETTINGS: PluginSettings = {
   language: DEFAULT_LANGUAGE,
@@ -36,10 +40,15 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   coordinator: true,
 }
 
-/** The one check of an interval, for the screen and for reading the settings: a whole number of minutes, at least
- *  MIN_INTERVAL_MINUTES, with no upper limit (a safe integer: JSON numbers past it are not whole numbers any more). */
+/** The one check of an interval — the screen's, reading the settings', and Orca's own for the declared setting (a
+ *  whole number from minimum to maximum). */
 export function isQueueCheckInterval(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= MIN_INTERVAL_MINUTES
+  return (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= MIN_INTERVAL_MINUTES &&
+    value <= MAX_INTERVAL_MINUTES
+  )
 }
 
 /** Whether `key` (of a settings change) is one of these settings. */

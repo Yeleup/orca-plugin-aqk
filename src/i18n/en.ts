@@ -29,6 +29,7 @@ export const en = {
   'settings.languageRussian': 'Русский',
   'settings.interval': 'Queue check interval, minutes',
   'settings.intervalInvalid': 'Enter a whole number of minutes, at least {min}',
+  'settings.intervalTooLarge': 'Enter a whole number of minutes, at most {max}',
   'settings.mergeNotifications': 'Merge notifications',
   'settings.coordinator': 'Coordinator on this computer',
   'settings.project': 'Project settings',

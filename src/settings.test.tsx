@@ -20,7 +20,14 @@ import {
 import manifest from '../orca-plugin.json' with { type: 'json' }
 import { LANGUAGE_SETTING, type Language } from './i18n/catalog'
 import type { Project } from './protocol'
-import { DEFAULT_SETTINGS, MIN_INTERVAL_MINUTES, parseSettings, readSettings, SETTING_KEYS } from './settings'
+import {
+  DEFAULT_SETTINGS,
+  MAX_INTERVAL_MINUTES,
+  MIN_INTERVAL_MINUTES,
+  parseSettings,
+  readSettings,
+  SETTING_KEYS,
+} from './settings'
 import { pixelWidths, textsIn, textsNotFromCatalog } from './testing/panel-tree'
 import { withTemporaryHome } from './testing/temporary-home'
 import * as worker from './worker'
@@ -472,17 +479,22 @@ test('Настройки: строка «Сохранено» после пер�
 
 // Each change of the field that is a whole number of minutes, at least 1, is saved at once, as the person types it
 // (typing «30» saves 3, then 30); a text that is not stays in the field with its error and is not saved. No upper limit.
+// The top of the range is no product limit, only the largest whole number a JSON number holds exactly
+// (Number.MAX_SAFE_INTEGER), declared as the setting's maximum so that Orca's Settings take the same intervals.
 test('Настройки: интервал проверки очереди — целое число минут не меньше 1 сохраняется сразу, без верхнего предела; другое значение не сохраняется, у поля ошибка', async () => {
   const host = hostWith({ settings: RU })
   const panel = await open(host)
   await openSettings(panel)
   const field = { label: 'Интервал проверки очереди, минут' }
   const invalid = `Введите целое число минут, не меньше ${MIN_INTERVAL_MINUTES}`
-  const assertRefused = (typed: string, kept: number) => {
+  const tooLarge = `Введите целое число минут, не больше ${MAX_INTERVAL_MINUTES}`
+  const assertRefused = (typed: string, kept: number, error = invalid) => {
     assert.equal(stored(host)[SETTING_KEYS.queueCheckInterval], kept, `«${typed}» сохранено`)
     assert.equal(panel.valueOf(field), typed, `«${typed}»: в поле не то, что набрано`)
-    assert.ok(panel.find({ type: 'Text', text: invalid }), `«${typed}»: нет ошибки у поля`)
+    assert.ok(panel.find({ type: 'Text', text: error }), `«${typed}»: нет ошибки у поля`)
     assert.equal(panel.find(field)?.props.invalid, true, `«${typed}»: поле не помечено`)
+    // A new change takes away the line of the earlier one: nothing of this text is saved.
+    assert.deepEqual(callouts(panel), [], `«${typed}»: прежняя строка над настройками`)
   }
 
   await panel.type(field, '15', { replace: true })
@@ -505,6 +517,12 @@ test('Настройки: интервал проверки очереди — �
   // A fraction.
   await panel.type(field, '.5')
   assertRefused('525600.5', 525600)
+  // The largest whole number a JSON number holds is saved; one digit more is past it.
+  await panel.type(field, String(MAX_INTERVAL_MINUTES), { replace: true })
+  assert.equal(stored(host)[SETTING_KEYS.queueCheckInterval], MAX_INTERVAL_MINUTES)
+  assert.deepEqual(callouts(panel), [{ tone: 'success', text: SAVED_RU }])
+  await panel.type(field, '0')
+  assertRefused(`${MAX_INTERVAL_MINUTES}0`, MAX_INTERVAL_MINUTES, tooLarge)
   await panel.type(field, '2880', { replace: true })
 
   await panel.press({ type: 'Link', text: 'Назад' })
@@ -567,7 +585,15 @@ async function redrawnAfter(end: () => void): Promise<void> {
 
 test('Настройки: интервал — две цифры подряд, пока запись первой не закончилась → в поле набранное «15», сохраняется 15; отказ в записи первой цифры не откатывает вторую', async () => {
   const field = { label: 'Интервал проверки очереди, минут' }
-  for (const firstRefused of [false, true]) {
+  const refusal = { tone: 'danger', text: 'Не удалось сохранить: хранилище плагина недоступно' }
+  const outcomes = [
+    { firstRefused: false, secondRefused: false, field: '15', stored: 15, line: { tone: 'success', text: SAVED_RU } },
+    { firstRefused: true, secondRefused: false, field: '15', stored: 15, line: { tone: 'success', text: SAVED_RU } },
+    { firstRefused: false, secondRefused: true, field: '1', stored: 1, line: refusal },
+    { firstRefused: true, secondRefused: true, field: '5', stored: undefined, line: refusal },
+  ]
+  for (const outcome of outcomes) {
+    const where = `«1» ${outcome.firstRefused ? 'отказ' : 'сохранено'}, «15» ${outcome.secondRefused ? 'отказ' : 'сохранено'}`
     const writes = heldSettings(RU)
     const panel = await open(hostWith({ results: writes.results }))
     await openSettings(panel)
@@ -581,14 +607,16 @@ test('Настройки: интервал — две цифры подряд, �
     // «5» after it — a separate input event while the write of «1» is on its way.
     const second = await drawnAfter(() => panel.type(field, '5'))
     assert.equal(panel.valueOf(field), '15')
+    assert.deepEqual(callouts(panel), [], `${where}: строка, пока ничего не записано`)
 
-    // The write of «1» ends: the field still shows the person's latest text, and «15» goes to Orca.
-    await redrawnAfter(() => {
-      if (firstRefused) writes.held[0]?.refuse('хранилище плагина недоступно')
-      else writes.held[0]?.land()
-    })
+    // The write of «1» ends: «15» is still on its way, so the field keeps it and the screen says nothing yet — neither
+    // «Сохранено.» for a value it does not show, nor the refusal of a value the person has typed over. (A refused «1»
+    // changes nothing on the screen, so there is no draw to wait for.)
+    if (outcome.firstRefused) writes.held[0]?.refuse('хранилище плагина недоступно')
+    else await redrawnAfter(() => writes.held[0]?.land())
     await writes.written(2)
-    assert.equal(panel.valueOf(field), '15', 'конец записи «1» изменил поле, хотя «15» ещё в пути')
+    assert.equal(panel.valueOf(field), '15', `${where}: конец записи «1» изменил поле, хотя «15» ещё в пути`)
+    assert.deepEqual(callouts(panel), [], `${where}: строка между концами записей`)
     assert.deepEqual(
       writes.held.map((write) => [write.key, write.value]),
       [
@@ -596,38 +624,54 @@ test('Настройки: интервал — две цифры подряд, �
         [SETTING_KEYS.queueCheckInterval, 15],
       ],
     )
-    writes.held[1]?.land()
+
+    // The write of «15» ends: only now the line, and after a refusal the value Orca keeps.
+    await redrawnAfter(() => {
+      if (outcome.secondRefused) writes.held[1]?.refuse('хранилище плагина недоступно')
+      else writes.held[1]?.land()
+    })
     await first.acting
     await second.acting
-    assert.equal(writes.store[SETTING_KEYS.queueCheckInterval], 15)
-    assert.equal(panel.valueOf(field), '15')
-    assert.deepEqual(callouts(panel), [{ tone: 'success', text: SAVED_RU }])
+    assert.equal(writes.store[SETTING_KEYS.queueCheckInterval], outcome.stored, where)
+    assert.equal(panel.valueOf(field), outcome.field, where)
+    assert.deepEqual(callouts(panel), [outcome.line], where)
     assertClean(panel)
   }
 })
 
 test('Настройки: запись последней правки отказана, пока идёт запись → на экране снова сохранённое значение; до конца записи — то, что выбрал человек', async () => {
-  const writes = heldSettings(RU)
-  const panel = await open(hostWith({ results: writes.results }))
-  await openSettings(panel)
-  const toggling = await drawnAfter(() => panel.toggle({ label: 'Уведомления о мержах' }))
-  await writes.written(1)
-  assert.equal(panel.valueOf({ label: 'Уведомления о мержах' }), false, 'пока идёт запись, переключатель вернулся')
-  const typing = await drawnAfter(() => panel.type({ label: 'Интервал проверки очереди, минут' }, '0'))
-  assert.equal(panel.valueOf({ label: 'Интервал проверки очереди, минут' }), '50')
+  for (const intervalRefused of [true, false]) {
+    const writes = heldSettings(RU)
+    const panel = await open(hostWith({ results: writes.results }))
+    await openSettings(panel)
+    const toggling = await drawnAfter(() => panel.toggle({ label: 'Уведомления о мержах' }))
+    await writes.written(1)
+    assert.equal(panel.valueOf({ label: 'Уведомления о мержах' }), false, 'пока идёт запись, переключатель вернулся')
+    const typing = await drawnAfter(() => panel.type({ label: 'Интервал проверки очереди, минут' }, '0'))
+    assert.equal(panel.valueOf({ label: 'Интервал проверки очереди, минут' }), '50')
 
-  // The switch's write is refused: the switch shows the saved value again, the field keeps «50» on its way.
-  await redrawnAfter(() => writes.held[0]?.refuse('хранилище плагина недоступно'))
-  await writes.written(2)
-  assert.equal(panel.valueOf({ label: 'Уведомления о мержах' }), true)
-  assert.equal(panel.valueOf({ label: 'Интервал проверки очереди, минут' }), '50')
-  writes.held[1]?.refuse('хранилище плагина недоступно')
-  await toggling.acting
-  await typing.acting
-  assert.deepEqual(shown(panel, 'ru'), { language: 'ru', interval: '5', notifications: true, coordinator: true })
-  assert.deepEqual(callouts(panel), [{ tone: 'danger', text: 'Не удалось сохранить: хранилище плагина недоступно' }])
-  assert.deepEqual(writes.store, RU)
-  assertClean(panel)
+    // The switch's write is refused: at once the refusal and the saved value of the switch; «50» stays on its way.
+    const refusal = [{ tone: 'danger', text: 'Не удалось сохранить: хранилище плагина недоступно' }]
+    await redrawnAfter(() => writes.held[0]?.refuse('хранилище плагина недоступно'))
+    await writes.written(2)
+    assert.equal(panel.valueOf({ label: 'Уведомления о мержах' }), true)
+    assert.equal(panel.valueOf({ label: 'Интервал проверки очереди, минут' }), '50')
+    assert.deepEqual(callouts(panel), refusal)
+
+    // The interval's write ends: refused — «5» again; saved — «50», and the switch's refusal is not covered by
+    // «Сохранено.».
+    await redrawnAfter(() => {
+      if (intervalRefused) writes.held[1]?.refuse('хранилище плагина недоступно')
+      else writes.held[1]?.land()
+    })
+    await toggling.acting
+    await typing.acting
+    const interval = intervalRefused ? '5' : '50'
+    assert.deepEqual(shown(panel, 'ru'), { language: 'ru', interval, notifications: true, coordinator: true })
+    assert.deepEqual(callouts(panel), refusal)
+    assert.deepEqual(writes.store, intervalRefused ? RU : { ...RU, [SETTING_KEYS.queueCheckInterval]: 50 })
+    assertClean(panel)
+  }
 })
 
 test('Настройки: English → Русский при выключенных переключателях — строка русского кадра о них; English → «Saved.» во всех четырёх английских кадрах', async () => {
@@ -673,9 +717,13 @@ test('Настройки: настройки не заданы → English, ин
   )
   assert.equal(byKey(SETTING_KEYS.language)?.default, DEFAULT_SETTINGS.language)
   // The manifest, the screen and reading the settings take the same intervals: whole minutes, at least 1, no maximum.
+  // The maximum is only the technical top: the largest whole number a JSON number holds exactly.
   const declaredInterval = byKey(SETTING_KEYS.queueCheckInterval)
-  assert.deepEqual([declaredInterval?.type, declaredInterval?.minimum], ['integer', MIN_INTERVAL_MINUTES])
-  assert.equal(Object.hasOwn(declaredInterval ?? {}, 'maximum'), false, 'у интервала есть верхний предел')
+  assert.deepEqual(
+    [declaredInterval?.type, declaredInterval?.minimum, declaredInterval?.maximum],
+    ['integer', MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES],
+  )
+  assert.equal(MAX_INTERVAL_MINUTES, Number.MAX_SAFE_INTEGER)
   assert.equal(byKey(SETTING_KEYS.queueCheckInterval)?.default, DEFAULT_SETTINGS.queueCheckInterval)
   for (const name of ['mergeNotifications', 'coordinator'] as const) {
     assert.equal(byKey(SETTING_KEYS[name])?.type, 'boolean', name)
@@ -693,10 +741,10 @@ test('Настройки: настройки не заданы → English, ин
     }),
     DEFAULT_SETTINGS,
   )
-  for (const interval of [-5, 0, 1.5, '10', Number.MAX_SAFE_INTEGER + 2, Number.POSITIVE_INFINITY]) {
+  for (const interval of [-5, 0, 1.5, '10', Number.MAX_SAFE_INTEGER + 1, Number.MAX_SAFE_INTEGER + 3, Number.POSITIVE_INFINITY]) {
     assert.equal(parseSettings({ [SETTING_KEYS.queueCheckInterval]: interval }).queueCheckInterval, 5, String(interval))
   }
-  for (const interval of [1, 1441, 2880, 525600]) {
+  for (const interval of [1, 1441, 2880, 525600, Number.MAX_SAFE_INTEGER]) {
     assert.equal(parseSettings({ [SETTING_KEYS.queueCheckInterval]: interval }).queueCheckInterval, interval)
   }
   const odd = await open(

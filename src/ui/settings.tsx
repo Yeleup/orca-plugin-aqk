@@ -2,13 +2,15 @@
 // queue check interval, merge notifications and the coordinator of this computer — and «Настройки проекта», which opens
 // the selected project's .agent-queue.json and .agent-queue.md in Orca's editor (through the worker). A change is saved
 // at once: each control shows the person's latest change while its write is on its way; when that write ends, the
-// screen says «Сохранено» (with what the switches now mean, where the frames say so) and shows the saved value, or
-// says «Не удалось сохранить: <ошибка>» and shows the previous value again — never one a failed write did not save.
+// control shows the saved value, or after a refusal the previous one again — never one a failed write did not save.
+// A new change takes away the line above the settings; «Сохранено» (with what the switches now mean, where the frames
+// say so) comes only once nothing the screen shows is still on its way, «Не удалось сохранить: <ошибка>» at once.
 import { atom, Button, Callout, Input, plugin, read, Row, Select, set, settings, Stack, Switch, Text } from 'orca'
 import { LANGUAGES, type Language, type MessageKey } from '../i18n/catalog'
 import { PROJECT_FILES, type Project, type ProjectFile } from '../protocol'
 import {
   isQueueCheckInterval,
+  MAX_INTERVAL_MINUTES,
   MIN_INTERVAL_MINUTES,
   readSettings,
   SETTING_KEYS,
@@ -91,10 +93,13 @@ function savedLine(name: SettingName, saved: PluginSettings): MessageKey {
 // Writes go one after another, in the order the person made the changes.
 let writing: Promise<void> = Promise.resolve()
 
-/** Saves the change number `edit` of `name`; the control shows `value` until this write, or a later change, ends. */
+/**
+ * Saves the change number `edit` of `name`; the control shows `value` until this write, or a later change, ends. The
+ * change takes away the line above the settings: it spoke of earlier changes.
+ */
 function save<N extends SettingName>(name: N, value: PluginSettings[N], edit = ++edits): Promise<void> {
   const at = read(route)
-  changeVisit(at, { pending: { ...currentVisit().pending, [name]: { edit, value } } })
+  changeVisit(at, { notice: null, pending: { ...currentVisit().pending, [name]: { edit, value } } })
   const run = writing.then(() => write(at, name, value, edit))
   writing = run.catch(() => {})
   return run
@@ -117,33 +122,45 @@ async function write<N extends SettingName>(at: Route, name: N, value: PluginSet
 }
 
 /**
- * The write of change `edit` of `name` ended with `notice`. If no later change of `name` is on its way, the control
- * shows what Orca keeps now: the new value after a save, the previous one after a refusal. The interval's field lets
- * go of its text only if this change typed it.
+ * The write of change `edit` of `name` ended with `notice`. A later change of `name` on its way has the last word: this
+ * end changes neither the control nor the line. Otherwise the control shows what Orca keeps now — the new value after
+ * a save, the previous one after a refusal — and the line says so: a refusal at once; «Сохранено» only once no other
+ * write is on its way, and never over a refusal of this round of changes. The interval's field lets go of its text
+ * only if this change typed it.
  */
 function settle(at: Route, name: SettingName, edit: number, notice: Notice): void {
   if (read(route) !== at) return
   const here = currentVisit()
+  if (here.pending[name]?.edit !== edit) return
   const pending: Record<string, unknown> = { ...here.pending }
-  if (here.pending[name]?.edit === edit) delete pending[name]
+  delete pending[name]
   const field = here.field?.edit === edit ? null : here.field
-  set(visit, { ...here, notice, pending: pending as Pending, field })
+  const settled = Object.keys(pending).length === 0
+  const shown =
+    notice.kind !== 'saved' ? notice : settled && here.notice?.kind !== 'saveError' ? notice : here.notice
+  set(visit, { ...here, notice: shown, pending: pending as Pending, field })
 }
 
-/** The interval a text of the field names, or null when it is not a whole number of minutes, at least the least. */
-function intervalOf(text: string): number | null {
+/** The minutes a text of the field names: digits only, read as a number. */
+function minutesOf(text: string): number {
   const typed = text.trim()
-  const minutes = /^\d+$/.test(typed) ? Number(typed) : Number.NaN
+  return /^\d+$/.test(typed) ? Number(typed) : Number.NaN
+}
+
+/** The interval a text of the field names, or null when it is not one (isQueueCheckInterval). */
+function intervalOf(text: string): number | null {
+  const minutes = minutesOf(text)
   return isQueueCheckInterval(minutes) ? minutes : null
 }
 
 /**
  * The field keeps the text as typed. A valid interval is saved at once, each one the person types (typing «30» saves
- * 3, then 30); anything else stays in the field with its error and is not written.
+ * 3, then 30); anything else stays in the field with its error and is not written. Either way the line above the
+ * settings goes: it spoke of earlier changes.
  */
 function changeInterval(text: string): void {
   const edit = ++edits
-  changeVisit(read(route), { field: { text, edit } })
+  changeVisit(read(route), { notice: null, field: { text, edit } })
   const minutes = intervalOf(text)
   if (minutes !== null) void save('queueCheckInterval', minutes, edit)
 }
@@ -193,6 +210,7 @@ function SettingsForm(props: { saved: PluginSettings }) {
   const { pending, field } = here
   const interval = field?.text ?? String(pending.queueCheckInterval?.value ?? saved.queueCheckInterval)
   const intervalInvalid = field !== null && intervalOf(field.text) === null
+  const tooLarge = field !== null && minutesOf(field.text) > MAX_INTERVAL_MINUTES
   return (
     <Stack gap="md">
       <NoticeLine notice={here.notice} />
@@ -209,7 +227,9 @@ function SettingsForm(props: { saved: PluginSettings }) {
         <Input label={t('settings.interval')} value={interval} invalid={intervalInvalid} onChange={changeInterval} />
         {intervalInvalid ? (
           <Text tone="danger" size="sm">
-            {t('settings.intervalInvalid', { min: MIN_INTERVAL_MINUTES })}
+            {tooLarge
+              ? t('settings.intervalTooLarge', { max: MAX_INTERVAL_MINUTES })
+              : t('settings.intervalInvalid', { min: MIN_INTERVAL_MINUTES })}
           </Text>
         ) : null}
       </Stack>
