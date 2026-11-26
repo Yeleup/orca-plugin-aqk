@@ -72,9 +72,12 @@ jobs:
       - name: plugin test
         run: '"$ORCA_CLI_COMMAND" plugin test .'
 
+      # On Windows RUNNER_TEMP is a Windows path (D:\a\_temp), which the tar of Git Bash cannot open with -C: the export
+      # directory goes in the shell's form there (cygpath -u).
       - name: plugin inspect чистой выгрузки коммита (git archive, без node_modules и .orca)
         run: |
           export_dir="$RUNNER_TEMP/plugin-export"
+          if command -v cygpath >/dev/null; then export_dir="$(cygpath -u "$export_dir")"; fi
           rm -rf "$export_dir"
           mkdir -p "$export_dir"
           git archive --format=tar HEAD | tar -x -f - -C "$export_dir"
