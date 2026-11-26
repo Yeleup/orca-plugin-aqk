@@ -20,6 +20,7 @@ import { catalogs, format, LANGUAGE_SETTING, type Language, type MessageKey } fr
 import type { Project } from './protocol'
 import { loadLanguage } from './ui/language'
 import { openScreen, SCREENS } from './ui/navigation'
+import { pixelWidths, textsIn, textsNotFromCatalog } from './testing/panel-tree'
 import { withTemporaryHome } from './testing/temporary-home'
 import * as worker from './worker'
 
@@ -78,8 +79,8 @@ async function pressWhileWaiting<T>(
 
 type ProjectsAnswer = { projects: Project[] }
 
-const SHOP: Project = { id: 'shop-demo', name: 'shop-demo' }
-const BLOG: Project = { id: 'blog-demo', name: 'blog-demo' }
+const SHOP: Project = { id: 'shop-demo', hostId: 'local', name: 'shop-demo' }
+const BLOG: Project = { id: 'blog-demo', hostId: 'local', name: 'blog-demo' }
 
 let view: TestPanel | undefined
 afterEach(async () => {
@@ -153,7 +154,8 @@ test('Каркас панели: панель открывается на «Оч
   for (const [item, screen] of opens) {
     await panel.press({ type: 'Button', text: item })
     assert.deepEqual(headings(panel), [screen], `«${item}» открывает не «${screen}»`)
-    assert.deepEqual(buttons(panel), [], `на экране «${screen}» осталось меню «Очереди»`)
+    const menuLeft = buttons(panel).filter((label) => MENU_RU.includes(label))
+    assert.deepEqual(menuLeft, [], `на экране «${screen}» осталось меню «Очереди»`)
     assert.ok(panel.find({ type: 'Link', text: 'Назад' }), `на экране «${screen}» нет «Назад»`)
 
     await panel.press({ type: 'Link', text: 'Назад' })
@@ -243,32 +245,12 @@ test('Каркас панели: у каждого ключа английско
   }
 })
 
-/** Every word a drawn tree shows or names: text, and the label, title, description, placeholder, tooltip and options. */
-function textsIn(tree: TreeSnapshot | string | null): string[] {
-  if (tree === null) return []
-  if (typeof tree === 'string') return [tree]
-  const props = tree.props ?? {}
-  const named = ['label', 'title', 'description', 'placeholder', 'tooltip']
-    .map((name) => props[name])
-    .filter((value): value is string => typeof value === 'string')
-  const options = Array.isArray(props.options) ? (props.options as { label: string }[]).map((option) => option.label) : []
-  return [...named, ...options, ...(tree.children ?? []).flatMap(textsIn)]
-}
-
 // Every word the panel draws is a text of the current language's catalog (a `{name}` part is a value the screen puts
 // in), apart from data: the names of projects.
 function assertTextsFromCatalog(panel: TestPanel, language: Language, data: readonly string[], where: string): void {
-  const texts = Object.values(catalogs[language])
-  const fromCatalog = (text: string) =>
-    texts.some((template) => {
-      const pattern = template.replace(/[.*+?^$()|[\]\\]/g, '\\$&').replace(/\{\w+\}/g, '.+')
-      return new RegExp(`^${pattern}$`, 's').test(text)
-    })
   const seen = textsIn(panel.tree())
   assert.ok(seen.length > 0, `${where}: нет текстов`)
-  for (const text of seen) {
-    assert.ok(data.includes(text) || fromCatalog(text), `${where} (${language}): «${text}» не из каталога строк`)
-  }
+  assert.deepEqual(textsNotFromCatalog(seen, language, data), [], `${where} (${language}): не из каталога строк`)
 }
 
 test('Каркас панели: ни одной строки экрана мимо каталога — на каждом экране, в загрузке и в ошибке, на английском и на русском', async () => {
@@ -413,17 +395,6 @@ test('Каркас панели: светлая и тёмная тема Orca �
     assertClean(panel)
   }
 })
-
-/** Where a drawn tree gives an element a width in pixels: `width` or `minWidth` as a number. */
-function pixelWidths(tree: TreeSnapshot | string | null, path = ''): string[] {
-  if (tree === null || typeof tree === 'string') return []
-  const here = `${path}/${tree.type}`
-  const props = tree.props ?? {}
-  const found = ['width', 'minWidth']
-    .filter((name) => typeof props[name] === 'number')
-    .map((name) => `${here} ${name}=${String(props[name])}`)
-  return [...found, ...(tree.children ?? []).flatMap((child, index) => pixelWidths(child, `${here}[${index}]`))]
-}
 
 /** The rows of a drawn tree that hold all the buttons `labels` (the menu of «Очередь»). */
 function rowsHolding(tree: TreeSnapshot | string | null, labels: readonly string[]): TreeSnapshot[] {

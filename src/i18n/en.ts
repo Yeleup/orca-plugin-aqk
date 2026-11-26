@@ -23,6 +23,29 @@ export const en = {
   'screen.settings': 'Settings',
   'screen.mvp': 'MVP',
   'screen.mvpStart': 'MVP start',
+
+  'settings.language': 'Interface language',
+  'settings.languageEnglish': 'English',
+  'settings.languageRussian': 'Русский',
+  'settings.interval': 'Queue check interval, minutes',
+  'settings.intervalInvalid': 'Enter a whole number of minutes, at least {min}',
+  'settings.intervalTooLarge': 'Enter a whole number of minutes, at most {max}',
+  'settings.mergeNotifications': 'Merge notifications',
+  'settings.coordinator': 'Coordinator on this computer',
+  'settings.project': 'Project settings',
+  'settings.configFile': '.agent-queue.json',
+  'settings.rulesFile': '.agent-queue.md',
+  'settings.openFile': "Opens the file in Orca's editor",
+  'settings.noProjects': 'No connected projects',
+  'settings.saved': 'Saved.',
+  'settings.savedNotificationsOff': 'Saved: there will be no merge notifications; blocking notifications will still come.',
+  'settings.savedCoordinatorOff':
+    'Saved: the coordinator of this computer neither takes nor runs tasks; the panel only shows the queue.',
+  'settings.savedBothOff': 'Saved: no merge notifications, and the coordinator of this computer takes no tasks.',
+  'settings.saveError': 'Could not save: {error}',
+  'settings.readError': 'Could not read the settings: {error}',
+  'settings.openError': 'Could not open {file}: {error}',
+  'settings.noCheckout': 'Orca has no main checkout of this project',
 } as const satisfies Record<string, string>
 
 export type MessageKey = keyof typeof en

@@ -38,8 +38,8 @@ export function resource<T>(run: () => Promise<T>): Resource<T> {
   }
 }
 
-/** What the worker's error says (a rejected `plugin.request` carries its message), or its code. */
-function errorMessage(error: unknown): string {
+/** What a host or worker error says (a rejected `plugin.request` carries its message), or its code. */
+export function errorMessage(error: unknown): string {
   if (error && typeof error === 'object') {
     const { message, code } = error as { message?: unknown; code?: unknown }
     if (typeof message === 'string' && message.trim()) return message
