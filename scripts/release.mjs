@@ -10,7 +10,7 @@
 // never a bare `orca` on Linux. Node only, no packages.
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, relative, resolve } from 'node:path'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isScreenReader, orcaCliCommand, spawnCommand } from './tools.mjs'
 
@@ -35,6 +35,10 @@ export function releaseEntry(rev = 'HEAD', { root = pluginRoot, cli = orcaCliCom
       '(orca-ide или полный путь CLI)')
   }
   const toplevel = gitOk(['rev-parse', '--show-toplevel'], root, 'папка плагина не в репозитории git')
+  // Where the plugin folder lies in the repository, in git's own words: the path this command knows itself by may be
+  // spelled otherwise than git's top level (a symbolic link, an 8.3 short name on Windows such as C:\Users\RUNNER~1),
+  // and a path computed from the two could point outside the clone.
+  const prefix = gitOk(['rev-parse', '--show-prefix'], root, 'папка плагина в репозитории git').replace(/\/$/, '')
   const found = git(['rev-parse', '--verify', '--quiet', '--end-of-options', `${rev}^{commit}`], root)
   if (found.status !== 0) throw new Error(`релизный коммит «${rev}» не найден в ${toplevel}`)
   const sha = found.stdout.trim()
@@ -44,7 +48,7 @@ export function releaseEntry(rev = 'HEAD', { root = pluginRoot, cli = orcaCliCom
     const clone = join(temp, 'repo')
     gitOk(['clone', '--quiet', '--no-checkout', toplevel, clone], temp, 'временный клон')
     gitOk(['-c', 'advice.detachedHead=false', 'checkout', '--quiet', '--detach', sha], clone, 'релизный коммит в клоне')
-    const pluginDir = join(clone, relative(resolve(toplevel), resolve(root)))
+    const pluginDir = prefix === '' ? clone : join(clone, ...prefix.split('/'))
     log(`Релизный коммит ${sha} (${rev}) во временном клоне ${clone}: ${cli} plugin release-entry`)
 
     const answer = spawnCommand(cli, ['plugin', 'release-entry', pluginDir, '--json'], { cwd: clone, encoding: 'utf8' })

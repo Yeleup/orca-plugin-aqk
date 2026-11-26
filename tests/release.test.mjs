@@ -6,7 +6,7 @@
 // the folder, its commit and state — and answers in the form of Orca's CLI (`--json`).
 import { assert, test } from 'orca/testing'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { exportHead, nestedRun, readJson, run, tempDir, testEnv, writeExecutable } from './helpers.mjs'
 
@@ -139,11 +139,12 @@ console.log(JSON.stringify({ ok: true, result: { path: folder, pluginKey: 'local
   }
 }
 
-// The release command of the checkout `dir`, run there, with its temporary files in `tmp` (TMPDIR, TMP, TEMP).
-function release(temp, dir, args, env) {
+// The release command of the checkout `dir`, run there, with its temporary files in `tmp` (TMPDIR, TMP, TEMP);
+// `nodeArgs` go to node before the script.
+function release(temp, dir, args, env, nodeArgs = []) {
   const tmp = join(temp, 'tmp')
   mkdirSync(tmp, { recursive: true })
-  return run('node', [join(dir, 'scripts', 'release.mjs'), ...args], {
+  return run('node', [...nodeArgs, join(dir, 'scripts', 'release.mjs'), ...args], {
     cwd: dir,
     env: { ...gitEnv(temp), TMPDIR: tmp, TMP: tmp, TEMP: tmp, ...env },
   })
@@ -206,6 +207,25 @@ releaseTest('Релиз: релизный коммит по тегу — зап�
   const entry = JSON.parse(result.stdout)
   assert.deepEqual([entry.version, entry.commit], ['0.4.2', released])
   assert.notEqual(released, head)
+  assert.deepEqual(snapshot(temp, dir), before)
+})
+
+// The checkout by a path git spells otherwise: on windows-latest the temporary directory is an 8.3 short name
+// (C:\Users\RUNNER~1\…) and git names the long one; here a link to the checkout (a junction on Windows), which the
+// command keeps as its own path (node --preserve-symlinks-main) while git names the checkout's real one.
+releaseTest('Релиз: чекаут по пути, который git пишет иначе (ссылка; на Windows — короткое имя 8.3), — запись через plugin release-entry в корне временного клона релизного коммита, чекаут без изменений', (temp) => {
+  const { dir, head } = checkout(temp)
+  const link = join(temp, 'checkout-link')
+  symlinkSync(dir, link, process.platform === 'win32' ? 'junction' : 'dir')
+  const before = snapshot(temp, dir)
+  const fake = fakeCli(temp)
+
+  const result = release(temp, link, [], fake.env, ['--preserve-symlinks-main'])
+  assert.equal(result.status, 0, result.output)
+  const calls = fake.calls()
+  assert.equal(calls.length, 1, JSON.stringify(calls))
+  assertInTemporaryClone(calls[0], dir, head, temp)
+  assert.deepEqual([JSON.parse(result.stdout).commit, JSON.parse(result.stdout).version], [head, '0.5.0'])
   assert.deepEqual(snapshot(temp, dir), before)
 })
 
