@@ -47,7 +47,11 @@
 //   as before. The text and the time of the file are read after Orca's answer, with nothing waited for or written
 //   between them and the reply, the time after the text — a file changed in between has the later time, so «not ready»
 //   — and the text read is the one returned. The rule assumes one computer: the data directory and Orca on it, so the
-//   file's time and `stateStartedAt` come from one clock; the report is written by the agent itself.
+//   file's time and `stateStartedAt` come from one clock; the report is written by the agent itself. Readiness is a
+//   reading at the moment of Orca's answer: the answer of `agents.list` this reading got and the report file read after
+//   it (the text, then the time) decide — nothing is waited for or written between that read of the file and the reply,
+//   a wait between Orca's answer and the last read of the file is allowed — and what Orca shows after its answer (the
+//   agent gone from the list, a new turn that left the file as it was) does not change it: the next reading shows it.
 // After a restart of the worker only the disk is kept: the events the former worker heard are gone, and an event of a
 // launch the new worker does not know yet (before its first reading of that launch's state or report) leaves no mark.
 //

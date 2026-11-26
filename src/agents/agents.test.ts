@@ -1745,3 +1745,59 @@ test('Каталог на месте файла отчёта — не начал
   assert.deepEqual(r.worker.refusals, [])
   await r.worker.deactivate()
 })
+
+test('Готовность — на момент ответа Orca: агент, которого Orca убрала из списка после своего ответа — пока ответ шёл к воркеру или пока чтение записывало отметку начала, — при отчёте, не менявшемся с тех пор, готов; следующее чтение — «не готов», список агента не называет', async () => {
+  const orca = fakeOrca()
+  // The disk takes its time with a start mark while the test says so.
+  let slow: Promise<void> | null = null
+  const machine: Machine = {
+    ...orca.machine,
+    createText: async (path, text) => {
+      if (slow !== null && path.endsWith('/started-0')) await slow
+      return orca.machine.createText(path, text)
+    },
+  }
+  const r = await mount(orca, { machine })
+
+  // A late answer of the list: the start is on disk already (a reading saw the turn), and the agent ends its turn with
+  // its report. Orca answers with that «done»; while the answer goes to the worker, the terminal is closed.
+  const late = await launched(r, 97, 'implementer')
+  orca.clock.advance(1_000)
+  orca.list(late.terminalId, 'working', orca.clock.now())
+  assert.deepEqual(await r.agents.report(late), notReady(late, { state: 'working', listed: true, started: true }))
+  orca.clock.advance(60_000)
+  orca.finishTurn(late, 'Отчёт: фильтр по цвету.\n')
+  const held = gate()
+  orca.listGate = held.promise
+  const reading = r.agents.report(late)
+  await settle()
+  orca.clock.advance(5_000)
+  orca.unlist(late.terminalId)
+  orca.listGate = null
+  held.open()
+  assert.deepEqual(await reading, { ready: true, text: 'Отчёт: фильтр по цвету.\n', reportFile: late.reportFile })
+  // The next reading asks Orca again: its list no longer names the agent — not confirmed, the watchdog's case (Ф10).
+  assert.deepEqual(await r.agents.report(late), notReady(late, { started: true, reportExists: true }))
+
+  // The same while the reading keeps the start on disk: no mark yet, the agent ends its turn with its report, Orca's
+  // answer names that «done»; while the mark is written, the terminal is closed and the file does not change.
+  const marking = await launched(r, 98, 'implementer')
+  orca.clock.advance(60_000)
+  orca.finishTurn(marking, 'Отчёт: фильтр по размеру.\n')
+  const mark = startMark(orca, marking)
+  assert.equal(orca.machine.files.has(mark), false)
+  const disk = gate()
+  slow = disk.promise
+  const marked = r.agents.report(marking)
+  await settle()
+  assert.equal(orca.machine.files.has(mark), false)
+  orca.clock.advance(5_000)
+  orca.unlist(marking.terminalId)
+  slow = null
+  disk.open()
+  assert.deepEqual(await marked, { ready: true, text: 'Отчёт: фильтр по размеру.\n', reportFile: marking.reportFile })
+  assert.ok(orca.machine.files.has(mark))
+  assert.deepEqual(await r.agents.report(marking), notReady(marking, { started: true, reportExists: true }))
+  assert.deepEqual(r.worker.refusals, [])
+  await r.worker.deactivate()
+})
