@@ -37,12 +37,41 @@
           "Русский"
         ],
         "default": "en"
+      },
+      {
+        "key": "queueCheckInterval",
+        "title": "Queue check interval, minutes",
+        "description": "How often the coordinator of this computer checks the queues of the connected projects: a whole number of minutes from 1 to 1440.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1440,
+        "default": 5
+      },
+      {
+        "key": "mergeNotifications",
+        "title": "Merge notifications",
+        "description": "Show a notification when a task is merged. Notifications about blocked tasks are always shown.",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "coordinatorEnabled",
+        "title": "Coordinator on this computer",
+        "description": "When off, the coordinator of this computer takes and runs no tasks; the panel only shows the queue.",
+        "type": "boolean",
+        "default": true
       }
     ]
   },
   "capabilities": [
     {
       "kind": "settings:own"
+    },
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "workspace:write"
     }
   ]
 }

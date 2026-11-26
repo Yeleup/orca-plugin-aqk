@@ -1,5 +1,6 @@
-// The screens of the ТЗ («Экраны») other than «Очередь». Each is a placeholder for now — its frame, «Назад» and its
-// title; the task of each screen's function fills it with its data and states (ТЗ, «Экраны»; docs/mvp/plan.md).
+// The screens of the ТЗ («Экраны») other than «Очередь»: each has its frame — «Назад» and its title — and its content.
+// «Настройки» has its own (./settings.tsx); the others are placeholders for now, and the task of each screen's function
+// fills it with its data and states (ТЗ, «Экраны»; docs/mvp/plan.md).
 import { Stack, type OrcaNode } from 'orca'
 import type { MessageKey } from '../i18n/catalog'
 import { ScreenHeader } from './header'
