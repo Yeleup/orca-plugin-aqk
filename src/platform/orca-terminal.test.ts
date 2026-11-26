@@ -39,6 +39,7 @@ test('CLI Orca вводит строку в терминал по его handle 
     refusedReason: null,
     turnStarted: true,
     replayed: false,
+    typedAt: null,
   })
   assert.deepEqual(started.starts.map((start) => [start.file, ...start.args]), [
     [CLI, 'status', '--json'],
@@ -65,7 +66,7 @@ test('CLI Orca вводит строку в терминал по его handle 
   assert.equal(started.starts.filter((start) => start.args[0] === 'status').length, 2)
 
   const queued = machineWith(() => receipt(['input_accepted']))
-  assert.deepEqual(await orcaCliTerminalInput(queued)('term_1', 'x', REQUEST), { ok: true, accepted: true, refusedReason: null, turnStarted: false, replayed: false })
+  assert.deepEqual(await orcaCliTerminalInput(queued)('term_1', 'x', REQUEST), { ok: true, accepted: true, refusedReason: null, turnStarted: false, replayed: false, typedAt: null })
   const refused = machineWith(() => receipt(['input_accepted'], false, 'the terminal is read-only'))
   assert.deepEqual(await orcaCliTerminalInput(refused)('term_1', 'x', REQUEST), {
     ok: true,
@@ -73,6 +74,7 @@ test('CLI Orca вводит строку в терминал по его handle 
     refusedReason: 'the terminal is read-only',
     turnStarted: false,
     replayed: false,
+    typedAt: null,
   })
 })
 
@@ -159,6 +161,31 @@ test('CLI Orca: ответ без квитанции терминала (нет 
     refusedReason: null,
     turnStarted: false,
     replayed: true,
+    typedAt: null,
   })
+})
+
+test('CLI Orca: время Enter из квитанции промпта агента (prompt.submit.enteredAt), и в отыгранной квитанции; без него — null', async () => {
+  const answer = (submit: unknown, replayed: boolean): FakeAnswer => ({
+    code: 0,
+    stdout: JSON.stringify({
+      ok: true,
+      result: {
+        send: { handle: 'term_1', accepted: true, prompt: { requestId: REQUEST, stages: ['input_accepted'], submit } },
+        mutation: { requestId: REQUEST, replayed },
+      },
+    }),
+  })
+  const read = async (submit: unknown, replayed = false) => {
+    const result = await orcaCliTerminalInput(machineWith(() => answer(submit, replayed)))('term_1', 'x', REQUEST)
+    assert.ok(result.ok, JSON.stringify(result))
+    return [result.typedAt, result.replayed]
+  }
+  assert.deepEqual(await read({ pastedAt: 1768469400000, enteredAt: 1768469400250 }), [1768469400250, false])
+  assert.deepEqual(await read({ pastedAt: 1768469400000, enteredAt: 1768469400250 }, true), [1768469400250, true])
+  // Enter withheld (a dialog in the agent), no time, or not a time: none.
+  assert.deepEqual(await read({ pastedAt: 1768469400000, withheldFor: 5000 }), [null, false])
+  assert.deepEqual(await read(undefined), [null, false])
+  assert.deepEqual(await read({ enteredAt: '1768469400250' }), [null, false])
 })
 

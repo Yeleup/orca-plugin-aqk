@@ -872,6 +872,75 @@ test('Строку сообщения впервые ввёл повторный
   await r.worker.deactivate()
 })
 
+// The scenario of two lost answers: the first send does not reach Orca, the agent ends its turn on the task after the
+// send was recorded and Orca keeps listing that «done»; the first asking again types the line and its answer is lost;
+// the agent writes a draft of the report; the next asking again gets Orca's replayed receipt.
+async function replayedAfterTwoLostAnswers(orca: FakeOrca, r: Rig, issue: number) {
+  const launch = await launched(r, issue, 'implementer')
+  await r.worker.emit('agent.status.changed', status(launch, 'working', launch.launchedAt + 1_000))
+  orca.clock.advance(5_000)
+  orca.turnStarts = false
+  orca.cliRefusals.push({ code: 'runtime_unavailable', message: 'Orca is not reachable' })
+  const sent = await r.agents.message(launch, 'Замечание.')
+  assert.ok(!sent.ok && sent.outcome === 'unknown', JSON.stringify(sent))
+  const sending = sendingOf(orca, launch, 1)
+  orca.list(launch.terminalId, 'done', sending.sentAt + 1_000)
+  orca.clock.advance(60_000)
+  const typedAt = orca.clock.now()
+  orca.loseAnswers = 1
+  const lost = await r.agents.report(launch)
+  assert.ok(!lost.ready && lost.unresolved !== null, JSON.stringify(lost))
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [sending.line])
+  orca.machine.files.set(sending.reportFile, 'Черновик отчёта на замечание.\n')
+  orca.clock.advance(60_000)
+  const replayedAt = orca.clock.now()
+  const replayed = await r.agents.report(launch)
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [sending.line])
+  const outcome = JSON.parse(orca.machine.files.get(dataPath(orca.machine, launch.dir, 'message-1.json')) ?? '{}') as { typedFrom: number }
+  return { launch, sending, typedAt, replayedAt, replayed, typedFrom: outcome.typedFrom }
+}
+
+test('Оба ответа CLI потеряны, повтор получил отыгранную квитанцию: время ввода — из квитанции Orca; прежний «done» сообщение не подтверждает, «done» хода на сообщение — подтверждает', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const { launch, sending, typedAt, replayed, typedFrom } = await replayedAfterTwoLostAnswers(orca, r, 55)
+  assert.deepEqual(replayed, {
+    ready: false,
+    state: 'done',
+    started: true,
+    reportFile: sending.reportFile,
+    reportExists: true,
+    unresolved: null,
+    failure: null,
+  })
+  // Orca's time of the Enter, from the receipt of the run that typed the line.
+  assert.equal(typedFrom, typedAt)
+  // The agent's turn on the message, then its end (before the replay came): ready.
+  orca.list(launch.terminalId, 'working', typedAt + 500)
+  assert.equal((await r.agents.report(launch)).ready, false)
+  orca.list(launch.terminalId, 'done', typedAt + 30_000)
+  assert.deepEqual(await r.agents.report(launch), { ready: true, text: 'Черновик отчёта на замечание.\n', reportFile: sending.reportFile })
+  await r.worker.deactivate()
+})
+
+test('Отыгранная квитанция без времени ввода: «done», начавшийся до того, как исход стал известен, сообщение не подтверждает; «done» хода после этого — подтверждает', async () => {
+  const orca = fakeOrca()
+  orca.receiptTimes = false
+  const r = await mount(orca)
+  const { launch, sending, typedAt, replayedAt, replayed, typedFrom } = await replayedAfterTwoLostAnswers(orca, r, 56)
+  assert.ok(!replayed.ready && replayed.state === 'done' && replayed.reportExists, JSON.stringify(replayed))
+  // Without Orca's time of the Enter, the line counts as typed no earlier than its outcome became known.
+  assert.equal(typedFrom, replayedAt)
+  // A «done» that may have ended an earlier turn is not tied to the message.
+  orca.list(launch.terminalId, 'done', typedAt + 30_000)
+  assert.equal((await r.agents.report(launch)).ready, false)
+  orca.list(launch.terminalId, 'working', replayedAt + 100)
+  assert.equal((await r.agents.report(launch)).ready, false)
+  orca.list(launch.terminalId, 'done', replayedAt + 5_000)
+  assert.deepEqual(await r.agents.report(launch), { ready: true, text: 'Черновик отчёта на замечание.\n', reportFile: sending.reportFile })
+  await r.worker.deactivate()
+})
+
 test('Начало хода хранится на диске: после перезапуска воркера «blocked» без отчёта — не сбой доставки; агент, не начавший ход, — сбой с состоянием Orca', async () => {
   const orca = fakeOrca()
   const first = await mount(orca)

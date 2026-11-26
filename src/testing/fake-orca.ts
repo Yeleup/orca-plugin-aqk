@@ -12,7 +12,7 @@
 // outcome without typing again. `cliGate` holds the CLI's answer back after the text is typed, `loseAnswers` makes it
 // type the text and then die without an answer, `cliRefusals` makes Orca refuse the next sends without typing anything,
 // `cliAnswers` makes the next sends answer as given without typing, `cliHoldNext` holds the next send before Orca
-// handles it;
+// handles it, and its receipts carry the times of the paste and the Enter unless `receiptTimes` is false;
 // `terminal.close` waits for `closeGate`, `agents.list` for `listGate`. While `cliPresent` is false (`cli: false`) the
 // computer has no Orca CLI at all.
 import { hostError, mockHost, type MockHost } from 'orca/testing'
@@ -63,6 +63,9 @@ export type FakeOrca = {
   cliHoldNext: Promise<void> | null
   // Whether the computer has Orca's CLI.
   cliPresent: boolean
+  // Whether the CLI's receipts carry Orca's times of the paste and the Enter (`prompt.submit`), as Orca's do for an
+  // agent's prompt.
+  receiptTimes: boolean
   // The state `agents.list` reports for a terminal, and since when.
   list(terminalId: string, state: AgentState, stateStartedAt: number): void
   unlist(terminalId: string): void
@@ -130,7 +133,14 @@ export function fakeOrca(
             handle,
             accepted: true,
             bytesWritten: text.length + 1,
-            prompt: { requestId: requestId ?? `request-${terminal.typed.length}`, stages, provider: terminal.agent ?? 'unsupported', observation: 'supported' },
+            prompt: {
+              requestId: requestId ?? `request-${terminal.typed.length}`,
+              stages,
+              provider: terminal.agent ?? 'unsupported',
+              observation: 'supported',
+              // Orca's times of the paste and the Enter of an agent's prompt.
+              ...(fake.receiptTimes ? { submit: { pastedAt: clock.now(), enteredAt: clock.now() } } : {}),
+            },
           },
           mutation: { requestId: requestId ?? `request-${terminal.typed.length}`, replayed: false },
         },
@@ -232,6 +242,7 @@ export function fakeOrca(
     cliAnswers: [],
     cliHoldNext: null,
     cliPresent: options.cli !== false,
+    receiptTimes: true,
     list: (terminalId, state, stateStartedAt) => {
       listed.set(terminalId, { state, stateStartedAt })
     },

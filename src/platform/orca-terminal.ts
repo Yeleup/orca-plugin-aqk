@@ -24,6 +24,10 @@
 // leaves and after the connection closed behind it), any other refusal, every answer in which Orca itself calls the
 // outcome unknown (`error.data.deliveryOutcome: "unknown"`), and an answer without the terminal's receipt (no
 // `result.send.accepted` true or false).
+//
+// The receipt of an agent's prompt carries when Orca pressed Enter for the line (`prompt.submit.enteredAt`, Orca's
+// `Date.now()` right after it wrote the Enter — out/main/index.js of Orca 1.4.274), and a replay hands back the receipt
+// of the run that typed the line; a terminal without an agent gets a receipt without it.
 import type { Machine } from './machine'
 import { findOrcaCli } from './orca-cli'
 import { runProgram, type RunResult } from './run'
@@ -46,6 +50,10 @@ export type TerminalSendResult =
       // Whether Orca replayed the outcome of a request it had seen before (`mutation.replayed`): the line was typed by
       // an earlier run with this request id, not by this one.
       readonly replayed: boolean
+      // When Orca pressed Enter for the line (`prompt.submit.enteredAt`, milliseconds since the epoch), as its receipt
+      // of an agent's prompt gives it — also when replayed; null when the receipt has no such time (a terminal without
+      // an agent, an Orca that does not give it).
+      readonly typedAt: number | null
     }
   // `not-sent`: proven that nothing was typed (no CLI, Orca refused the line). `unknown`: the line may have been typed —
   // the answer was lost, or Orca failed or could not be reached; the same request id asks about it again.
@@ -71,7 +79,10 @@ export function orcaCliTerminalInput(machine: Machine): TerminalInput {
         { timeoutMs: (WAIT_SUBMIT_SECONDS + 60) * 1000 },
       ),
     )
-    if (answer.ok) return { ok: true, accepted: answer.accepted, refusedReason: answer.refusedReason, turnStarted: answer.turnStarted, replayed: answer.replayed }
+    if (answer.ok) {
+      const { accepted, refusedReason, turnStarted, replayed, typedAt } = answer
+      return { ok: true, accepted, refusedReason, turnStarted, replayed, typedAt }
+    }
     // A CLI that could not be started is looked for again next time.
     if (answer.code === null && answer.delivery === 'not-sent') cli = null
     return { ok: false, delivery: answer.delivery, error: answer.error }
@@ -86,6 +97,7 @@ type Parsed =
       readonly refusedReason: string | null
       readonly turnStarted: boolean
       readonly replayed: boolean
+      readonly typedAt: number | null
     }
   | { readonly ok: false; readonly delivery: 'not-sent' | 'unknown'; readonly error: string; readonly code: string | null }
 
@@ -129,11 +141,13 @@ function parseSend(result: RunResult): Parsed {
   }
   const reason = field(send, 'refusedReason')
   const stages = field(field(send, 'prompt'), 'stages')
+  const enteredAt = field(field(field(send, 'prompt'), 'submit'), 'enteredAt')
   return {
     ok: true,
     accepted,
     refusedReason: accepted ? null : typeof reason === 'string' ? reason : 'no reason given',
     turnStarted: Array.isArray(stages) && stages.includes('turn_started'),
     replayed: field(field(field(answer, 'result'), 'mutation'), 'replayed') === true,
+    typedAt: typeof enteredAt === 'number' && Number.isFinite(enteredAt) && enteredAt > 0 ? enteredAt : null,
   }
 }

@@ -35,8 +35,10 @@
 //   error with the reason. Only Orca's explicit receipt (the terminal took the line or not) decides an outcome. The
 //   sends of one launch run one at a time, and a new message is refused while an earlier one's outcome is unknown, so
 //   messages are typed in the order of their numbers and the newest number is the last input. A «done» counts for a
-//   message only if it began after the line could have been typed: after the send's record, or — when Orca's receipt
-//   shows that asking again typed the line itself — after that asking began.
+//   message only if it began after the line was typed: after Orca's time of the Enter when its receipt gives it
+//   (`prompt.submit.enteredAt`, also in a replayed receipt); without it, after the send's record, after the start of
+//   the asking again whose receipt shows it typed the line itself, or — a replayed receipt without that time, which
+//   cannot tell when an earlier run typed the line — after the outcome became known.
 // - stop: closes the terminals the plugin opened for this task, and no other terminal; it waits for the task's launches
 //   still waiting for Orca, and a launch of the task asked for while the stop runs is refused.
 // - an agent Orca does not know, or a launch that fails: an error naming the agent and the reason (by it the later
@@ -193,8 +195,9 @@ type LaunchingJson = { role: AgentRole; agent: string; language: GithubLanguage;
 type LaunchJson = { terminalId: string | null; error: string | null }
 type SendingJson = { sentAt: number; line: string; requestId: string; reportFile: string }
 // `at`: when the outcome was recorded — for a message the terminal took, when it took the line. `typedFrom`: the time
-// before which the line was surely not typed — the send's record, or the start of the asking again whose receipt shows
-// it typed the line itself (Orca did not replay an earlier outcome).
+// before which the line was surely not typed — Orca's time of the Enter from its receipt, else the send's record, or
+// the start of the asking again whose receipt shows it typed the line itself, or — a replayed receipt without that
+// time — when the outcome was recorded.
 type OutcomeJson = { taken: boolean; turnStarted: boolean; at: number; typedFrom: number; error: string | null }
 
 // An input of the plugin to the agent: its task (n = 0) or message n.
@@ -559,7 +562,18 @@ export class Agents {
         return { ok: false, outcome: 'not-sent', error: `the agent's terminal ${launch.terminalId} did not take message ${k}: ${sent.refusedReason}` }
       }
       try {
-        const typedFrom = attempt === 'again' && !sent.replayed ? attemptStart : sending.sentAt
+        // Since when the line can have been typed: Orca's own time of the Enter when the receipt gives it (kept within
+        // the send's record and now); otherwise the send's record, or the start of this asking again when it typed the
+        // line itself. A replayed receipt without that time cannot tell when an earlier run typed the line: then not
+        // before now, so that no «done» from before the outcome was known counts for the message.
+        const now = this.machine.now()
+        const lower = attempt === 'again' && !sent.replayed ? attemptStart : sending.sentAt
+        const typedFrom =
+          sent.typedAt !== null
+            ? Math.min(Math.max(sent.typedAt, lower), now)
+            : attempt === 'again' && sent.replayed
+              ? now
+              : lower
         await outcome({ taken: true, turnStarted: sent.turnStarted, error: null }, typedFrom)
       } catch (error) {
         // Unrecorded, the message is not the agent's last input; the report waits and asks Orca again.
