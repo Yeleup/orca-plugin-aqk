@@ -27,12 +27,15 @@
 //   disk, once (started-0): a worker started later does not count an agent that started and now waits (`blocked`) as a
 //   failed delivery. A turn heard in the terminal before Orca answered the launch is the start too: the mark is written
 //   once the launch is recorded, before the launch's result — when the disk refuses it, the launch is an error naming
-//   the terminal Orca opened (a stop of the task closes it). A reading of the report keeps the start it knows on disk
-//   before it asks Orca; a mark that cannot be read or kept makes the reading an error, never a failed delivery. No
-//   turn DELIVERY_DEADLINE_MS after the launch: the reading of the report names the failed delivery with what Orca
-//   shows of the agent (`blocked`: it waits for a person — a permission, a trust prompt; anything else or nothing: the
-//   task did not reach it), by which the caller blocks the task with «сбой агента». A turn seen in time is no failure,
-//   however long the agent then works.
+//   the terminal Orca opened (a stop of the task closes it). A reading of the report settles the start after Orca's
+//   answer, before it reads the report file for its reply: when the agent has started — a turn the worker saw, or the
+//   report file there (a file to read; a directory there is an error, never a start) — and the mark is not on disk yet,
+//   the mark is written first and the file read again, so a reading that says «started» has the mark on disk; a mark
+//   that cannot be read or kept makes the reading an error, never a failed delivery. No turn DELIVERY_DEADLINE_MS after
+//   the launch: the reading of the report names the failed delivery with what Orca shows of the agent (`blocked`: it
+//   waits for a person — a permission, a trust prompt; anything else or nothing: the task did not reach it), by which
+//   the caller blocks the task with «сбой агента». A turn seen in time is no failure, however long the agent then
+//   works.
 // - report: ready only when the launch's report file (report.md) is there, `agents.list` names the agent in «done», and
 //   that «done» began (`stateStartedAt`) no earlier than the file's last write, as precise as the file system keeps it
 //   (a fraction of a millisecond is not dropped) — an equal time is ready. The agent writes its report during its turn,
@@ -400,14 +403,6 @@ export class Agents {
   // when Orca's list cannot be read, and when the start of the task cannot be read from the disk or kept there.
   async report(launch: AgentLaunch): Promise<ReportReading> {
     this.know(launch)
-    // The start of the task as far as it is known before Orca is asked — the mark on disk, a turn this worker saw, the
-    // report file there — is settled first: kept on disk when it is not there yet. Nothing is written after the reads
-    // of the report file below.
-    let started = this.startedOnDisk(launch)
-    if (!started && (this.turns.has(launch.terminalId) || this.machine.modifiedAt(launch.reportFile) !== null)) {
-      await this.keepStarted(launch)
-      started = true
-    }
     let agents: ListedAgent[]
     try {
       agents = (await this.host.call('agents.list', { workspaceId: launch.workspaceId })).agents
@@ -415,16 +410,23 @@ export class Agents {
       throw unreadableList(launch, error)
     }
     const seen = this.seen(launch, agents)
-    // From Orca's answer to the reply nothing waits and nothing is written: the text first, then the time of the file's
-    // last write — a file changed between the two reads has the later time.
-    const text = this.machine.readText(launch.reportFile)
-    const writtenAt = text === null ? null : this.machine.modifiedAt(launch.reportFile)
+    // The start of the task is settled after Orca's answer and before the report file is read for the reply. On disk
+    // already: started. Not yet, while the agent has started — a turn this worker saw (Orca's answer included), or the
+    // report file read here — it is kept on disk first (a mark that cannot be read or kept is an error), and the file
+    // is read again. So the reply's `started` is the mark on disk, and from the reads it is given on to the reply
+    // nothing waits and nothing is written: the text first, then the time of the file's last write — a file changed
+    // between the two reads has the later time.
+    let started = this.startedOnDisk(launch)
+    let file = this.readReportFile(launch)
+    if (!started && (file.text !== null || this.turns.has(launch.terminalId))) {
+      await this.keepStarted(launch)
+      started = true
+      file = this.readReportFile(launch)
+    }
+    const { text, writtenAt } = file
     const exists = text !== null && writtenAt !== null
     const doneSince = seen !== null && seen.listed && seen.state === 'done' ? seen.since : null
     if (exists && doneSince !== null && doneSince >= writtenAt) return { ready: true, text, reportFile: launch.reportFile }
-    // A turn Orca's answer showed is being kept on disk (seen); a report file that appeared only now is kept by the
-    // next reading — the file itself is there meanwhile.
-    started = started || exists || this.turns.has(launch.terminalId)
     const state = seen?.state ?? null
     const late = !started && this.machine.now() - launch.launchedAt >= DELIVERY_DEADLINE_MS
     return {
@@ -569,6 +571,13 @@ export class Agents {
     this.turns.add(terminalId)
     const launch = this.known.get(terminalId)
     if (launch !== undefined) this.keepStartedLater(launch)
+  }
+
+  // The launch's report file: its text — a directory or anything else that is not a file to read there is an error,
+  // never a report — then the time of its last write.
+  private readReportFile(launch: AgentLaunch): { readonly text: string | null; readonly writtenAt: number | null } {
+    const text = this.machine.readText(launch.reportFile)
+    return { text, writtenAt: text === null ? null : this.machine.modifiedAt(launch.reportFile) }
   }
 
   // Whether the start of the launch's task is on disk (started-0). A mark that cannot be read is an error, never «not

@@ -1618,3 +1618,130 @@ test('Отметка начала, которую диск не принял и�
   assert.deepEqual(restarted.worker.refusals, [])
   await restarted.worker.deactivate()
 })
+
+test('Файл отчёта, впервые появившийся, пока Orca отвечает на agents.list, без хода в событиях — начало задания: одно чтение отчёта оставляет started-0 и при «не готов», и при «готов»; отметка, которую другое чтение записало, пока это ждало Orca, — начало, а не сбой доставки', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+
+  // The agent writes its report while Orca answers the list, which shows it idle; Orca tells no turn: not ready, and
+  // the start is on disk after this one reading.
+  const idle = await launched(r, 82, 'implementer')
+  orca.list(idle.terminalId, 'waiting', orca.clock.now())
+  const held = gate()
+  orca.listGate = held.promise
+  const reading = r.agents.report(idle)
+  await settle()
+  orca.clock.advance(1_000)
+  orca.machine.files.set(idle.reportFile, 'Черновик отчёта.\n')
+  orca.listGate = null
+  held.open()
+  assert.deepEqual(await reading, notReady(idle, { state: 'waiting', listed: true, started: true, reportExists: true }))
+  assert.ok(orca.machine.files.has(startMark(orca, idle)))
+
+  // Orca's answer names a «done» that began after the report the agent writes while Orca answers: ready, and the start
+  // is on disk too.
+  const done = await launched(r, 83, 'implementer')
+  orca.list(done.terminalId, 'done', orca.clock.now() + 2_000)
+  const heldDone = gate()
+  orca.listGate = heldDone.promise
+  const readingDone = r.agents.report(done)
+  await settle()
+  orca.clock.advance(1_000)
+  orca.machine.files.set(done.reportFile, 'Отчёт: фильтр по цвету.\n')
+  orca.listGate = null
+  heldDone.open()
+  assert.deepEqual(await readingDone, { ready: true, text: 'Отчёт: фильтр по цвету.\n', reportFile: done.reportFile })
+  assert.ok(orca.machine.files.has(startMark(orca, done)))
+
+  // Past the deadline, nothing seen of the agent's turn. One reading waits for Orca; meanwhile another one, answered at
+  // once, finds the report file and keeps the start, and then the file is gone. The first reading's answer: started —
+  // the mark on disk — and no failed delivery.
+  const raced = await launched(r, 84, 'implementer')
+  orca.list(raced.terminalId, 'waiting', orca.clock.now())
+  orca.clock.advance(DELIVERY_DEADLINE_MS)
+  const heldRaced = gate()
+  orca.listGate = heldRaced.promise
+  const waiting = r.agents.report(raced)
+  await settle()
+  orca.listGate = null
+  orca.machine.files.set(raced.reportFile, 'Черновик отчёта.\n')
+  assert.deepEqual(await r.agents.report(raced), notReady(raced, { state: 'waiting', listed: true, started: true, reportExists: true }))
+  orca.machine.files.delete(raced.reportFile)
+  heldRaced.open()
+  assert.deepEqual(await waiting, notReady(raced, { state: 'waiting', listed: true, started: true }))
+  assert.deepEqual(r.worker.refusals, [])
+  await r.worker.deactivate()
+})
+
+test('Ход, впервые показанный списком Orca или событием, пока чтение отчёта ждёт Orca, а отметку диск не принял: чтение отчёта — ошибка хранения с причиной, а не «начал» без отметки', async () => {
+  const orca = fakeOrca()
+  // The disk refuses to write the start marks while the test says so.
+  let refuse = true
+  const machine: Machine = {
+    ...orca.machine,
+    createText: async (path, text) => {
+      if (refuse && path.endsWith('/started-0')) throw new Error('ENOSPC: no space left on device')
+      return orca.machine.createText(path, text)
+    },
+  }
+  const r = await mount(orca, { machine })
+  const notKept = (launch: AgentLaunch) => (error: unknown) =>
+    error instanceof Error &&
+    error.message === `the start of the task of launch 1 could not be kept in ${startMark(orca, launch)}: ENOSPC: no space left on device`
+
+  // The turn first shows in Orca's answer to the list.
+  const listed = await launched(r, 85, 'implementer')
+  orca.list(listed.terminalId, 'working', orca.clock.now())
+  await assert.rejects(r.agents.report(listed), notKept(listed))
+
+  // The turn is told by an event while the reading waits for Orca, whose answer shows the agent idle.
+  const told = await launched(r, 86, 'implementer')
+  orca.list(told.terminalId, 'waiting', orca.clock.now())
+  const held = gate()
+  orca.listGate = held.promise
+  const reading = r.agents.report(told)
+  await settle()
+  // The test worker's emit settles once the host has no call pending: it is awaited after the list's answer is let go.
+  const emitted = r.worker.emit('agent.status.changed', status(told, 'working', orca.clock.now(), orca.clock.now()))
+  orca.listGate = null
+  held.open()
+  await assert.rejects(reading, notKept(told))
+  await emitted
+
+  // The disk takes the marks again: started, and kept.
+  refuse = false
+  assert.deepEqual(await r.agents.report(listed), notReady(listed, { state: 'working', listed: true, started: true }))
+  assert.deepEqual(await r.agents.report(told), notReady(told, { state: 'waiting', listed: true, started: true }))
+  for (const launch of [listed, told]) assert.ok(orca.machine.files.has(startMark(orca, launch)))
+  assert.deepEqual(r.worker.refusals, [])
+  await r.worker.deactivate()
+})
+
+test('Каталог на месте файла отчёта — не начало задания: чтение отчёта — ошибка с причиной, started-0 не записан; когда каталога нет, а хода не было, за сроком — сбой доставки', async () => {
+  const orca = fakeOrca()
+  // A directory where the report file should be, as the real computer sees it: reading it as a text fails, its
+  // metadata has a time.
+  let directory = true
+  const isReport = (path: string) => path.endsWith('/report.md')
+  const machine: Machine = {
+    ...orca.machine,
+    readText: (path) => {
+      if (directory && isReport(path)) throw new Error('EISDIR: illegal operation on a directory, read')
+      return orca.machine.readText(path)
+    },
+    modifiedAt: (path) => (directory && isReport(path) ? orca.clock.now() : orca.machine.modifiedAt(path)),
+  }
+  const r = await mount(orca, { machine })
+  const launch = await launched(r, 87, 'implementer')
+  orca.list(launch.terminalId, 'waiting', orca.clock.now())
+  await assert.rejects(r.agents.report(launch), /EISDIR: illegal operation on a directory, read/)
+  assert.equal(orca.machine.files.has(startMark(orca, launch)), false)
+
+  // The directory is gone; the agent never started its task: past the deadline, a failed delivery.
+  directory = false
+  orca.clock.advance(DELIVERY_DEADLINE_MS)
+  const late = await r.agents.report(launch)
+  assert.ok(!late.ready && !late.started && late.failure?.state === 'waiting', JSON.stringify(late))
+  assert.deepEqual(r.worker.refusals, [])
+  await r.worker.deactivate()
+})
