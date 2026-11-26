@@ -176,6 +176,24 @@ export function findByOperation<T extends { readonly body: string }>(
 
 // A mark with exactly the fields of the format, each of its form, in a fixed order; CheckError `bad_field` otherwise.
 // Unknown fields of a newer plugin are left out.
+// The fields each kind needs (TZ Ф4–Ф6, Ф10–Ф12): every progress comment is the coordinator's; a claim, a takeover and
+// what ends a claim (block, deferral, release) name the claim count they belong to (К4.1); a stage its stage; a review
+// round its round and the SHA reviewed (with the verdict and findings, below); a test run its claim (with the run,
+// below); the start and end of an operation its operation id.
+const REQUIRED: Record<MarkKind, readonly ('coordinator' | 'claim' | 'operation' | 'stage' | 'round' | 'sha')[]> = {
+  claim: ['coordinator', 'claim'],
+  takeover: ['coordinator', 'claim'],
+  stage: ['coordinator', 'claim', 'stage'],
+  'review-round': ['coordinator', 'claim', 'round', 'sha'],
+  'test-run': ['coordinator', 'claim'],
+  block: ['coordinator', 'claim'],
+  deferred: ['coordinator', 'claim'],
+  release: ['coordinator', 'claim'],
+  'operation-start': ['coordinator', 'operation'],
+  'operation-end': ['coordinator', 'operation'],
+  result: ['coordinator'],
+}
+
 function validMark(value: Mark | Record<string, unknown>): Mark {
   const source = value as Record<string, unknown>
   const kind = source.kind
@@ -193,6 +211,11 @@ function validMark(value: Mark | Record<string, unknown>): Mark {
   ] as const
   for (const [name, form] of fixed) {
     if (source[name] !== undefined) mark[name] = fixedValue(form, source[name] as string | number, name)
+  }
+  for (const name of REQUIRED[kind as MarkKind]) {
+    if (mark[name] === undefined) {
+      throw new CheckError('bad_field', `field ${name}: a ${kind} mark needs it; nothing was written`)
+    }
   }
   const review = source.review
   if ((kind === 'review-round') !== (review !== undefined)) {
@@ -227,6 +250,9 @@ function validReview(value: unknown): ReviewRound {
     }
     if (typeof path !== 'string' || path === '' || typeof summary !== 'string') {
       throw new CheckError('bad_field', `field ${name} needs a path and a summary (text); nothing was written`)
+    }
+    if (/[\r\n]/.test(path) || /[\r\n\u2028\u2029]/.test(summary)) {
+      throw new CheckError('bad_field', `field ${name}: a finding is one line (its path and summary); nothing was written`)
     }
     if (line !== null && !hasFixedForm('line', line)) {
       throw new CheckError('bad_field', `field ${name}.line is not a line number (from 1) or null; nothing was written`)

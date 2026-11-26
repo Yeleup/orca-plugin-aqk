@@ -2,8 +2,9 @@
 // own login (`gh auth login`), and the plugin never asks it for a token or reads its configuration. `gh` starts through
 // the platform layer (src/platform/run.ts), with the worker's environment.
 //
-// - Every call names the repository itself: `repos/<owner>/<name>/…` for `gh api`, `--repo <owner>/<name>` for other
-//   commands. gh's default repository (the checkout's remote, GH_REPO) is never used.
+// - Every call names the host and the repository itself: `gh api --hostname <host>` with `repos/<owner>/<name>/…` or
+//   GraphQL variables `owner` and `name`; `--repo <host>/<owner>/<name>` for other commands. gh's default host
+//   (GH_HOST, its configuration) and default repository (the checkout's remote, GH_REPO) are never used.
 // - A failure is an error that carries gh's own text: a non-zero exit (stderr), a program that did not start, a run
 //   that timed out, an answer that is not the expected JSON. Never an empty answer in its place.
 // - A list is read whole: `gh api --paginate` follows every page, and a list cut short — gh failed on a later page, its
@@ -20,24 +21,32 @@ export const GH_LIST_TIMEOUT_MS = 600_000
 // What gh itself must not do in a worker: ask anything, or check for its own updates.
 const GH_ENV = { GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' }
 
-// A repository on GitHub: owner (user or organisation) and name.
-export type Repository = { readonly owner: string; readonly name: string }
+export const DEFAULT_HOST = 'github.com'
 
+// A repository: its host (github.com, or a GitHub Enterprise host), owner (user or organisation) and name.
+export type Repository = { readonly host: string; readonly owner: string; readonly name: string }
+
+const HOST_FORM = /^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*(?::\d{1,5})?$/
 const OWNER_FORM = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/
 const NAME_FORM = /^[A-Za-z0-9._-]{1,100}$/
 
-// `owner/name` → a Repository; anything else (a URL, a path, blanks) is an error.
+// `owner/name` (on github.com) or `host/owner/name` → a Repository; anything else (a URL, a path, blanks) is an error.
 export function parseRepository(slug: string): Repository {
   const parts = slug.split('/')
-  const [owner, name] = parts
-  if (parts.length !== 2 || owner === undefined || name === undefined || !isRepository({ owner, name })) {
-    throw new Error(`not a GitHub repository «owner/name»: ${JSON.stringify(slug)}`)
+  const [host, owner, name] = parts.length === 2 ? [DEFAULT_HOST, ...parts] : parts
+  if (parts.length < 2 || parts.length > 3 || host === undefined || owner === undefined || name === undefined) {
+    throw new Error(`not a GitHub repository «owner/name» or «host/owner/name»: ${JSON.stringify(slug)}`)
   }
-  return { owner, name }
+  const repository = { host: host.toLowerCase(), owner, name }
+  if (!isRepository(repository)) {
+    throw new Error(`not a GitHub repository «owner/name» or «host/owner/name»: ${JSON.stringify(slug)}`)
+  }
+  return repository
 }
 
 export function isRepository(repository: Repository): boolean {
   return (
+    HOST_FORM.test(repository.host) &&
     OWNER_FORM.test(repository.owner) &&
     NAME_FORM.test(repository.name) &&
     repository.name !== '.' &&
@@ -45,14 +54,31 @@ export function isRepository(repository: Repository): boolean {
   )
 }
 
+// `owner/name`.
 export function repositorySlug(repository: Repository): string {
   return `${repository.owner}/${repository.name}`
 }
 
+// `host/owner/name`: the form of `--repo` that names the host too.
+export function repositoryRef(repository: Repository): string {
+  checkRepository(repository)
+  return `${repository.host}/${repository.owner}/${repository.name}`
+}
+
 // The REST path of the repository's `rest` (`issues/7/comments` …).
 export function repositoryPath(repository: Repository, rest: string): string {
-  if (!isRepository(repository)) throw new Error(`not a GitHub repository: ${JSON.stringify(repository)}`)
+  checkRepository(repository)
   return `repos/${repository.owner}/${repository.name}/${rest}`
+}
+
+// The start of every `gh api` call for the repository: its host named.
+export function apiArgs(repository: Repository): string[] {
+  checkRepository(repository)
+  return ['api', '--hostname', repository.host]
+}
+
+function checkRepository(repository: Repository): void {
+  if (!isRepository(repository)) throw new Error(`not a GitHub repository: ${JSON.stringify(repository)}`)
 }
 
 export type GitHubErrorKind =
@@ -64,7 +90,7 @@ export type GitHubErrorKind =
   | 'gh_timed_out'
   // gh exited 0, but its answer is not the expected JSON (or a list in it is not whole).
   | 'bad_answer'
-  // The GitHub user gh runs as is unknown: no texts can be told apart.
+  // The GitHub user gh runs as is unknown, or changed within one read: no texts can be told apart.
   | 'owner_unknown'
 
 // A failure of a GitHub call. `message` carries gh's own text (its stderr, or why it did not run).
@@ -73,15 +99,17 @@ export class GitHubError extends Error {
   // The arguments gh got (no bodies: those go on stdin).
   readonly args: readonly string[]
   readonly code: number | null
-  // The HTTP status gh reported (`… (HTTP 404)`), when it did.
+  // The HTTP status gh reported (`… (HTTP 404)`), when it did; null when GitHub gave no answer gh could report.
   readonly status: number | null
   // gh's own text: its stderr, or the reason it did not run.
   readonly ghText: string
+  // What gh printed on stdout: GitHub's answer, also of a refusal (its `message`, its `errors`).
+  readonly answer: string
 
   constructor(
     kind: GitHubErrorKind,
     args: readonly string[],
-    detail: { readonly code?: number | null; readonly ghText: string; readonly what?: string },
+    detail: { readonly code?: number | null; readonly ghText: string; readonly what?: string; readonly answer?: string },
   ) {
     const exit = detail.code === undefined || detail.code === null ? '' : ` (exit ${detail.code})`
     super(`gh ${args.join(' ')}${exit}: ${detail.what ?? detail.ghText}`)
@@ -90,6 +118,7 @@ export class GitHubError extends Error {
     this.args = args
     this.code = detail.code ?? null
     this.ghText = detail.ghText
+    this.answer = detail.answer ?? ''
     const status = /\(HTTP (\d{3})\)/.exec(detail.ghText)
     this.status = status ? Number(status[1]) : null
   }
@@ -119,12 +148,16 @@ export async function runGh(call: GhCall): Promise<RunResult> {
   if (result.error !== null) {
     const kind = result.error.kind === 'timed_out' ? 'gh_timed_out' : 'gh_not_started'
     const said = ghSaid(result)
-    throw new GitHubError(kind, args, { ghText: said ? `${result.error.reason}; ${said}` : result.error.reason })
+    throw new GitHubError(kind, args, {
+      ghText: said ? `${result.error.reason}; ${said}` : result.error.reason,
+      answer: result.stdout,
+    })
   }
   if (result.code !== 0) {
     throw new GitHubError('gh_failed', args, {
       code: result.code,
       ghText: ghSaid(result) || `no output${result.signal ? `, ended by ${result.signal}` : ''}`,
+      answer: result.stdout,
     })
   }
   return result
@@ -151,11 +184,11 @@ export async function ghArray(call: GhCall): Promise<unknown[]> {
   return answer
 }
 
-// Every item of a paginated list: `gh api --paginate <endpoint>` prints each page as its own JSON array, one after
-// another. All pages must be whole arrays; anything else — no page at all, a page that is not an array, output cut in
-// memory — is an error, never a shorter list.
-export async function ghList(call: GhCall): Promise<Record<string, unknown>[]> {
-  if (!call.args.includes('--paginate')) throw new Error('ghList needs --paginate: a list is read whole')
+// Every page of `gh api --paginate`: gh prints each page as its own JSON value, one after another (an array for REST,
+// an object for GraphQL). All pages must be whole and of that kind; anything else — no page at all, a page of another
+// kind, output cut in memory — is an error, never fewer pages.
+export async function ghPages(call: GhCall, kind: 'array' | 'object'): Promise<unknown[]> {
+  if (!call.args.includes('--paginate')) throw new Error('ghPages needs --paginate: a list is read whole')
   const result = await runGh({ ...call, timeoutMs: call.timeoutMs ?? GH_LIST_TIMEOUT_MS })
   if (result.truncated) throw badAnswer(call.args, 'the answer was cut in memory: the list is not whole', result)
   let pages: unknown[]
@@ -165,11 +198,20 @@ export async function ghList(call: GhCall): Promise<Record<string, unknown>[]> {
     throw badAnswer(call.args, `not whole JSON pages (${errorMessage(error)})`, result)
   }
   if (pages.length === 0) throw badAnswer(call.args, 'no page at all', result)
-  const items: Record<string, unknown>[] = []
   for (const page of pages) {
-    if (!Array.isArray(page)) throw badAnswer(call.args, 'a page is not a JSON array', result)
-    for (const item of page) {
-      if (!isObject(item)) throw badAnswer(call.args, 'an item of the list is not a JSON object', result)
+    if (kind === 'array' ? !Array.isArray(page) : !isObject(page)) {
+      throw badAnswer(call.args, `a page is not a JSON ${kind}`, result)
+    }
+  }
+  return pages
+}
+
+// Every item of a paginated REST list, read whole (ghPages).
+export async function ghList(call: GhCall): Promise<Record<string, unknown>[]> {
+  const items: Record<string, unknown>[] = []
+  for (const page of await ghPages(call, 'array')) {
+    for (const item of page as unknown[]) {
+      if (!isObject(item)) throw new GitHubError('bad_answer', call.args, { ghText: '', what: 'an item of the list is not a JSON object' })
       items.push(item)
     }
   }
@@ -192,6 +234,7 @@ function badAnswer(args: readonly string[], what: string, result: RunResult): Gi
     code: result.code,
     ghText: said,
     what: `gh answered ${what}${head ? `: ${head}` : ''}`,
+    answer: result.stdout,
   })
 }
 
@@ -229,6 +272,21 @@ export function jsonValues(text: string): unknown[] {
     if (depth !== 0 || inString) throw new Error(`the value at ${start} is not whole`)
     values.push(JSON.parse(text.slice(start, at)))
   }
+}
+
+// GitHub's own words in a refusal: the `message` of its answer and the `code`s of its `errors`.
+export function refusalOf(error: GitHubError): { readonly message: string | null; readonly codes: readonly string[] } {
+  let answer: unknown
+  try {
+    answer = JSON.parse(error.answer)
+  } catch {
+    return { message: null, codes: [] }
+  }
+  if (!isObject(answer)) return { message: null, codes: [] }
+  const codes = Array.isArray(answer.errors)
+    ? answer.errors.flatMap((one) => (isObject(one) && typeof one.code === 'string' ? [one.code] : []))
+    : []
+  return { message: typeof answer.message === 'string' ? answer.message : null, codes }
 }
 
 export function isObject(value: unknown): value is Record<string, unknown> {

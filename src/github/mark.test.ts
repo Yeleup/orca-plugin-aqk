@@ -83,7 +83,9 @@ test('комментарий со служебной меткой (вид, id к
   const ofOperation = fake.comments.filter((comment) => parseBody(comment.body).mark?.kind === 'operation-start')
   assert.equal(ofOperation.length, 1)
   assert.equal(repeat.result.id, ofOperation[0]?.id)
-  const posts = fake.calls.filter((call) => call.method === 'POST')
+  // Writes only: the GraphQL reads go as POST too.
+  const isWrite = (call: { method: string; path: string }) => call.method === 'POST' && call.path !== 'graphql'
+  const posts = fake.calls.filter(isWrite)
   assert.equal(posts.length, humans.length + 2)
   // The search itself: by operation and kind, in the order of the comments.
   assert.equal(findByOperation(comments, { operation: OPERATION, kind: 'stage' })?.id, comments[0]?.id)
@@ -94,7 +96,7 @@ test('комментарий со служебной меткой (вид, id к
     text: ['Другая операция'],
   })
   assert.equal(other.existed, false)
-  assert.equal(fake.calls.filter((call) => call.method === 'POST').length, humans.length + 3)
+  assert.equal(fake.calls.filter(isWrite).length, humans.length + 3)
 })
 
 test('служебная метка круга ревью (вердикт, замечания одной строкой) и прогона тестов (SHA, код выхода, начало, длительность, чистое дерево) разбирается обратно без потерь', async () => {
@@ -111,7 +113,7 @@ test('служебная метка круга ревью (вердикт, за�
       findings: [
         { severity: 'major', path: 'src/cart.ts', side: 'head', line: 42, summary: 'Сумма считается до скидки: a --> b <c>' },
         { severity: 'critical', path: 'src/legacy/cart.ts', side: 'base', line: null, summary: 'Файл удалён по ошибке' },
-        { severity: 'nit', path: 'docs/notes.md', side: 'head', line: 1, summary: 'Опечатка\nво второй строке' },
+        { severity: 'nit', path: 'docs/notes.md', side: 'head', line: 1, summary: 'Опечатка во второй строке' },
       ],
     },
   }
@@ -175,14 +177,26 @@ test('поле метки не своего вида (локальный пут�
     [{ kind: 'test-run', test: { sha: SHA, exitCode: 0, startedAt: '2026-01-15T09:30:00Z', durationMs: -5, clean: true } }, 'bad_field'],
     [{ kind: 'test-run', test: { sha: SHA, exitCode: 0, startedAt: '2026-01-15T09:30:00Z', durationMs: 5, clean: 'yes' } }, 'bad_field'],
     [
-      { kind: 'review-round', review: { verdict: 'changes', findings: [{ severity: 'major', path: 'src/secret.ts', side: 'head', line: 1, summary: 'x' }] } },
+      { kind: 'review-round', round: 1, sha: SHA, review: { verdict: 'changes', findings: [{ severity: 'major', path: 'src/secret.ts', side: 'head', line: 1, summary: 'x' }] } },
       'path_outside_diff',
     ],
     [
-      { kind: 'review-round', review: { verdict: 'changes', findings: [{ severity: 'major', path: 'src/cart.ts', side: 'base', line: 1, summary: 'x' }] } },
+      { kind: 'review-round', round: 1, sha: SHA, review: { verdict: 'changes', findings: [{ severity: 'major', path: 'src/cart.ts', side: 'base', line: 1, summary: 'x' }] } },
       'path_outside_diff',
     ],
-    [{ kind: 'review-round', review: { verdict: 'lgtm', findings: [] } }, 'bad_field'],
+    [{ kind: 'review-round', round: 1, sha: SHA, review: { verdict: 'lgtm', findings: [] } }, 'bad_field'],
+    // A finding is one line: its summary and its path.
+    [
+      { kind: 'review-round', round: 1, sha: SHA, review: { verdict: 'changes', findings: [{ severity: 'nit', path: 'src/cart.ts', side: 'head', line: 1, summary: 'Строка\nвторая' }] } },
+      'bad_field',
+    ],
+    // The fields a kind needs (TZ К4.1: a claim names its coordinator and claim count).
+    [{ coordinator: undefined }, 'bad_field'],
+    [{ claim: undefined }, 'bad_field'],
+    [{ kind: 'stage' }, 'bad_field'],
+    [{ kind: 'review-round', review: { verdict: 'approve', findings: [] } }, 'bad_field'],
+    [{ kind: 'operation-start' }, 'bad_field'],
+    [{ kind: 'result', coordinator: undefined }, 'bad_field'],
   ]
   for (const [change, reason] of wrong) {
     const mark = { ...base, ...change } as Mark
@@ -218,7 +232,27 @@ test('испорченная метка в комментарии не разб�
     assert.equal(parsed.text, 'текст')
   }
   // Unknown fields of a newer plugin are left out, the known ones read.
-  assert.deepEqual(parseBody(`${MARK_PREFIX}{"v":1,"kind":"claim","claim":3,"later":"x"} -->`).mark, { kind: 'claim', claim: 3 })
+  assert.deepEqual(
+    parseBody(`${MARK_PREFIX}{"v":1,"kind":"claim","coordinator":"${COORDINATOR}","claim":3,"later":"x"} -->`).mark,
+    { kind: 'claim', coordinator: COORDINATOR, claim: 3 },
+  )
+  // A claim without its coordinator or claim count is no mark the claim protocol could use.
+  for (const json of ['{"v":1,"kind":"claim","claim":3}', `{"v":1,"kind":"claim","coordinator":"${COORDINATOR}"}`]) {
+    const parsed = parseBody(`${MARK_PREFIX}${json} -->`)
+    assert.equal(parsed.mark, null)
+    assert.match(parsed.problem ?? '', /a claim mark needs it/)
+  }
+  // A finding of two lines read from GitHub is not taken either.
+  const twoLines = {
+    v: 1,
+    kind: 'review-round',
+    coordinator: COORDINATOR,
+    claim: 1,
+    round: 1,
+    sha: '0123456789abcdef0123456789abcdef01234567',
+    review: { verdict: 'changes', findings: [{ severity: 'nit', path: 'a.ts', side: 'head', line: 1, summary: 'один\nдва' }] },
+  }
+  assert.match(parseBody(`${MARK_PREFIX}${JSON.stringify(twoLines)} -->`).problem ?? '', /a finding is one line/)
   // A body that does not start with the mark has none, even with a mark further down.
   assert.equal(parseBody(` ${good}`).mark, null)
   assert.equal(parseBody(`текст\n${good}`).mark, null)

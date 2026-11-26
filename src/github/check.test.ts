@@ -22,7 +22,7 @@ const TIME = '2026-01-15T09:30:00.000Z'
 const shaped = (...parts: string[]) => parts.join('')
 const TOKEN = shaped('ghp', '_TESTONLYnotarealtoken0000000000000000')
 
-test('маска заменяет на «[скрыто]» адрес почты, номер телефона, строку вида токена и значение по шаблону запрещённых данных; путь файла, на который срабатывает маска, — «[скрыто]»; поля координатора фиксированного вида (номера, SHA, время, id) не меняются', () => {
+test('проверка текста из частей: почта, телефон, токен и шаблон в тексте — «[скрыто]», путь под маской — «[скрыто]» целиком, поля координатора (номера, SHA, время, id, код, длительность) — как есть', () => {
   // Patterns of the settings that would match the coordinator fields too: a SHA, a date, a coordinator id, an issue
   // number, an exit code. Those fields stay as they are; the same values in plain text are hidden.
   const settings: ProjectGitHubSettings = {
@@ -88,6 +88,36 @@ test('совпадение маски через несколько частей
   assert.equal(checkText(['order-12', field.path('logs/x.txt'), '-done'], context).text, '[скрыто][скрыто]-done')
   // Two strings next to each other are one text: a token split between them is still found.
   assert.equal(checkText([shaped('ключ gh', 'p_TESTONLY'), 'notarealtoken0000000000000000 конец'], context).text, `ключ ${HIDDEN} конец`)
+})
+
+test('телефон в части пути файла и номера подряд скрыты целиком; дата и длинное число без групп — не телефон', () => {
+  const context = checkContext(
+    { language: 'ru', forbiddenPatterns: [] },
+    { base: [], head: ['calls/2025550117.txt', 'calls\\2025550118.txt', 'logs/call_2025550119_v2.txt', 'src/cart.ts'] },
+  )
+  // A phone number as a part of a path: the whole path is hidden.
+  assert.equal(checkText([field.path('calls/2025550117.txt', 'head')], context).text, HIDDEN)
+  assert.equal(checkText([field.path('calls\\2025550118.txt', 'head')], context).text, HIDDEN)
+  assert.equal(checkText([field.path('logs/call_2025550119_v2.txt', 'head')], context).text, HIDDEN)
+  assert.equal(checkText([field.path('src/cart.ts', 'head')], context).text, 'src/cart.ts')
+  // Two numbers in a row (or a card-like run of groups): nothing of them stays.
+  const mask = compileMask([])
+  assert.equal(mask.apply('звоните +1 202 555 0117 202 555 0118 вечером').text, `звоните ${HIDDEN} вечером`)
+  assert.equal(mask.apply('номера 202 555 0117, 202 555 0118.').text, `номера ${HIDDEN}, ${HIDDEN}.`)
+  assert.equal(mask.apply('карта 4000 0000 0000 0002').text, `карта ${HIDDEN}`)
+  // Not phone numbers: a date before a number, a long number without groups, a run id in a link.
+  assert.equal(mask.apply('звонок 2026-11-26 701 555 0123 утром').text, `звонок 2026-11-26 ${HIDDEN} утром`)
+  assert.equal(mask.apply('время 1764145901123456789 нс').text, 'время 1764145901123456789 нс')
+})
+
+test('шаблон с пустым совпадением на тексте с эмодзи и суррогатными парами не зацикливает маску', () => {
+  const emoji = String.fromCodePoint(0x1f600)
+  const mask = compileMask(['(?=.)', 'x*', 'CUST-\\d{6}'])
+  const started = Date.now()
+  assert.equal(mask.apply(`${emoji} текст ${emoji}${emoji} CUST-424242 ${emoji}`).text, `${emoji} текст ${emoji}${emoji} ${HIDDEN} ${emoji}`)
+  assert.equal(mask.apply(emoji).text, emoji)
+  assert.equal(mask.apply('').text, '')
+  assert.ok(Date.now() - started < 5_000)
 })
 
 test('шаблон запрещённых данных — не регулярное выражение → запись отказана с причиной, шаблон не пропущен', () => {

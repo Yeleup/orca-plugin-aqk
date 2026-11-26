@@ -28,6 +28,10 @@ export type CheckRefusal =
   | 'path_outside_diff'
   // Nothing to write (an empty body or title).
   | 'empty'
+  // A value that cannot be hidden without changing what the write does (a PR's base branch) matches the mask.
+  | 'masked_value'
+  // The write would change an issue that is not the queue owner's (or a pull request through the issue call).
+  | 'not_owner'
 
 type Rule = { readonly name: string; readonly pattern: RegExp; readonly accept?: (found: string) => boolean }
 
@@ -66,15 +70,18 @@ const EMAIL: Rule = {
 }
 
 // Phone numbers: 10 to 15 digits (8 to 15 after a leading +), in groups divided by single blanks or hyphens, one group
-// may be in parentheses. Digits that continue a word, a hex string, a path or URL (/…), a hyphenated id, an issue
-// reference (#…), a time (…:mm) or a decimal (….5) are not a phone number, nor is a date (YYYY-MM-DD …).
+// may be in parentheses — also as a part of a file path (`calls/<number>.txt`). Digits that continue a word, a hex
+// string, a hyphenated id, an issue reference (#…), a time (…:mm) or a decimal (….5) are not a phone number, nor is a
+// date (YYYY-MM-DD …). A run of such groups with more than 15 digits — several numbers in a row, or a card number — is
+// hidden whole.
 const PHONE: Rule = {
   name: 'phone',
-  pattern: /(?<![\p{L}\p{N}_+\-\/#])(?<!\d[.,])\+?(?:\(\d{1,5}\)|\d)(?:[ -]?(?:\(\d{1,5}\)|\d)){6,}(?![\p{L}\p{N}_]|[.:]\d)/gu,
+  pattern: /(?<![\p{L}\p{N}+\-#])(?<!\d[.,])\+?(?:\(\d{1,5}\)|\d)(?:[ -]?(?:\(\d{1,5}\)|\d)){6,}(?![\p{L}\p{N}]|[.:]\d)/gu,
   accept: (found) => {
     if (/^\d{4}-\d{2}-\d{2}(?!\d)/.test(found)) return false
     const digits = found.replace(/\D/g, '').length
-    return digits <= 15 && digits >= (found.startsWith('+') ? 8 : 10)
+    if (digits > 15) return found.split(/[ ()-]+/).filter((group) => group !== '').length > 1
+    return digits >= (found.startsWith('+') ? 8 : 10)
   },
 }
 
@@ -132,17 +139,25 @@ function matchesOf(rule: Rule, text: string): MaskMatch[] {
   const pattern = new RegExp(rule.pattern.source, rule.pattern.flags)
   for (let match = pattern.exec(text); match !== null; match = pattern.exec(text)) {
     if (match[0] === '') {
-      pattern.lastIndex++
+      // An empty match hides nothing; the search goes on from the next character — a whole one, never the middle of a
+      // surrogate pair (where a `u` pattern would find the same empty match again, for ever).
+      pattern.lastIndex = nextCharacter(text, pattern.lastIndex)
       continue
     }
     if (rule.accept && !rule.accept(match[0])) {
-      // Not this one (a date, too many digits): a shorter one may start inside it.
-      pattern.lastIndex = match.index + 1
+      // Not this one (a date): a shorter one may start inside it.
+      pattern.lastIndex = nextCharacter(text, match.index)
       continue
     }
     found.push({ start: match.index, end: match.index + match[0].length, rules: [rule.name] })
   }
   return found
+}
+
+// The index after the character at `at` (one code point: two UTF-16 units for a surrogate pair).
+function nextCharacter(text: string, at: number): number {
+  const code = text.codePointAt(at)
+  return at + (code !== undefined && code > 0xffff ? 2 : 1)
 }
 
 // Overlapping and touching matches become one.

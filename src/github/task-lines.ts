@@ -3,7 +3,8 @@
 // split task #N.
 //
 // What counts as such a line (README «Строки задачи»):
-// - a whole line of the text, blanks around it ignored; lines in fenced code blocks (``` or ~~~), in quotes (>) and
+// - a whole line of the text, blanks around it ignored; lines in fenced code blocks (``` or ~~~), in quotes (> — with
+//   the lines that go on a quoted paragraph without a blank line, as GitHub Flavored Markdown reads a quote) and
 //   inside HTML comments do not count — they are not lines of the task as GitHub shows it;
 // - it starts with the words, in any case: «Зависит от» or «Depends on», then an optional colon and the first number
 //   with #; «MVP» and a colon, then the number with #; «Часть», then an optional colon and the number with #;
@@ -71,6 +72,11 @@ export function parseTaskLines(body: string): TaskLines {
   return { dependsOn, mvp, partOf, problems }
 }
 
+const QUOTE = /^ {0,3}>/
+// A line that starts a block of its own (and so ends a quoted paragraph): a code fence, an ATX heading, a thematic
+// break, a list item that may interrupt a paragraph, an HTML block.
+const BLOCK_START = /^ {0,3}(?:`{3,}|~{3,}|#{1,6}(?:\s|$)|(?:[-*_] *){3,}$|[-+*]\s|1[.)]\s|<)/
+
 // The lines of the text as GitHub shows them as text: trimmed, with their number (from 1); without fenced code blocks,
 // quotes and HTML comments.
 function visibleLines(body: string): { line: string; number: number }[] {
@@ -78,6 +84,9 @@ function visibleLines(body: string): { line: string; number: number }[] {
   const visible: { line: string; number: number }[] = []
   let fence: string | null = null
   let comment = false
+  // The last line was a paragraph line of a quote: a next line that starts no block of its own goes on that paragraph
+  // («lazy continuation» of GFM) and is a part of the quote.
+  let quoted = false
   lines.forEach((raw, index) => {
     const line = raw.trim()
     if (fence !== null) {
@@ -90,6 +99,17 @@ function visibleLines(body: string): { line: string; number: number }[] {
       if (line.includes('-->')) comment = false
       return
     }
+    if (QUOTE.test(raw)) {
+      const content = raw.replace(/^(?: {0,3}> ?)+/, '')
+      quoted = content.trim() !== '' && !BLOCK_START.test(content)
+      return
+    }
+    if (line === '') {
+      quoted = false
+      return
+    }
+    if (quoted && !BLOCK_START.test(raw)) return
+    quoted = false
     const opens = /^ {0,3}(`{3,}|~{3,})/.exec(raw)
     if (opens) {
       fence = opens[1] ?? null
@@ -100,7 +120,6 @@ function visibleLines(body: string): { line: string; number: number }[] {
       comment = true
       return
     }
-    if (line.startsWith('>')) return
     visible.push({ line: line.replace(/<!--[\s\S]*?-->/g, '').trim(), number: index + 1 })
   })
   return visible

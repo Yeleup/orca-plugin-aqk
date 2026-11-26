@@ -71,3 +71,19 @@ test('строки задачи: целые строки вне кода, цит
     problems: [],
   })
 })
+
+test('строка сразу после цитаты без пустой строки — продолжение цитаты (как в GitHub) и не читается; после пустой строки — читается', () => {
+  // GFM: a line right after a quoted paragraph goes on that paragraph, inside the quote.
+  assert.deepEqual(parseTaskLines('> Пример:\nЗависит от #5\nMVP: #2').dependsOn, [])
+  assert.deepEqual(parseTaskLines('> Пример:\nЗависит от #5\nMVP: #2').mvp, null)
+  // After a blank line the quote is over.
+  assert.deepEqual(parseTaskLines('> Пример:\n\nЗависит от #5').dependsOn, [5])
+  // A quote whose last line is empty (">") has ended its paragraph: the next line starts a paragraph outside it.
+  assert.deepEqual(parseTaskLines('> Пример:\n>\nЗависит от #6').dependsOn, [6])
+  // A line that starts a block of its own ends the quote (a heading here); the line after it is outside.
+  assert.deepEqual(parseTaskLines('> Пример:\n## Зависимости\nЗависит от #7').dependsOn, [7])
+  const fenced = parseTaskLines('> Пример:\n```\nЗависит от #8\n```\nЗависит от #9')
+  assert.deepEqual(fenced.dependsOn, [9])
+  // Nested quotes the same.
+  assert.deepEqual(parseTaskLines('>> Вложенная цитата\nЧасть #4\n\nЧасть #3'), { dependsOn: [], mvp: null, partOf: 3, problems: [] })
+})
