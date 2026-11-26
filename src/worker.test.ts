@@ -104,7 +104,7 @@ test('Каркас панели: воркер отвечает панели на
 
 test('id координатора: проигравший одновременный запуск берёт id победителя; файл без id не заменяется', async () => {
   const machine = fakeMachine({ platform: 'linux' })
-  const dataDir = await dataDirectory(machine)
+  const dataDir = dataDirectory(machine)
   const file = dataPath(machine, dataDir, COORDINATOR_ID_FILE)
   const winner = '0f6c1e8a-3b2d-4c5e-9f7a-1b2c3d4e5f60'
   // Another worker creates the file between this one's read and its create.

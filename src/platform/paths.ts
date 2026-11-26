@@ -8,17 +8,20 @@ import { pathsOf, type Machine } from './machine'
 export const DATA_DIRECTORY_NAME = 'orca-agent-queue'
 
 // The plugin's data directory on this computer (TZ «Данные», «Состояние на компьютере»), by the rules of the system:
-// - Windows: <Local AppData>\orca-agent-queue — the user's Local AppData as Windows names it (folders.ts), by default
-//   <home>\AppData\Local. Local, not Roaming: a roaming profile would carry the coordinator id to another computer.
+// - Windows: %LOCALAPPDATA%\orca-agent-queue when the worker's environment has an absolute LOCALAPPDATA, otherwise
+//   <home>\AppData\Local\orca-agent-queue. Local, not Roaming: a roaming profile would carry the coordinator id to
+//   another computer.
 // - macOS: ~/Library/Application Support/orca-agent-queue.
-// - Linux: $XDG_DATA_HOME/orca-agent-queue, by default ~/.local/share/orca-agent-queue (XDG Base Directory: a relative
-//   XDG_DATA_HOME is ignored).
-export async function dataDirectory(machine: Pick<Machine, 'platform' | 'env' | 'homedir' | 'start'>): Promise<string> {
+// - Linux: $XDG_DATA_HOME/orca-agent-queue when the worker's environment has an absolute XDG_DATA_HOME, otherwise
+//   ~/.local/share/orca-agent-queue (XDG Base Directory).
+// Orca does not pass LOCALAPPDATA or XDG_DATA_HOME to the worker, so a location the user moved does not count
+// (folders.ts); nothing is asked of the system, and the directory is the same on every start.
+export function dataDirectory(machine: Pick<Machine, 'platform' | 'env' | 'homedir'>): string {
   const paths = pathsOf(machine)
   let base: string
-  if (machine.platform === 'win32') base = await localAppData(machine)
+  if (machine.platform === 'win32') base = localAppData(machine)
   else if (machine.platform === 'darwin') base = paths.join(machine.homedir, 'Library', 'Application Support')
-  else base = (await xdgHome(machine, 'XDG_DATA_HOME')) ?? paths.join(machine.homedir, '.local', 'share')
+  else base = xdgHome(machine, 'XDG_DATA_HOME')
   return nativePath(machine, paths.join(base, DATA_DIRECTORY_NAME))
 }
 

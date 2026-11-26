@@ -123,11 +123,6 @@ const ORCA_ENV = {
   },
 }
 
-// Process starts other than the one PowerShell that names Local AppData on Windows.
-function cliStarts(machine: FakeMachine): string[] {
-  return started(machine).filter((line) => !line.includes('powershell.exe'))
-}
-
 test('К14.5 (поиск): CLI не найден ни в PATH, ни по известному пути → результат «CLI Orca не найден» с причиной', async () => {
   const machines = [
     fakeMachine({ platform: 'linux', env: orcaWorkerEnv(ORCA_ENV.linux, 'linux'), executables: ['/usr/bin/orca'] }),
@@ -139,10 +134,10 @@ test('К14.5 (поиск): CLI не найден ни в PATH, ни по изв�
     assert.equal(search.found, false, machine.platform)
     if (search.found) continue
     assert.equal(search.code, ORCA_CLI_NOT_FOUND)
-    assert.deepEqual(cliStarts(machine), [], `${machine.platform}: no CLI may start`)
+    assert.deepEqual(started(machine), [], `${machine.platform}: no CLI may start`)
     const name = machine.platform === 'linux' ? 'orca-ide' : 'orca'
     assert.ok(search.reason.startsWith(`${name}: not in PATH`), search.reason)
-    const known = await knownOrcaCliPaths(machine)
+    const known = knownOrcaCliPaths(machine)
     for (const path of known) assert.ok(search.reason.includes(`${path}: no such file`), search.reason)
     assert.deepEqual(search.tried.map((entry) => entry.source), ['PATH', ...known.map(() => 'known path')])
   }
@@ -170,9 +165,9 @@ test('К14.5 (поиск): не нашёлся в PATH — известный п
     { platform: 'darwin' as const, cli: '/Users/avery/Applications/Orca.app/Contents/Resources/bin/orca' },
     // An installation in a directory of its own (NSIS /D): only the running Orca knows it.
     { platform: 'win32' as const, execPath: 'D:\\Apps\\Orca\\Orca.exe', cli: 'D:\\Apps\\Orca\\resources\\bin\\orca.exe' },
-    // Local AppData as Windows names it (the worker has no LOCALAPPDATA).
-    { platform: 'win32' as const, cli: 'D:\\Profiles\\Avery\\Local\\Programs\\Orca\\resources\\bin\\orca.exe' },
-    // Program Files on the system drive (the worker has no ProgramFiles).
+    // Local AppData under the profile: LOCALAPPDATA (D:\\Profiles\\…) does not reach the worker.
+    { platform: 'win32' as const, cli: 'C:\\Users\\Avery\\AppData\\Local\\Programs\\Orca\\resources\\bin\\orca.exe' },
+    // Program Files on the system drive: ProgramFiles (E:\\…) does not reach the worker.
     { platform: 'win32' as const, cli: 'C:\\Program Files\\Orca\\resources\\bin\\orca.exe' },
   ]
   for (const { platform: system, execPath, cli } of cases) {
@@ -181,11 +176,10 @@ test('К14.5 (поиск): не нашёлся в PATH — известный п
       env: orcaWorkerEnv(ORCA_ENV[system], system),
       execPath,
       executables: [cli],
-      answer: (request) =>
-        request.file.endsWith('powershell.exe') ? { code: 0, stdout: 'D:\\Profiles\\Avery\\Local' } : answers([cli])(request),
+      answer: answers([cli]),
     })
     const search = await findOrcaCli(machine)
-    assert.deepEqual(cliStarts(machine), [`${cli} status --json`], cli)
+    assert.deepEqual(started(machine), [`${cli} status --json`], cli)
     assert.ok(search.found && search.file === cli && search.source === 'known path', cli)
   }
 })

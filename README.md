@@ -17,16 +17,21 @@
 Воркер плагина получает от Orca урезанное окружение: только `PATH`, `HOME`, `USERPROFILE`, язык и часовой пояс,
 временные каталоги, `XDG_RUNTIME_DIR`, адреса D-Bus и ssh-agent и системные переменные Windows (`SYSTEMROOT`,
 `SYSTEMDRIVE`, `WINDIR`, `COMSPEC`, `PATHEXT` …). Переменных вроде `LOCALAPPDATA`, `XDG_DATA_HOME`, `ProgramFiles` и
-`ORCA_CLI_COMMAND` в нём нет, поэтому то, что они называют, плагин узнаёт у системы сам.
+`ORCA_CLI_COMMAND` в нём нет.
 
 **Каталог данных.** Своё состояние на компьютере плагин держит вне репозиториев, в месте для данных приложений этой
 системы:
 
 | Система | Каталог данных |
 |---|---|
-| Linux | `$XDG_DATA_HOME/orca-agent-queue`, без `XDG_DATA_HOME` — `~/.local/share/orca-agent-queue` |
+| Linux | `~/.local/share/orca-agent-queue` |
 | macOS | `~/Library/Application Support/orca-agent-queue` |
-| Windows | `<Local AppData>\orca-agent-queue`: папка Local AppData, как её называет Windows (по умолчанию `%USERPROFILE%\AppData\Local`; локальный профиль, не перемещаемый) |
+| Windows | `%USERPROFILE%\AppData\Local\orca-agent-queue` (локальный профиль, не перемещаемый) |
+
+`XDG_DATA_HOME` (Linux) и `LOCALAPPDATA` (Windows) плагин учитывает, только когда они есть в окружении воркера и это
+абсолютные пути: тогда каталог данных — `$XDG_DATA_HOME/orca-agent-queue` или `%LOCALAPPDATA%\orca-agent-queue`. Orca
+эти переменные воркеру не передаёт, поэтому перенесённые туда данные приложений на каталог данных плагина не влияют: он
+всегда под домашним каталогом, одинаковый при каждом запуске воркера.
 
 В нём файл `coordinator-id` — id координатора этого компьютера: случайный UUID, без имени компьютера и пользователя.
 Воркер создаёт его при первом запуске и дальше только читает; не удаляйте и не копируйте его на другой компьютер: у
@@ -53,9 +58,9 @@
 
 | Система | Известные пути (по порядку) |
 |---|---|
-| Linux | `<каталог Orca>/resources/bin/orca-ide`; `~/.local/bin/orca-ide`; `~/.cache/orca/appimage/launcher/orca-ide` (AppImage); `/usr/bin/orca-ide` (пакеты deb и rpm); `/opt/Orca`, `/opt/orca-ide`, `/opt/orca` — `resources/bin/orca-ide` |
+| Linux | `<каталог Orca>/resources/bin/orca-ide`; `~/.local/bin/orca-ide`; `~/.cache/orca/appimage/launcher/orca-ide` (AppImage; `$XDG_CACHE_HOME/…`, только если `XDG_CACHE_HOME` есть в окружении воркера); `/usr/bin/orca-ide` (пакеты deb и rpm); `/opt/Orca`, `/opt/orca-ide`, `/opt/orca` — `resources/bin/orca-ide` |
 | macOS | `<Orca>.app/Contents/Resources/bin/orca` запущенной Orca; `/usr/local/bin/orca`; `~/.local/bin/orca`; `Orca.app/Contents/Resources/bin/orca` в `/Applications` и в `~/Applications` |
-| Windows | `<каталог Orca>\resources\bin\orca.exe`; `<Local AppData>\Programs\Orca\resources\bin\orca.exe`; `<системный диск>\Program Files\Orca\resources\bin\orca.exe` |
+| Windows | `<каталог Orca>\resources\bin\orca.exe`; `%USERPROFILE%\AppData\Local\Programs\Orca\resources\bin\orca.exe`; `<системный диск>\Program Files\Orca\resources\bin\orca.exe` (`%LOCALAPPDATA%` и `%ProgramFiles%` — только если они есть в окружении воркера) |
 
 Найденный CLI должен ответить на `status --json` (`"ok": true`) за 20 секунд, иначе плагин берёт следующий. Не нашёлся
 ни один — результат «CLI Orca не найден» с причиной: что и где искали.
