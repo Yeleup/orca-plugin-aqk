@@ -159,7 +159,10 @@ test('настройки читаются из базовой ветки на or
     const before = await readProjectSettings(machine, repo.checkout)
     assert.ok(!before.ok && before.kind === 'missing', JSON.stringify(before))
     assert.equal(before.source.branch, 'main')
-    assert.match(before.error, /^origin\/main has no \.agent-queue\.json, and no other branch of origin has one$/)
+    assert.match(
+      before.error,
+      /^origin\/main has no \.agent-queue\.json, and no other branch of origin known to this clone has one$/,
+    )
 
     const pushed = await repo.commit({ [SETTINGS_FILE]: json({ ...MINIMAL, maxInProgress: 2 }) }, 'connect')
     await repo.push()
@@ -324,6 +327,64 @@ test('ветка origin сдвинулась во время чтения → н
     assert.ok(fetched, 'the reader looked at origin’s branches')
     assert.equal(settingsOf(result).baseBranch, 'develop')
     assert.deepEqual(result.ok && result.source, { branch: 'develop', commit: connected })
+  })
+})
+
+test('клон одной ветки без origin/<ветка по умолчанию> → «не прочитано» с её именем, базовая ветка по остальным не выбирается; названная ветка читается, а после загрузки ветки по умолчанию база находится', async () => {
+  await withRepository(async (repo) => {
+    // main, the default branch, has no file; the only one is the connection commit on develop.
+    await repo.git(['checkout', '--quiet', '-b', 'develop'])
+    const connected = await repo.commit({ [SETTINGS_FILE]: json({ ...MINIMAL, baseBranch: 'develop' }) }, 'connect')
+    await repo.push()
+    // A clone of develop alone: it knows origin/develop, not origin/main.
+    const single = await repo.clone('shop-demo-develop', ['--single-branch', '--branch', 'develop'])
+
+    let result = await readProjectSettings(machine, single)
+    assert.ok(!result.ok && result.kind === 'unreadable', JSON.stringify(result))
+    assert.match(result.error, /this clone has no origin\/main, the repository's default branch, where reading starts/)
+
+    result = await readProjectSettings(machine, single, { branch: 'develop' })
+    assert.equal(settingsOf(result).baseBranch, 'develop')
+    assert.deepEqual(result.ok && result.source, { branch: 'develop', commit: connected })
+
+    // Once the clone has the default branch, the search finds develop.
+    await repo.git(['fetch', '--quiet', 'origin', 'main:refs/remotes/origin/main'], single)
+    result = await readProjectSettings(machine, single)
+    assert.equal(settingsOf(result).baseBranch, 'develop')
+    assert.deepEqual(result.ok && result.source, { branch: 'develop', commit: connected })
+  })
+})
+
+test('git вернул список веток origin не целиком → «не прочитано» с причиной до любого решения, без ветки и с названной', async () => {
+  await withRepository(async (repo) => {
+    await repo.git(['checkout', '--quiet', '-b', 'develop'])
+    await repo.commit({ [SETTINGS_FILE]: json({ ...MINIMAL, baseBranch: 'develop' }) }, 'connect')
+    await repo.push()
+    await repo.git(['checkout', '--quiet', '-b', 'staging'])
+    await repo.commit({ [SETTINGS_FILE]: json({ ...MINIMAL, baseBranch: 'staging' }) })
+    await repo.push()
+    // The run layer kept only the beginning and the end of a huge list: staging was in the part left out.
+    const cut = realMachine({
+      now: fakeClock().now,
+      start: async (request) => {
+        const outcome = await startProcess(request)
+        if (!request.args.includes('for-each-ref')) return outcome
+        const lines = outcome.stdout.split('\n')
+        const kept = lines.filter((line) => !line.startsWith('refs/remotes/origin/staging'))
+        assert.equal(kept.length, lines.length - 1, outcome.stdout)
+        return { ...outcome, stdout: kept.join('\n'), truncated: true }
+      },
+    })
+    for (const options of [{}, { branch: 'staging' }]) {
+      const result = await readProjectSettings(cut, repo.checkout, options)
+      assert.ok(!result.ok && result.kind === 'unreadable', JSON.stringify(result))
+      assert.match(result.error, /git for-each-ref .*: its output was too large to keep/)
+    }
+
+    // The whole list: two branches each name themselves.
+    const whole = await readProjectSettings(machine, repo.checkout)
+    assert.ok(!whole.ok && whole.kind === 'ambiguous', JSON.stringify(whole))
+    assert.deepEqual(whole.branches, ['develop', 'staging'])
   })
 })
 

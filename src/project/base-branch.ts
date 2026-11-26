@@ -72,7 +72,8 @@ export async function branchCommit(machine: Machine, checkout: string, branch: s
 export async function remoteBranches(machine: Machine, checkout: string): Promise<BaseBranchCommit[]> {
   const prefix = `refs/remotes/${REMOTE}/`
   const refs = await git(machine, checkout, ['for-each-ref', '--format=%(refname)%00%(objectname)%00%(symref)', prefix])
-  if (refs.error !== null || refs.code !== 0) throw new Error(failure(refs))
+  // A list cut short is not a picture of origin: refused before anything is decided from it.
+  if (refs.error !== null || refs.code !== 0 || refs.truncated) throw new Error(failure(refs))
   const branches: BaseBranchCommit[] = []
   for (const line of refs.stdout.split(/\r?\n/)) {
     const [name = '', commit = '', symref = ''] = line.split('\0')

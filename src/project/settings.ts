@@ -150,7 +150,7 @@ export function describeProblems(problems: readonly SettingsProblem[]): string {
 export type ReadSettingsResult =
   | { readonly ok: true; readonly settings: ProjectSettings; readonly source: BaseBranchCommit }
   // No .agent-queue.json: the project is not connected. Read from the caller's branch: that branch has none; otherwise
-  // neither the default branch (`source`) nor any other branch of origin has a copy of the file.
+  // neither the default branch (`source`) nor any other branch of origin known to this clone has a copy of the file.
   | { readonly ok: false; readonly kind: 'missing'; readonly error: string; readonly source: BaseBranchCommit }
   // The file is there but wrong: `problems` names each field at fault.
   | {
@@ -244,7 +244,14 @@ class SettingsReader {
     const start = branch ?? (await this.defaultBranch())
     const commit = (await this.picture()).get(start)
     if (commit === undefined) {
-      throw new Error(`this clone has no ${REMOTE}/${start}: there is no such branch, or it was not fetched yet`)
+      if (branch !== undefined) {
+        throw new Error(`this clone has no ${REMOTE}/${start}: there is no such branch, or it was not fetched yet`)
+      }
+      // Reading starts at the default branch, whose copy decides first: the base branch is not chosen from the other
+      // branches without it.
+      throw new Error(
+        `this clone has no ${REMOTE}/${start}, the repository's default branch, where reading starts: the clone does not fetch it (a clone of one branch), or it was not fetched yet`,
+      )
     }
     const copy = await this.copyAt(start, commit)
     if (copy.state === 'file') return this.handOver(copy)
@@ -282,7 +289,7 @@ class SettingsReader {
     const candidates = undeferred.length > 0 ? undeferred : copied
     const [only] = candidates
     if (only === undefined) {
-      const error = `${missing.error}, and no other branch of ${REMOTE} has one`
+      const error = `${missing.error}, and no other branch of ${REMOTE} known to this clone has one`
       return { ...missing, error }
     }
     if (candidates.length === 1) {
