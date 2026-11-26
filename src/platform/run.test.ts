@@ -462,3 +462,31 @@ test('запуск batch-файла на Windows: путь с " ^ или % — �
   await runProgram(win, 'C:\\work\\50%\\check.exe', ['--strict'])
   assert.deepEqual(win.starts.map(({ file, args }) => [file, ...args]), [['C:\\work\\50%\\check.exe', '--strict']])
 })
+
+test('текст на стандартный ввод доходит до программы целиком, в UTF-8; без него ввод пуст; программа, которая ввод не читает, — не сбой', async () => {
+  const echo =
+    "let s = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', (d) => (s += d));" +
+    " process.stdin.on('end', () => process.stdout.write(JSON.stringify(s)))"
+  // Longer than any command line of Windows (32767 characters), with line breaks, quotes and Cyrillic.
+  const input = `Комментарий «с кавычками» "и" \\ обратной чертой\r\n${'строка текста для GitHub\n'.repeat(4000)}конец`
+  const machine = realMachine()
+  const whole = await runProgram(machine, execPath, ['-e', echo], { input, timeoutMs: 30_000 })
+  assert.equal(whole.error, null, JSON.stringify(whole.error))
+  assert.equal(whole.code, 0)
+  assert.equal(JSON.parse(whole.stdout), input)
+
+  const none = await runProgram(machine, execPath, ['-e', echo], { timeoutMs: 30_000 })
+  assert.equal(none.code, 0, JSON.stringify(none.error))
+  assert.equal(JSON.parse(none.stdout), '')
+
+  // It exits at once without reading: the pipe breaks under the write, the run still ends with its own exit.
+  const deaf = await runProgram(machine, execPath, ['-e', 'process.exit(3)'], { input: 'x'.repeat(4_000_000), timeoutMs: 30_000 })
+  assert.equal(deaf.error, null, JSON.stringify(deaf.error))
+  assert.equal(deaf.code, 3)
+
+  // The fake computer records the input of each start, as a test of a fake gh needs it.
+  const fake = fakeMachine({ platform: 'linux', env: { PATH: '/usr/bin' }, executables: ['/usr/bin/gh'] })
+  await runProgram(fake, 'gh', ['api', 'user'])
+  await runProgram(fake, 'gh', ['api', '--input', '-'], { input: '{"body":"x"}' })
+  assert.deepEqual(fake.starts.map((start) => start.input), [undefined, '{"body":"x"}'])
+})

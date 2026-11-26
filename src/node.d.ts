@@ -88,8 +88,14 @@ declare module 'node:child_process' {
     on(event: 'data', listener: (chunk: Uint8Array) => void): this
     destroy(): this
   }
+  // A child's stdin: a string is written as UTF-8.
+  export interface WritableText {
+    end(data: string): this
+    on(event: 'error', listener: (error: Error) => void): this
+  }
   export interface ChildProcess {
     readonly pid?: number
+    readonly stdin: WritableText | null
     readonly stdout: ReadableBytes | null
     readonly stderr: ReadableBytes | null
     kill(signal?: 'SIGTERM' | 'SIGKILL'): boolean
