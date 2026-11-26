@@ -72,8 +72,8 @@ export type Machine = {
   isRunnableFile(path: string): boolean
   // The text of a file, or null when there is no such file.
   readText(path: string): string | null
-  // When the file was last written, in whole milliseconds since the epoch (the clock of now()), or null when there is
-  // no such file.
+  // When the file was last written, in milliseconds since the epoch (the clock of now()) with the fraction the file
+  // system keeps, or null when there is no such file.
   modifiedAt(path: string): number | null
   // The entries right inside a directory, each as the directory has it — a symbolic link or a Windows junction is
   // `other`, never followed — or null when there is no such directory. Throws on any other failure (no access, not a

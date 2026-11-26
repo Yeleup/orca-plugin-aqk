@@ -7,7 +7,10 @@
 // is the clock's reading when it was written. Invented project, issues, terminals and workspaces only.
 import { assert, hostError, mountWorker, test, type TestWorker } from 'orca/testing'
 import type { PluginEvents } from 'orca/worker'
-import type { Machine } from '../platform/machine'
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { realMachine, realPlatform, type Machine } from '../platform/machine'
 import { dataDirectory, dataName, dataPath } from '../platform/paths'
 import { DEFAULT_AGENTS, type AgentRole, type ProjectAgents } from '../project/settings'
 import { fakeOrca, type FakeOrca } from '../testing/fake-orca'
@@ -1463,6 +1466,155 @@ test('После перезапуска воркера без единого с�
   orca.unlist(launch.terminalId)
   assert.equal(await restarted.agents.state(again), null)
   assert.deepEqual(await restarted.agents.report(again), notReady(again, { started: true, reportExists: true }))
+  assert.deepEqual(restarted.worker.refusals, [])
+  await restarted.worker.deactivate()
+})
+
+// The one test on the real disk (the exception of the tests' rule for the time of a file's last write): the layer reads
+// the report file and its time with the real computer's file operations, in a temporary data directory.
+test('Время записи файла отчёта — с долей миллисекунды, как его хранит файловая система: «done», начавшийся в ту же миллисекунду раньше записи черновика, отчёт не подтверждает; «done» не раньше записи — подтверждает (настоящий диск, временный каталог)', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-queue-report-time-'))
+  try {
+    const orca = fakeOrca({ platform: realPlatform() })
+    const real = realMachine()
+    const machine: Machine = {
+      ...orca.machine,
+      readText: real.readText,
+      modifiedAt: real.modifiedAt,
+      listEntries: real.listEntries,
+      createText: real.createText,
+    }
+    const r = await mount(orca, { machine, dataDir })
+    const launch = await launched(r, 80, 'implementer')
+    const seconds = (ms: number) => ms / 1000
+    // The agent's earlier turn ended at doneAt — Orca keeps the start in whole milliseconds — and the draft of its new
+    // turn is written 0.7 ms later.
+    const doneAt = Date.UTC(2026, 0, 15, 9, 40, 0)
+    orca.list(launch.terminalId, 'done', doneAt)
+    writeFileSync(launch.reportFile, 'Черновик отчёта.\n')
+    utimesSync(launch.reportFile, seconds(doneAt + 0.7), seconds(doneAt + 0.7))
+    assert.deepEqual(
+      await r.agents.report(launch),
+      notReady(launch, { state: 'done', listed: true, started: true, reportExists: true, writtenAfterDone: true }),
+    )
+    // A «done» that began the next millisecond: ready.
+    orca.list(launch.terminalId, 'done', doneAt + 1)
+    assert.deepEqual(await r.agents.report(launch), { ready: true, text: 'Черновик отчёта.\n', reportFile: launch.reportFile })
+    // The file written at the very millisecond the «done» began: ready.
+    orca.list(launch.terminalId, 'done', doneAt)
+    utimesSync(launch.reportFile, seconds(doneAt), seconds(doneAt))
+    assert.deepEqual(await r.agents.report(launch), { ready: true, text: 'Черновик отчёта.\n', reportFile: launch.reportFile })
+    assert.deepEqual(r.worker.refusals, [])
+    await r.worker.deactivate()
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('Отметку начала чтение отчёта пишет до чтения файла отчёта: черновик нового хода, записанный, пока пишется отметка, даёт «не готов», а не прежний текст', async () => {
+  const orca = fakeOrca()
+  const first = await mount(orca)
+  const launch = await launched(first, 81, 'implementer')
+  await first.worker.deactivate()
+  // While no worker runs, the agent ends its turn with its report: no start mark is on disk yet.
+  orca.clock.advance(5 * 60_000)
+  orca.finishTurn(launch, 'Отчёт.\n')
+  const mark = startMark(orca, launch)
+  assert.equal(orca.machine.files.has(mark), false)
+
+  // The new worker's disk takes its time with the mark, and meanwhile the agent starts a new turn and writes a draft.
+  const machine: Machine = {
+    ...orca.machine,
+    createText: async (path, text) => {
+      if (path === mark) {
+        orca.clock.advance(1)
+        orca.machine.files.set(launch.reportFile, 'Черновик нового хода.\n')
+      }
+      return orca.machine.createText(path, text)
+    },
+  }
+  const restarted = await mount(orca, { machine })
+  const again = recorded(restarted, issueTask(PROJECT, 81), 1)
+  assert.deepEqual(
+    await restarted.agents.report(again),
+    notReady(again, { state: 'done', listed: true, started: true, reportExists: true, writtenAfterDone: true }),
+  )
+  assert.ok(orca.machine.files.has(mark))
+  // The agent ends that turn with its report: ready, with that text.
+  orca.clock.advance(30_000)
+  orca.finishTurn(launch, 'Отчёт нового хода.\n')
+  assert.deepEqual(await restarted.agents.report(again), { ready: true, text: 'Отчёт нового хода.\n', reportFile: launch.reportFile })
+  assert.deepEqual(restarted.worker.refusals, [])
+  await restarted.worker.deactivate()
+})
+
+test('Отметка начала, которую диск не принял или не отдаёт: ранний working до ответа Orca — запуск с ошибкой хранения, его терминал назван и открыт; чтение отчёта — ошибка с причиной, а не «не начал» и не сбой доставки', async () => {
+  const orca = fakeOrca()
+  // The disk refuses to write the start marks, or to read them, while the test says so.
+  let refuse: 'write' | 'read' | null = null
+  const isMark = (path: string) => path.endsWith('/started-0')
+  const machine: Machine = {
+    ...orca.machine,
+    createText: async (path, text) => {
+      if (refuse === 'write' && isMark(path)) throw new Error('ENOSPC: no space left on device')
+      return orca.machine.createText(path, text)
+    },
+    readText: (path) => {
+      if (refuse === 'read' && isMark(path)) throw new Error('EACCES: permission denied')
+      return orca.machine.readText(path)
+    },
+  }
+  const r = await mount(orca, { machine })
+
+  // Orca tells the turn of the agent in the terminal it opens before it answers the launch; the mark cannot be written.
+  refuse = 'write'
+  const held = gate()
+  orca.launchGate = held.promise
+  const launching = r.agents.launch(request(90, 'implementer'))
+  await settle()
+  const turnAt = orca.clock.now() + 500
+  // The test worker's emit settles once the host has no call pending: it is awaited after Orca's answer is let go.
+  const emitted = r.worker.emit('agent.status.changed', status({ workspaceId: 'workspace-issue-90', terminalId: 'terminal-1' }, 'working', turnAt, turnAt))
+  orca.launchGate = null
+  held.open()
+  await emitted
+  const dir = launchDir(r, 'issue-90', 1)
+  assert.deepEqual(await launching, {
+    ok: false,
+    kind: 'launch-failed',
+    role: 'implementer',
+    agent: 'codex',
+    error: `the agent "codex" (agents.implementer in .agent-queue.json) was launched in terminal terminal-1 and started its task before Orca answered the launch, but the start of the task of launch 1 could not be kept in ${dir}/started-0: ENOSPC: no space left on device; the terminal stays open, and a stop of the task closes it`,
+  })
+  assert.equal(orca.terminals.get('terminal-1')?.open, true)
+  assert.deepEqual(json(orca, `${dir}/launch.json`), { terminalId: 'terminal-1', error: null })
+  assert.equal(orca.machine.files.has(`${dir}/started-0`), false)
+  assert.deepEqual(await r.agents.stop(issueTask(PROJECT, 90)), { closed: ['terminal-1'], failed: [] })
+
+  // A turn of a launch the worker knows, the mark refused: the reading of the report is an error with the reason —
+  // not «started» without the mark — until the disk takes it.
+  const launch = await launched(r, 91, 'implementer')
+  const mark = startMark(orca, launch)
+  await r.worker.emit('agent.status.changed', status(launch, 'working', orca.clock.now(), orca.clock.now()))
+  assert.equal(orca.machine.files.has(mark), false)
+  const notKept = `the start of the task of launch 1 could not be kept in ${mark}: ENOSPC: no space left on device`
+  await assert.rejects(r.agents.report(launch), (error) => error instanceof Error && error.message === notKept)
+  refuse = null
+  assert.deepEqual(await r.agents.report(launch), notReady(launch, { state: 'working', started: true }))
+  assert.ok(orca.machine.files.has(mark))
+  await r.worker.deactivate()
+
+  // After a restart the agent waits for a permission past the deadline, and its mark cannot be read: an error with the
+  // reason, not a failed delivery.
+  orca.list(launch.terminalId, 'blocked', orca.clock.now())
+  orca.clock.advance(DELIVERY_DEADLINE_MS)
+  const restarted = await mount(orca, { machine })
+  const again = recorded(restarted, issueTask(PROJECT, 91), 1)
+  refuse = 'read'
+  const unreadable = `the start of the task of launch 1 cannot be read from ${mark}: EACCES: permission denied`
+  await assert.rejects(restarted.agents.report(again), (error) => error instanceof Error && error.message === unreadable)
+  refuse = null
+  assert.deepEqual(await restarted.agents.report(again), notReady(again, { state: 'blocked', listed: true, started: true }))
   assert.deepEqual(restarted.worker.refusals, [])
   await restarted.worker.deactivate()
 })

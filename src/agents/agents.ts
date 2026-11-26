@@ -26,22 +26,25 @@
 //   launch's terminal — `working`, in an event or in the list — or the report file appeared. The plugin keeps that on
 //   disk, once (started-0): a worker started later does not count an agent that started and now waits (`blocked`) as a
 //   failed delivery. A turn heard in the terminal before Orca answered the launch is the start too: the mark is written
-//   once the launch is recorded, before the launch's result. No turn DELIVERY_DEADLINE_MS after the launch: the reading
-//   of the report names the failed delivery with what Orca shows of the agent (`blocked`: it waits for a person — a
-//   permission, a trust prompt; anything else or nothing: the task did not reach it), by which the caller blocks the
-//   task with «сбой агента». A turn seen in time is no failure, however long the agent then works.
+//   once the launch is recorded, before the launch's result — when the disk refuses it, the launch is an error naming
+//   the terminal Orca opened (a stop of the task closes it). A reading of the report keeps the start it knows on disk
+//   before it asks Orca; a mark that cannot be read or kept makes the reading an error, never a failed delivery. No
+//   turn DELIVERY_DEADLINE_MS after the launch: the reading of the report names the failed delivery with what Orca
+//   shows of the agent (`blocked`: it waits for a person — a permission, a trust prompt; anything else or nothing: the
+//   task did not reach it), by which the caller blocks the task with «сбой агента». A turn seen in time is no failure,
+//   however long the agent then works.
 // - report: ready only when the launch's report file (report.md) is there, `agents.list` names the agent in «done», and
-//   that «done» began (`stateStartedAt`) no earlier than the file's last write — an equal time is ready. The agent
-//   writes its report during its turn, so the «done» of that turn begins after the file's last write; an earlier «done»
-//   — of an earlier turn, from a late answer of the list, shown with an old start — began before it, and a file written
-//   after the «done» began is the draft of a turn still going on. Only the list confirms: an event never makes a report
-//   ready (it may lack the start, come late, or tell the end of the agent's session rather than of a turn), and an
-//   agent the list does not name has no confirmed report — the case «the agent is gone from Orca» of the watchdog
-//   (Ф10), after a restart of the worker as before. The text and the time of the file are read after Orca's answer,
-//   with nothing waited for between them and the reply, the time after the text — a file changed in between has the
-//   later time, so «not ready» — and the text read is the one returned. The rule assumes one computer: the data
-//   directory and Orca on it, so the file's time and `stateStartedAt` come from one clock; the report is written by the
-//   agent itself.
+//   that «done» began (`stateStartedAt`) no earlier than the file's last write, as precise as the file system keeps it
+//   (a fraction of a millisecond is not dropped) — an equal time is ready. The agent writes its report during its turn,
+//   so the «done» of that turn begins after the file's last write; an earlier «done» — of an earlier turn, from a late
+//   answer of the list, shown with an old start — began before it, and a file written after the «done» began is the
+//   draft of a turn still going on. Only the list confirms: an event never makes a report ready (it may lack the start,
+//   come late, or tell the end of the agent's session rather than of a turn), and an agent the list does not name has
+//   no confirmed report — the case «the agent is gone from Orca» of the watchdog (Ф10), after a restart of the worker
+//   as before. The text and the time of the file are read after Orca's answer, with nothing waited for or written
+//   between them and the reply, the time after the text — a file changed in between has the later time, so «not ready»
+//   — and the text read is the one returned. The rule assumes one computer: the data directory and Orca on it, so the
+//   file's time and `stateStartedAt` come from one clock; the report is written by the agent itself.
 // After a restart of the worker only the disk is kept: the events the former worker heard are gone, and an event of a
 // launch the new worker does not know yet (before its first reading of that launch's state or report) leaves no mark.
 //
@@ -200,7 +203,8 @@ export type LaunchRecord = LaunchFiles & {
 export type LaunchFailure = {
   readonly ok: false
   // `unknown-agent`: Orca does not know the agent of the settings and started nothing; `launch-failed`: Orca or the
-  // plugin could not start it, or a stop of the task refused it (the reason is in `error`).
+  // plugin could not start it, a stop of the task refused it, or the start of its task, heard before Orca answered the
+  // launch, could not be kept on disk — then its terminal is open, named in `error` (the reason is in `error`).
   readonly kind: 'unknown-agent' | 'launch-failed'
   readonly role: AgentRole
   readonly agent: string
@@ -379,7 +383,7 @@ export class Agents {
   // otherwise the latest event of that terminal this worker heard; null when Orca has said nothing of the agent.
   // Rejects when Orca's list cannot be read.
   async state(launch: AgentLaunch): Promise<StateReading | null> {
-    this.learn(launch)
+    this.know(launch)
     let agents: ListedAgent[]
     try {
       agents = (await this.host.call('agents.list', { workspaceId: launch.workspaceId })).agents
@@ -393,26 +397,34 @@ export class Agents {
   // The report on the launch's task: ready only when its report file is there, `agents.list` names the agent in «done»,
   // and that «done» began no earlier than the file's last write; then with the file's text. Otherwise what is missing,
   // and the failed delivery when the agent has not started on its task DELIVERY_DEADLINE_MS after the launch. Rejects
-  // when Orca's list cannot be read.
+  // when Orca's list cannot be read, and when the start of the task cannot be read from the disk or kept there.
   async report(launch: AgentLaunch): Promise<ReportReading> {
-    this.learn(launch)
+    this.know(launch)
+    // The start of the task as far as it is known before Orca is asked — the mark on disk, a turn this worker saw, the
+    // report file there — is settled first: kept on disk when it is not there yet. Nothing is written after the reads
+    // of the report file below.
+    let started = this.startedOnDisk(launch)
+    if (!started && (this.turns.has(launch.terminalId) || this.machine.modifiedAt(launch.reportFile) !== null)) {
+      await this.keepStarted(launch)
+      started = true
+    }
     let agents: ListedAgent[]
     try {
       agents = (await this.host.call('agents.list', { workspaceId: launch.workspaceId })).agents
     } catch (error) {
       throw unreadableList(launch, error)
     }
-    // From Orca's answer to the reply nothing waits: the text first, then the time of the file's last write — a file
-    // changed between the two reads has the later time.
     const seen = this.seen(launch, agents)
+    // From Orca's answer to the reply nothing waits and nothing is written: the text first, then the time of the file's
+    // last write — a file changed between the two reads has the later time.
     const text = this.machine.readText(launch.reportFile)
     const writtenAt = text === null ? null : this.machine.modifiedAt(launch.reportFile)
     const exists = text !== null && writtenAt !== null
     const doneSince = seen !== null && seen.listed && seen.state === 'done' ? seen.since : null
-    const started = exists || this.turns.has(launch.terminalId) || this.hasStarted(launch)
-    // Kept on disk without waiting for the write.
-    if (started) void this.markStarted(launch)
     if (exists && doneSince !== null && doneSince >= writtenAt) return { ready: true, text, reportFile: launch.reportFile }
+    // A turn Orca's answer showed is being kept on disk (seen); a report file that appeared only now is kept by the
+    // next reading — the file itself is there meanwhile.
+    started = started || exists || this.turns.has(launch.terminalId)
     const state = seen?.state ?? null
     const late = !started && this.machine.now() - launch.launchedAt >= DELIVERY_DEADLINE_MS
     return {
@@ -517,16 +529,27 @@ export class Agents {
     }
     const launch: AgentLaunch = { ...files, task: place.task, number, role, agent, language, workspaceId, launchedAt, terminalId }
     this.known.set(terminalId, launch)
-    // Orca opened this terminal for this launch: a turn heard in it before Orca's answer is a turn on its task.
-    if (this.turns.has(terminalId)) await this.markStarted(launch)
+    // Orca opened this terminal for this launch: a turn heard in it before Orca's answer is a turn on its task, kept on
+    // disk before the result. When the disk refuses it, the launch is an error naming the terminal Orca opened: its
+    // launch is recorded, so a stop of the task closes it.
+    if (this.turns.has(terminalId)) {
+      try {
+        await this.keepStarted(launch)
+      } catch (error) {
+        return failure(
+          'launch-failed',
+          `the agent "${agent}" (${field}) was launched in terminal ${terminalId} and started its task before Orca answered the launch, but ${errorMessage(error)}; the terminal stays open, and a stop of the task closes it`,
+        )
+      }
+    }
     return { ok: true, launch }
   }
 
   // From now on the worker knows the launch: a turn already heard in its terminal, and every later one, is kept on disk
   // as the start of its task.
-  private learn(launch: AgentLaunch): void {
+  private know(launch: AgentLaunch): void {
     this.known.set(launch.terminalId, launch)
-    if (this.turns.has(launch.terminalId)) void this.markStarted(launch)
+    if (this.turns.has(launch.terminalId)) this.keepStartedLater(launch)
   }
 
   // What Orca shows of the launch's agent, from Orca's answer to `agents.list` of its workspace: its entry there, else
@@ -545,27 +568,35 @@ export class Agents {
   private turnSeen(terminalId: string): void {
     this.turns.add(terminalId)
     const launch = this.known.get(terminalId)
-    if (launch !== undefined) void this.markStarted(launch)
+    if (launch !== undefined) this.keepStartedLater(launch)
   }
 
-  // Whether the start of the launch's task is on disk (started-0); a mark that cannot be read counts as none.
-  private hasStarted(launch: AgentLaunch): boolean {
+  // Whether the start of the launch's task is on disk (started-0). A mark that cannot be read is an error, never «not
+  // started»: it may be there.
+  private startedOnDisk(launch: AgentLaunch): boolean {
+    const path = dataPath(this.machine, launch.dir, STARTED_FILE)
     try {
-      return this.machine.readText(dataPath(this.machine, launch.dir, STARTED_FILE)) !== null
-    } catch {
-      return false
+      return this.machine.readText(path) !== null
+    } catch (error) {
+      throw new Error(`the start of the task of launch ${launch.number} cannot be read from ${path}: ${errorMessage(error)}`)
     }
   }
 
-  // Keeps on disk, once, that the agent has started on its task. Not kept (the disk refused): the next reading sees the
-  // turn or the report file again.
-  private async markStarted(launch: AgentLaunch): Promise<void> {
-    if (this.hasStarted(launch)) return
+  // Keeps on disk, once, that the agent has started on its task. Rejects when the mark can be neither read nor written.
+  private async keepStarted(launch: AgentLaunch): Promise<void> {
+    if (this.startedOnDisk(launch)) return
+    const path = dataPath(this.machine, launch.dir, STARTED_FILE)
     try {
-      await this.machine.createText(dataPath(this.machine, launch.dir, STARTED_FILE), `${this.machine.now()}\n`)
-    } catch {
-      // Not kept.
+      await this.machine.createText(path, `${this.machine.now()}\n`)
+    } catch (error) {
+      throw new Error(`the start of the task of launch ${launch.number} could not be kept in ${path}: ${errorMessage(error)}`)
     }
+  }
+
+  // The same for a turn Orca reports with no caller to tell: when the disk refuses it, the worker still knows the turn,
+  // and the next reading of the report keeps it on disk or rejects with the reason.
+  private keepStartedLater(launch: AgentLaunch): void {
+    this.keepStarted(launch).catch(() => undefined)
   }
 
   // The records of launch `number`: what its directory holds — whether the `closed` mark is there is seen in the

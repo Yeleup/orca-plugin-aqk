@@ -73,12 +73,13 @@ test('Время последней записи файла читается н�
     const path = join(dir, 'agents', '1', 'report.md')
     assert.equal(machine.modifiedAt(path), null)
     await machine.createText(path, 'Черновик.\n')
-    // The time the disk keeps for the file, in whole milliseconds.
-    assert.equal(machine.modifiedAt(path), Math.floor(statSync(path).mtimeMs))
-    // A time set on the file, with a fraction of a millisecond: read in whole milliseconds, the fraction dropped.
+    // The time the disk keeps for the file, as it keeps it.
+    assert.equal(machine.modifiedAt(path), statSync(path).mtimeMs)
+    // A time set on the file with a fraction of a millisecond: the fraction is kept, not dropped.
     const written = Date.UTC(2026, 0, 15, 9, 30, 0, 250)
     utimesSync(path, (written + 0.7) / 1000, (written + 0.7) / 1000)
-    assert.equal(machine.modifiedAt(path), written)
+    const fractional = machine.modifiedAt(path)
+    assert.ok(fractional !== null && fractional > written + 0.6 && fractional < written + 0.8, String(fractional))
     // Written again: a later time.
     writeFileSync(path, 'Отчёт.\n')
     const rewritten = machine.modifiedAt(path)
@@ -100,9 +101,11 @@ test('Время последней записи файла читается н�
     ['C:\\data\\given.md', 'C:\\data\\report.md', 'C:\\data\\created.md'].map((path) => fake.modifiedAt(path)),
     [t0, t0 + 1_500, t0 + 2_000],
   )
-  // Names without case, as on Windows; a file written again has the new reading; no file — null.
+  // Names without case, as on Windows; a file written again has the new reading, a fraction of a millisecond kept; no
+  // file — null.
+  fake.clock.advance(0.5)
   fake.files.set('C:\\data\\report.md', 'Отчёт.\n')
-  assert.equal(fake.modifiedAt('c:\\DATA\\Report.md'), t0 + 2_500)
+  assert.equal(fake.modifiedAt('c:\\DATA\\Report.md'), t0 + 2_500.5)
   fake.files.delete('C:\\data\\report.md')
   assert.equal(fake.modifiedAt('C:\\data\\report.md'), null)
   assert.equal(fake.modifiedAt('C:\\data\\missing.md'), null)

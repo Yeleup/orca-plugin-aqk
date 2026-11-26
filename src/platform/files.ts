@@ -26,12 +26,12 @@ export function readText(path: string): string | null {
   }
 }
 
-// When the file was last written (its modification time), in whole milliseconds since the epoch — as Date.now() counts
-// them, so that a time Orca took with it compares with the file's at the same precision; null when there is no such
-// file.
+// When the file was last written (its modification time), in milliseconds since the epoch with the fraction of a
+// millisecond the file system keeps — never rounded: a file written 0.7 ms after a time Orca took in whole milliseconds
+// (Date.now()) is later than that time, not equal to it; null when there is no such file.
 export function modifiedAt(path: string): number | null {
   try {
-    return Math.floor(statSync(path).mtimeMs)
+    return statSync(path).mtimeMs
   } catch (error) {
     if (errorCode(error) === 'ENOENT') return null
     throw error
