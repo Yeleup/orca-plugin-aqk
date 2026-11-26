@@ -11,7 +11,7 @@
 import { homedir } from 'node:os'
 import { posix, win32, type PlatformPath } from 'node:path'
 import { cwd, env, execPath, platform } from 'node:process'
-import { createText, isRunnableFile, readText } from './files'
+import { createText, isRunnableFile, listEntries, readText } from './files'
 import { startProcess } from './process'
 
 export type Platform = 'linux' | 'darwin' | 'win32'
@@ -55,6 +55,9 @@ export type StartOutcome = {
   readonly startError: { readonly code: string | null; readonly message: string } | null
 }
 
+// An entry of a directory: a real directory, a regular file, or anything else (a link, a junction, a device).
+export type DirectoryEntry = { readonly name: string; readonly kind: 'directory' | 'file' | 'other' }
+
 export type Machine = {
   readonly platform: Platform
   readonly env: Env
@@ -69,6 +72,10 @@ export type Machine = {
   isRunnableFile(path: string): boolean
   // The text of a file, or null when there is no such file.
   readText(path: string): string | null
+  // The entries right inside a directory, each as the directory has it — a symbolic link or a Windows junction is
+  // `other`, never followed — or null when there is no such directory. Throws on any other failure (no access, not a
+  // directory).
+  listEntries(path: string): DirectoryEntry[] | null
   // Creates the file with exactly this text unless the file exists, creating its directory first. True when this call
   // created it, false when it was already there; a reader never sees it half written. Throws on any other failure.
   createText(path: string, text: string): Promise<boolean>
@@ -91,6 +98,7 @@ export function realMachine(overrides: Partial<Machine> = {}): Machine {
     now: () => Date.now(),
     isRunnableFile: (path) => isRunnableFile(path, system),
     readText,
+    listEntries,
     createText: (path, text) => createText(path, text),
     start: startProcess,
     ...overrides,

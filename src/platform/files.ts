@@ -1,10 +1,10 @@
-// The file operations of the real machine: whether a file can be run, reading a text file, and creating a file only if
-// it is absent, in a way no reader ever sees half written.
+// The file operations of the real machine: whether a file can be run, reading a text file, the entries of a directory,
+// and creating a file only if it is absent, in a way no reader ever sees half written.
 import { randomUUID } from 'node:crypto'
-import { accessSync, constants, linkSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { accessSync, constants, linkSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { errorCode } from './errors'
-import type { Platform } from './machine'
+import type { DirectoryEntry, Platform } from './machine'
 
 export function isRunnableFile(path: string, system: Platform): boolean {
   try {
@@ -19,6 +19,19 @@ export function isRunnableFile(path: string, system: Platform): boolean {
 export function readText(path: string): string | null {
   try {
     return readFileSync(path, 'utf8')
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return null
+    throw error
+  }
+}
+
+// The kind of each entry comes from the directory itself (for an unknown one Node asks lstat): a link is not followed.
+export function listEntries(path: string): DirectoryEntry[] | null {
+  try {
+    return readdirSync(path, { withFileTypes: true }).map((entry) => ({
+      name: entry.name,
+      kind: entry.isSymbolicLink() ? 'other' : entry.isDirectory() ? 'directory' : entry.isFile() ? 'file' : 'other',
+    }))
   } catch (error) {
     if (errorCode(error) === 'ENOENT') return null
     throw error

@@ -39,7 +39,16 @@ declare module 'node:fs' {
   export function mkdtempSync(prefix: string): string
   export function readFileSync(path: string, encoding: 'utf8'): string
   export function readFileSync(path: string): Uint8Array
+  // An entry of a directory as the directory has it: a symbolic link (or a Windows junction) is a link, not followed.
+  export interface Dirent {
+    readonly name: string
+    isFile(): boolean
+    isDirectory(): boolean
+    isSymbolicLink(): boolean
+  }
   export function readdirSync(path: string): string[]
+  export function readdirSync(path: string, options: { withFileTypes: true }): Dirent[]
+  export function symlinkSync(target: string, path: string, type?: 'dir' | 'file' | 'junction'): void
   export function writeFileSync(
     path: string,
     data: string | Uint8Array,
@@ -62,7 +71,12 @@ declare module 'node:os' {
 }
 
 declare module 'node:crypto' {
+  export interface Hash {
+    update(data: string, encoding: 'utf8'): Hash
+    digest(encoding: 'hex'): string
+  }
   export function randomUUID(): string
+  export function createHash(algorithm: 'sha256'): Hash
 }
 
 declare module 'node:process' {

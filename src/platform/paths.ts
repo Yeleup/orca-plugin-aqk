@@ -1,6 +1,7 @@
 // Paths by the rules of the machine's system: the plugin's data directory outside every repository, files in it, and
 // files in a worktree. Every path these functions return uses only the system's separator (`\` on Windows, `/`
 // elsewhere): on Windows a path from git (`C:/Users/…`) and the same path from Orca (`C:\Users\…`) come out alike.
+import { createHash } from 'node:crypto'
 import { localAppData, xdgHome } from './folders'
 import { pathsOf, type Machine } from './machine'
 
@@ -33,6 +34,21 @@ export function dataPath(machine: Pick<Machine, 'platform'>, dataDir: string, ..
     }
   }
   return nativePath(machine, pathsOf(machine).join(dataDir, ...names))
+}
+
+// A plain name inside the data directory for any id — a project's id may hold `/`, `:`, capitals or anything else: the
+// id's letters, digits, `.`, `_` and `-` (others become `-`), lower-cased, without leading `.`, `_` and `-`, cut to 40,
+// then `-` and 12 hex digits of the id's SHA-256. Two ids never share a name, also on the file systems of Windows and
+// macOS, where names have no case; the name stays the same for the same id on every system.
+export function dataName(id: string): string {
+  const readable = id
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^[._-]+/, '')
+    .slice(0, 40)
+    .replace(/[.-]+$/, '')
+  const hash = createHash('sha256').update(id, 'utf8').digest('hex').slice(0, 12)
+  return readable === '' ? hash : `${readable}-${hash}`
 }
 
 // The path in the machine's own form: on Windows forward slashes become backslashes; `.` and doubled separators go.
