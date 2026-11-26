@@ -7,7 +7,7 @@
 import { assert, test } from 'orca/testing'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
-import { join, relative } from 'node:path'
+import { join, relative, sep } from 'node:path'
 import { exportHead, nestedRun, readJson, run, tempDir, testEnv, writeExecutable } from './helpers.mjs'
 
 // A test with git repositories and processes of its own: it skips in the inner runs of the delivery tests and К14.6.
@@ -96,15 +96,15 @@ function snapshot(temp, dir) {
 
 // A fake Orca CLI: logs each call (arguments, the real path of its working directory, and of the folder it got: its real path, git's
 // top level, HEAD, status) to FAKE_ORCA_LOG and answers `plugin release-entry <dir> --json` as Orca's CLI does — the
-// entry of the folder's HEAD, the version and name of its manifest. FAKE_RELEASE_ANSWER=invalid answers plugin_invalid
-// with exit 2, =other-commit an entry of another commit.
+// entry of the folder's HEAD, the version and name of its manifest, and for a folder below the top level its path there
+// (sourcePath). FAKE_RELEASE_ANSWER=invalid answers plugin_invalid with exit 2, =other-commit an entry of another commit.
 function fakeCli(temp) {
   const dir = join(temp, 'fake-orca')
   mkdirSync(dir)
   const script = join(dir, 'fake-orca.mjs')
   writeFileSync(script, `import { appendFileSync, existsSync, readFileSync, realpathSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { join } from 'node:path'
+import { join, relative, sep } from 'node:path'
 const args = process.argv.slice(2)
 const folder = args[2]
 const git = (...a) => spawnSync('git', ['-C', folder, ...a], { encoding: 'utf8' }).stdout.trim()
@@ -123,7 +123,9 @@ const manifest = JSON.parse(readFileSync(join(folder, 'orca-plugin.json'), 'utf8
 const commit = process.env.FAKE_RELEASE_ANSWER === 'other-commit' ? '0'.repeat(40) : call.head
 const entry = { version: manifest.version, commit, contentHash: 'c'.repeat(64), execution: manifest.execution,
   minimumOrca: manifest.engines.orca.slice(2), name: manifest.name, contributes: [] }
-console.log(JSON.stringify({ ok: true, result: { path: folder, pluginKey: 'local.' + manifest.id, entry } }, null, 2))
+const result = { path: folder, pluginKey: 'local.' + manifest.id, entry }
+if (call.real !== call.toplevel) result.sourcePath = relative(call.toplevel, call.real).split(sep).join('/')
+console.log(JSON.stringify({ ok: true, result }, null, 2))
 `, 'utf8')
   const node = process.execPath
   const quote = (text) => `'${text.replaceAll("'", "'\\''")}'`
@@ -227,6 +229,36 @@ releaseTest('Релиз: чекаут по пути, который git пише
   assertInTemporaryClone(calls[0], dir, head, temp)
   assert.deepEqual([JSON.parse(result.stdout).commit, JSON.parse(result.stdout).version], [head, '0.5.0'])
   assert.deepEqual(snapshot(temp, dir), before)
+})
+
+// The plugin as a subdirectory of its repository: release-entry runs on that folder of the clone, and the command names
+// its source.path for the catalog.
+releaseTest('Релиз: плагин в подкаталоге репозитория — запись через plugin release-entry его папки во временном клоне релизного коммита, source.path для каталога в выводе, чекаут без изменений', (temp) => {
+  const repo = join(temp, 'mono')
+  mkdirSync(join(repo, 'plugins'), { recursive: true })
+  const dir = exportHead(join(repo, 'plugins'))
+  writeFileSync(join(repo, 'README.md'), 'Несколько плагинов.\n')
+  git(temp, repo, 'init', '-q', '-b', 'main')
+  git(temp, repo, 'add', '-A')
+  git(temp, repo, 'commit', '-q', '-m', 'plugins')
+  const head = git(temp, repo, 'rev-parse', 'HEAD')
+  const before = snapshot(temp, repo)
+  const fake = fakeCli(temp)
+
+  const result = release(temp, dir, [], fake.env)
+  assert.equal(result.status, 0, result.output)
+  const calls = fake.calls()
+  assert.equal(calls.length, 1, JSON.stringify(calls))
+  const [call] = calls
+  assert.equal(relative(call.toplevel, call.real).split(sep).join('/'), 'plugins/plugin', 'release-entry не на папке плагина')
+  assert.ok(!relative(realpathSync.native(join(temp, 'tmp')), call.toplevel).startsWith('..'), `клон не во временном каталоге: ${call.toplevel}`)
+  assert.equal(call.head, head, 'клон не на релизном коммите')
+  assert.equal(call.status, '', 'клон не чистый')
+  assert.equal(call.cwd, call.toplevel, 'release-entry не из клона')
+  assert.equal(existsSync(call.toplevel), false, 'временный клон остался')
+  assert.equal(JSON.parse(result.stdout).commit, head)
+  assert.match(result.stderr, /^source\.path плагина в каталоге: plugins\/plugin$/m)
+  assert.deepEqual(snapshot(temp, repo), before)
 })
 
 releaseTest('Релиз (контроль): отказ CLI, запись чужого коммита или нет такого коммита — ошибка без записи, клон убран, чекаут без изменений', (temp) => {

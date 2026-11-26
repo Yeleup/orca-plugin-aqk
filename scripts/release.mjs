@@ -84,7 +84,8 @@ function main(args) {
   const { sha, entry, result } = releaseEntry(args[0] ?? 'HEAD')
   console.log(JSON.stringify(entry, null, 2))
   console.error(`Запись каталога Orca: ${entry.name} ${entry.version}, коммит ${sha}. Рабочий чекаут не менялся.`)
-  if (result.source) console.error(`source плагина в каталоге: ${JSON.stringify(result.source)}`)
+  // A plugin in a subdirectory of its repository: Orca's CLI names it (sourcePath), the catalog needs it as source.path.
+  if (result.sourcePath) console.error(`source.path плагина в каталоге: ${result.sourcePath}`)
   console.error('В каталог Orca её вносит владелец: первой в "releases" плагина в orca-catalog.json.')
   return 0
 }
