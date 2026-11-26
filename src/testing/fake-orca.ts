@@ -8,7 +8,10 @@
 // `agent.launch` opens the agent's terminal and answers (`launchGate` holds the answer back); Orca sends the prompt on
 // its own afterwards and only logs a failure, so whether the agent got it shows only in the states the test reports for
 // it (`list`, or the worker's agent.status.changed). The CLI's `terminal send` answers like Orca's: the stage
-// `turn_started` when the agent starts a turn on the text (`turnStarts`).
+// `turn_started` when the agent starts a turn on the text (`turnStarts`); a request id it has seen replays the first
+// outcome without typing again. `cliGate` holds the CLI's answer back after the text is typed, `loseAnswers` makes it
+// type the text and then die without an answer; `terminal.close` waits for `closeGate`. Without `cli` the computer has
+// no Orca CLI at all.
 import { hostError, mockHost, type MockHost } from 'orca/testing'
 import type { Platform } from '../platform/machine'
 import { fakeClock, fakeMachine, FAKE_HOME, orcaStatusAnswer, type FakeAnswer, type FakeClock, type FakeMachine } from './fake-machine'
@@ -41,6 +44,12 @@ export type FakeOrca = {
   turnStarts: boolean
   // While set, `agent.launch` answers only once the promise settles.
   launchGate: Promise<void> | null
+  // While set, the CLI's `terminal send` answers only once the promise settles (the text is typed before).
+  cliGate: Promise<void> | null
+  // How many of the next CLI sends type the text and then end without an answer.
+  loseAnswers: number
+  // While set, `terminal.close` answers only once the promise settles.
+  closeGate: Promise<void> | null
   // The state `agents.list` reports for a terminal, and since when.
   list(terminalId: string, state: AgentState, stateStartedAt: number): void
   unlist(terminalId: string): void
@@ -55,13 +64,17 @@ function cliPath(platform: Platform, home: string): string {
   return `${home}/.local/bin/orca-ide`
 }
 
-export function fakeOrca(options: { readonly platform?: Platform; readonly results?: Record<string, unknown> } = {}): FakeOrca {
+export function fakeOrca(
+  options: { readonly platform?: Platform; readonly results?: Record<string, unknown>; readonly cli?: boolean } = {},
+): FakeOrca {
   const platform = options.platform ?? 'linux'
   const clock = fakeClock()
   const cli = cliPath(platform, FAKE_HOME[platform])
   const terminals = new Map<string, FakeTerminal>()
   const listed = new Map<string, { state: AgentState; stateStartedAt: number }>()
   let opened = 0
+  // The outcome of each request id the CLI has seen.
+  const requests = new Map<string, string>()
 
   const answer = (request: { file: string; args: readonly string[] }): FakeAnswer => {
     if (request.file !== cli) return { startError: { code: 'ENOENT', message: `spawn ${request.file} ENOENT` } }
@@ -74,6 +87,15 @@ export function fakeOrca(options: { readonly platform?: Platform; readonly resul
     }
     const handle = flag('--terminal') ?? ''
     const text = flag('--text') ?? ''
+    const requestId = flag('--retry-request')
+    const replay = requestId === undefined ? undefined : requests.get(requestId)
+    if (replay !== undefined) {
+      if (fake.loseAnswers > 0) {
+        fake.loseAnswers--
+        return { timedOut: true, signal: 'SIGKILL' }
+      }
+      return { code: 0, stdout: replay }
+    }
     const terminal = terminals.get(handle)
     if (terminal === undefined || !terminal.open) {
       return {
@@ -83,9 +105,7 @@ export function fakeOrca(options: { readonly platform?: Platform; readonly resul
     }
     terminal.typed.push(text)
     const stages = fake.turnStarts && request.args.includes('--wait-submit') ? ['input_accepted', 'turn_started'] : ['input_accepted']
-    return {
-      code: 0,
-      stdout: JSON.stringify({
+    const stdout = JSON.stringify({
         id: 'cli-2',
         ok: true,
         result: {
@@ -93,14 +113,31 @@ export function fakeOrca(options: { readonly platform?: Platform; readonly resul
             handle,
             accepted: true,
             bytesWritten: text.length + 1,
-            prompt: { requestId: `request-${terminal.typed.length}`, stages, provider: terminal.agent ?? 'unsupported', observation: 'supported' },
+            prompt: { requestId: requestId ?? `request-${terminal.typed.length}`, stages, provider: terminal.agent ?? 'unsupported', observation: 'supported' },
           },
+          mutation: { requestId: requestId ?? `request-${terminal.typed.length}`, replayed: false },
         },
-      }),
+      })
+    if (requestId !== undefined) requests.set(requestId, stdout.replace('"replayed":false', '"replayed":true'))
+    if (fake.loseAnswers > 0) {
+      fake.loseAnswers--
+      return { timedOut: true, signal: 'SIGKILL' }
     }
+    return { code: 0, stdout }
   }
 
-  const machine = fakeMachine({ platform, clock, executables: [cli], answer })
+  const base = fakeMachine({ platform, clock, executables: options.cli === false ? [] : [cli], answer })
+  const machine: FakeMachine = {
+    ...base,
+    start: async (request) => {
+      const gate = fake.cliGate
+      if (gate === null || request.args[0] !== 'terminal') return base.start(request)
+      // The text is typed at once; the answer waits.
+      const outcome = await base.start(request)
+      await gate
+      return outcome
+    },
+  }
 
   const host = mockHost({
     results: {
@@ -127,7 +164,9 @@ export function fakeOrca(options: { readonly platform?: Platform; readonly resul
         }
         return { accepted: true }
       },
-      'terminal.close': (params: { terminalId: string }) => {
+      'terminal.close': async (params: { terminalId: string }) => {
+        const gate = fake.closeGate
+        if (gate !== null) await gate
         const terminal = terminals.get(params.terminalId)
         const focused = terminal !== undefined && terminal.workspaceId === fake.focused
         if (terminal === undefined || (!terminal.byPlugin && !focused)) {
@@ -158,6 +197,9 @@ export function fakeOrca(options: { readonly platform?: Platform; readonly resul
     focused: null,
     turnStarts: true,
     launchGate: null,
+    cliGate: null,
+    loseAnswers: 0,
+    closeGate: null,
     list: (terminalId, state, stateStartedAt) => {
       listed.set(terminalId, { state, stateStartedAt })
     },

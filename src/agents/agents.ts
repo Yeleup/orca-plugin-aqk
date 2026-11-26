@@ -6,20 +6,29 @@
 //   main checkout for the start agent — in a new background terminal Orca opens there. Its task is a file in the
 //   plugin's data directory; the one-line prompt names that file and the report file beside it. Orca returns once the
 //   terminal exists and sends the prompt by itself once the agent is ready (Orca 1.4.274 only logs a prompt that does
-//   not get through), so the launch is not yet the task's delivery: the task has reached the agent once Orca reports a
-//   turn start (`working`) after the launch, or the report file appears.
-// - state: working, blocked, waiting or done — the newest by the time the state began: `agents.list` gives it
-//   (`stateStartedAt`), `agent.status.changed` gives the main agent's (`mainAgent.stateStartedAt`) and otherwise only
-//   when Orca got the status (`receivedAt`).
-// - report: each input of the plugin — the task, then each message — names a report file of its own. The report is
-//   ready only when the agent is in Orca's «done» that began after the last input AND that input's report file exists;
-//   a report of an earlier input never counts for a later one.
-// - delivery: an input the agent has not started on (no turn start seen, no report file) DELIVERY_DEADLINE_MS after it
-//   was given counts as not delivered: the report says so, the reason for «сбой агента».
-// - message: typed into the agent's terminal through Orca's CLI (src/platform/orca-terminal.ts) — the plugin API types
-//   only into a terminal of the focused worktree — as one line naming the message's file and its report file.
+//   not get through), so the launch is not yet the task's delivery.
+// - delivery: an input of the plugin — the task, then each message — has reached the agent once Orca shows the agent
+//   start a turn (`working`) after it, the CLI saw the turn start, or the input's report file appears; the plugin keeps
+//   that on disk (started-<n>), so a restart of the worker does not forget it. An input the agent has not started on
+//   DELIVERY_DEADLINE_MS after it is reported with what Orca shows of the agent (`blocked` — it waits for a person;
+//   anything else — the input did not reach it), the reason for «сбой агента».
+// - state: working, blocked, waiting or done. When `agents.list` lists the agent, its answer is Orca's current state and
+//   counts (with `stateStartedAt`); otherwise the latest `agent.status.changed`, whose start is known only from the
+//   main agent's state (`mainAgent.stateStartedAt`).
+// - report: each input names a report file of its own. The report is ready only when the agent is in a «done» that
+//   began after the last input — or, for an event without its start, that Orca reported after the agent's turn on the
+//   input — AND that input's report file exists; a report of an earlier input never counts for a later one.
+// - message: its text goes into a file; one line naming that file and the report file is typed into the agent's
+//   terminal through Orca's CLI (src/platform/orca-terminal.ts) — one way for every terminal of an agent, in a
+//   background worktree or the active one; the host API's `terminal.sendText` is never called, and the focus of
+//   Orca's window never moves for a message. Only into the terminal of an agent the plugin launched: the terminal must
+//   be the one of the launch's record, or nothing runs. Without the CLI (not found, not answering) or when Orca refuses,
+//   nothing is typed and the message is an error with the reason. The send is recorded with its request id before the
+//   line is typed; while its
+//   outcome is unknown (the answer is pending or was lost) the report waits, and the plugin asks Orca again with the
+//   same request id, which replays the outcome instead of typing the line twice.
 // - stop: closes the terminals the plugin opened for this task, and no other terminal; it waits for the task's launches
-//   still waiting for Orca, so an agent being launched cannot outlive the stop.
+//   still waiting for Orca, and a launch of the task asked for while the stop runs is refused.
 // - an agent Orca does not know, or a launch that fails: an error naming the agent and the reason (by it the later
 //   tasks block the task with «сбой агента»); for an agent Orca does not know Orca starts nothing.
 //
@@ -28,11 +37,14 @@
 // - task.md — the task the agent got, and report.md — its report, which the agent writes;
 // - launching.json — role, agent, language, workspace and time, written before Orca is asked; launch.json — Orca's
 //   answer: the terminal it opened, or null and the error;
-// - message-<k>.md — a message's text, report-<k>.md — the agent's report on it; message-<k>.json — the message's time,
-//   files and whether Orca saw it start a turn, once the agent's terminal took it;
+// - message-<k>.md — a message's text, report-<k>.md — the agent's report on it; sending-<k>.json — the line, its
+//   request id and time, written before the line is typed; message-<k>.json — the outcome: whether the terminal took
+//   it and whether Orca saw a turn start;
+// - started-0 (the task), started-<k> (message k) — when the agent was seen starting on that input;
 // - closed — the plugin has closed the agent's terminal.
 // Every file is created once and never rewritten, so the records survive a restart of the worker: a new worker stops
 // the agents an earlier one launched.
+import { randomUUID } from 'node:crypto'
 import type { OrcaWorkerApi, PluginEvents } from 'orca/worker'
 import type { GithubLanguage } from '../github-texts/catalog'
 import { errorCode, errorMessage, type Machine } from '../platform/machine'
@@ -128,8 +140,8 @@ export type LaunchFailure = {
 
 export type LaunchResult = { readonly ok: true; readonly launch: AgentLaunch } | LaunchFailure
 
-// An agent's state and when it began (Orca's clock; for an event without the main agent's state, when Orca got it).
-export type StateReading = { readonly state: AgentState; readonly since: number }
+// An agent's state and when it began; null when Orca did not say (an event without the main agent's state).
+export type StateReading = { readonly state: AgentState; readonly since: number | null }
 
 export type ReportReading =
   | { readonly ready: true; readonly text: string; readonly reportFile: string }
@@ -142,14 +154,21 @@ export type ReportReading =
       // The report file of the last input, and whether it exists.
       readonly reportFile: string
       readonly reportExists: boolean
-      // Set when the agent has not started on the last input DELIVERY_DEADLINE_MS after it: it did not reach the agent.
-      readonly failure: string | null
+      // While the last message's outcome is unknown — the plugin is still typing it, or Orca's answer was lost and
+      // asking again failed — why; the report waits until Orca answers.
+      readonly unresolved: string | null
+      // When the agent has not started on the last input DELIVERY_DEADLINE_MS after it: what Orca shows of the agent
+      // (`blocked`: it waits for a person, e.g. a permission or trust prompt; anything else or null: the input did not
+      // reach it) and the reason in words.
+      readonly failure: { readonly state: AgentState | null; readonly error: string } | null
     }
 
 export type MessageResult =
   // `reportFile`: where the agent writes its report on this message; `started`: Orca saw it start a turn on it.
   | { readonly ok: true; readonly reportFile: string; readonly started: boolean }
-  | { readonly ok: false; readonly error: string }
+  // `not-sent`: nothing was typed. `unknown`: the line may have been typed; the report waits, and the plugin asks Orca
+  // again with the same request id (report) — it is not to be sent anew.
+  | { readonly ok: false; readonly outcome: 'not-sent' | 'unknown'; readonly error: string }
 
 export type StopResult = {
   // The terminals closed now (or found already gone), in the order of their launches.
@@ -162,17 +181,33 @@ type WorkerHost = OrcaWorkerApi['host']
 
 type LaunchingJson = { role: AgentRole; agent: string; language: GithubLanguage; workspaceId: string; launchedAt: number }
 type LaunchJson = { terminalId: string | null; error: string | null }
-type MessageJson = { sentAt: number; messageFile: string; reportFile: string; turnStarted: boolean }
+type SendingJson = { sentAt: number; line: string; requestId: string; reportFile: string }
+type OutcomeJson = { taken: boolean; turnStarted: boolean; error: string | null }
 
-// An input of the plugin to the agent: its task, or a message.
-type Input = { readonly what: 'task' | 'message'; readonly at: number; readonly reportFile: string; readonly turnStarted: boolean }
+// An input of the plugin to the agent: its task (n = 0) or message n.
+type Input = {
+  readonly n: number
+  readonly at: number
+  readonly reportFile: string
+  // Message: its send, and whether its outcome is recorded.
+  readonly sending: SendingJson | null
+  readonly resolved: boolean
+  // Whether the agent was seen starting on it: the CLI's receipt, or the started-<n> mark.
+  readonly started: boolean
+}
+
+// What the worker last heard of an agent's state: `since` — when the state began, null when Orca did not say;
+// `seq` — the order in which this worker heard it.
+type Observation = { readonly state: AgentState; readonly since: number | null; readonly seq: number }
 
 export type AgentsOptions = {
   readonly host: WorkerHost
   readonly machine: Machine
   readonly dataDir: string
-  // Typing into an agent's terminal (by default through this computer's Orca CLI).
+  // Typing a line into an agent's terminal (by default through this computer's Orca CLI).
   readonly terminalInput: TerminalInput
+  // The request id of a message's send (by default a random UUID).
+  readonly newRequestId?: () => string
 }
 
 // The layer for one worker: `onStatus` takes Orca's `agent.status.changed` (startAgents subscribes it).
@@ -181,35 +216,47 @@ export class Agents {
   private readonly machine: Machine
   private readonly dataDir: string
   private readonly terminalInput: TerminalInput
-  // The newest state Orca has reported for each terminal.
-  private readonly states = new Map<string, StateReading>()
-  // When the agent of each terminal last started a turn: the start of the newest «working» Orca reported.
-  private readonly turns = new Map<string, number>()
-  // The launches still waiting for Orca, by the task's directory.
+  private readonly newRequestId: () => string
+  private seq = 0
+  // The latest state Orca reported in an event, for each terminal.
+  private readonly events = new Map<string, Observation>()
+  // The newest turn start the worker saw for each terminal (`working`: when it began, or when Orca got it), and when.
+  private readonly turns = new Map<string, { readonly at: number; readonly seq: number }>()
+  // The launches this worker knows, by terminal: a turn start seen in an event is kept on disk for the right input.
+  private readonly known = new Map<string, AgentLaunch>()
+  // The messages being typed now (their directory and number).
+  private readonly sending = new Set<string>()
+  // The launches still waiting for Orca, and the stops under way, by the task's directory.
   private readonly pending = new Map<string, Set<Promise<LaunchResult>>>()
+  private readonly stopping = new Map<string, number>()
 
   constructor(options: AgentsOptions) {
     this.host = options.host
     this.machine = options.machine
     this.dataDir = options.dataDir
     this.terminalInput = options.terminalInput
+    this.newRequestId = options.newRequestId ?? randomUUID
   }
 
-  // Launches the agent of `request.role` from the project's agents. Until it settles, a stop of the task waits for it.
+  // Launches the agent of `request.role` from the project's agents. Until it settles, a stop of the task waits for it;
+  // while a stop of the task runs, it is refused.
   launch(request: LaunchRequest): Promise<LaunchResult> {
-    let key: string
-    try {
-      key = this.taskDir(request.task)
-    } catch (error) {
-      const agent = request.agents[request.role]
-      return Promise.resolve({
+    const agent = request.agents[request.role]
+    const refuse = (reason: string): Promise<LaunchResult> =>
+      Promise.resolve({
         ok: false,
         kind: 'launch-failed',
         role: request.role,
         agent,
-        error: `the agent "${agent}" (agents.${request.role} in ${SETTINGS_FILE}) was not launched: ${errorMessage(error)}`,
+        error: `the agent "${agent}" (agents.${request.role} in ${SETTINGS_FILE}) was not launched: ${reason}`,
       })
+    let key: string
+    try {
+      key = this.taskDir(request.task)
+    } catch (error) {
+      return refuse(errorMessage(error))
     }
+    if ((this.stopping.get(key) ?? 0) > 0) return refuse(`the agents of ${request.task.key} are being stopped`)
     const running = this.runLaunch(request)
     const set = this.pending.get(key) ?? new Set<Promise<LaunchResult>>()
     set.add(running)
@@ -222,107 +269,142 @@ export class Agents {
     return running
   }
 
-  // Orca's event `agent.status.changed`: the state of the agent in the event's terminal, with the time the main agent's
-  // state began when the event has it.
+  // Orca's event `agent.status.changed`: the state of the agent in the event's terminal. A turn start of a launch the
+  // worker knows is kept on disk at once.
   onStatus(event: PluginEvents['agent.status.changed']): void {
     if (!event.terminalId) return
     const main = event.mainAgent
-    const since = main !== undefined && main.state === event.state ? main.stateStartedAt : event.receivedAt
-    this.remember(event.terminalId, { state: event.state, since })
-  }
-
-  // The agent's state: the newest, by the time it began, of what Orca reported in its events and what `agents.list` of
-  // the agent's workspace says now (an event may come without the terminal, an agent may leave the list once it ends).
-  // Null: Orca has said nothing about it. Rejects with Orca's error when the list cannot be read.
-  async state(launch: AgentLaunch): Promise<StateReading | null> {
-    const { agents } = await this.host.call('agents.list', { workspaceId: launch.workspaceId })
-    const listed = agents.find((agent) => agent.terminalId === launch.terminalId)
-    if (listed !== undefined) this.remember(launch.terminalId, { state: listed.state, since: listed.stateStartedAt })
-    return this.states.get(launch.terminalId) ?? null
-  }
-
-  // The report on the plugin's last input to the agent (its task, or the last message): ready only when the agent is
-  // in a «done» that began after that input and that input's report file exists.
-  async report(launch: AgentLaunch): Promise<ReportReading> {
-    const input = this.lastInput(launch)
-    const reading = await this.state(launch)
-    const text = this.machine.readText(input.reportFile)
-    if (text !== null && reading !== null && reading.state === 'done' && reading.since >= input.at) {
-      return { ready: true, text, reportFile: input.reportFile }
+    const since = main !== undefined && main.state === event.state ? main.stateStartedAt : null
+    const heard: Observation = { state: event.state, since, seq: ++this.seq }
+    const latest = this.events.get(event.terminalId)
+    // A state that began before the one already heard, both with their starts, is an old one arriving late.
+    if (latest === undefined || latest.since === null || since === null || since >= latest.since) {
+      this.events.set(event.terminalId, heard)
     }
-    const turn = this.turns.get(launch.terminalId)
-    const started = input.turnStarted || (turn !== undefined && turn >= input.at) || text !== null
-    const late = !started && this.machine.now() - input.at >= DELIVERY_DEADLINE_MS
-    const failure = late
-      ? `${input.what === 'task' ? 'the task' : 'the message'} did not reach the agent "${launch.agent}" in terminal ${launch.terminalId}: Orca saw it start no turn in ${DELIVERY_DEADLINE_MS / 60_000} minutes (its state: ${reading?.state ?? 'none'})`
-      : null
-    return { ready: false, state: reading?.state ?? null, started, reportFile: input.reportFile, reportExists: text !== null, failure }
+    if (event.state === 'working') this.noteTurn(event.terminalId, since ?? event.receivedAt, heard.seq)
   }
 
-  // A message to the agent: its text goes into the file message-<k>.md of the launch, and the agent's terminal gets
-  // one line — typed through Orca's CLI, with Enter — naming that file and the report file report-<k>.md.
+  // The agent's state: what `agents.list` of its workspace says now when it lists the agent — Orca's current state —
+  // otherwise the latest state of Orca's events (an agent may leave the list once it ends). Null: Orca has said nothing
+  // about it. Rejects with Orca's error when the list cannot be read.
+  async state(launch: AgentLaunch): Promise<StateReading | null> {
+    const seen = await this.observe(launch)
+    return seen === null ? null : { state: seen.state, since: seen.since }
+  }
+
+  // The report on the plugin's last input to the agent (its task, or the last message whose terminal took it): ready
+  // only when the agent is in a «done» after that input and that input's report file exists. While the last message's
+  // outcome is unknown, the report waits; when no send of it is under way, Orca is asked again with the same request id.
+  async report(launch: AgentLaunch): Promise<ReportReading> {
+    this.known.set(launch.terminalId, launch)
+    let input = this.lastInput(launch)
+    if (input.sending !== null && !input.resolved) {
+      if (this.sending.has(`${launch.dir}#${input.n}`)) {
+        return this.held(launch, input, `message ${input.n} is being typed into the agent's terminal`)
+      }
+      const asked = await this.deliver(launch, input.n, input.sending)
+      input = this.lastInput(launch)
+      if (input.sending !== null && !input.resolved) {
+        return this.held(launch, input, `the outcome of message ${input.n} is unknown: ${asked.ok ? 'not recorded' : asked.error}`)
+      }
+    }
+    const seen = await this.observe(launch)
+    const text = this.machine.readText(input.reportFile)
+    const turn = this.turns.get(launch.terminalId)
+    const turnAfter = turn !== undefined && turn.at >= input.at
+    const started = input.started || turnAfter || text !== null
+    if (started && !input.started) await this.markStarted(launch, input.n)
+    const done =
+      seen !== null &&
+      seen.state === 'done' &&
+      (seen.since !== null ? seen.since >= input.at : turnAfter && turn !== undefined && seen.seq > turn.seq)
+    if (text !== null && done) return { ready: true, text, reportFile: input.reportFile }
+    const late = !started && this.machine.now() - input.at >= DELIVERY_DEADLINE_MS
+    const state = seen?.state ?? null
+    const failure = late
+      ? {
+          state,
+          error: `${input.n === 0 ? 'the task' : `message ${input.n}`} did not start a turn of the agent "${launch.agent}" in terminal ${launch.terminalId} in ${DELIVERY_DEADLINE_MS / 60_000} minutes (Orca shows it ${state ?? 'nowhere'}${state === 'blocked' ? ': it waits for a person' : ''})`,
+        }
+      : null
+    return { ready: false, state, started, reportFile: input.reportFile, reportExists: text !== null, unresolved: null, failure }
+  }
+
+  // A message to the agent: its text goes into the file message-<k>.md of the launch, and one line naming that file
+  // and the report file report-<k>.md is typed into the agent's terminal through Orca's CLI, with Enter. Only into the
+  // terminal of this launch's record: another terminal (the owner's, another agent's) is an error, and nothing runs.
   async message(launch: AgentLaunch, text: string): Promise<MessageResult> {
-    if (text.trim() === '') return { ok: false, error: 'the message is empty' }
-    if (this.isClosed(launch)) return { ok: false, error: `the plugin has closed the agent's terminal ${launch.terminalId}` }
+    const notSent = (error: string): MessageResult => ({ ok: false, outcome: 'not-sent', error })
+    if (text.trim() === '') return notSent('the message is empty')
+    const recorded = parseLaunch(this.machine.readText(dataPath(this.machine, launch.dir, LAUNCH_FILE)))
+    if (recorded === null || recorded.terminalId !== launch.terminalId) {
+      return notSent(
+        `the terminal ${launch.terminalId} is not the terminal of the plugin's launch in ${launch.dir}${recorded === null ? ' (the launch has no record)' : ''}: nothing is typed into it`,
+      )
+    }
+    if (this.isClosed(launch)) return notSent(`the plugin has closed the agent's terminal ${launch.terminalId}`)
+    this.known.set(launch.terminalId, launch)
     let k: number
     try {
       k = await this.reserve(launch.dir, (n) => `message-${n}.md`, () => text)
     } catch (error) {
-      return { ok: false, error: `the message could not be written to the data directory: ${errorMessage(error)}` }
+      return notSent(`the message could not be written to the data directory: ${errorMessage(error)}`)
     }
-    const messageFile = dataPath(this.machine, launch.dir, `message-${k}.md`)
     const reportFile = dataPath(this.machine, launch.dir, `report-${k}.md`)
+    const line = messageLine(launch.language, dataPath(this.machine, launch.dir, `message-${k}.md`), reportFile)
     // Any turn the agent starts from now on may be on this message.
-    const sentAt = this.machine.now()
-    const sent = await this.terminalInput(launch.terminalId, messageLine(launch.language, messageFile, reportFile))
-    if (!sent.ok) return { ok: false, error: `the message did not go into the agent's terminal ${launch.terminalId}: ${sent.error}` }
-    if (!sent.accepted) {
-      return { ok: false, error: `the agent's terminal ${launch.terminalId} did not take the message: ${sent.refusedReason}` }
-    }
+    const sending: SendingJson = { sentAt: this.machine.now(), line, requestId: this.newRequestId(), reportFile }
     try {
-      await this.createJson(launch.dir, `message-${k}.json`, { sentAt, messageFile, reportFile, turnStarted: sent.turnStarted })
+      await this.createJson(launch.dir, `sending-${k}.json`, sending)
     } catch (error) {
-      // Without its record the message is not the agent's last input, and an earlier report would count for it.
-      return { ok: false, error: `the message went into the agent's terminal, but could not be recorded: ${errorMessage(error)}` }
+      return notSent(`the message's send could not be recorded: ${errorMessage(error)}`)
     }
-    return { ok: true, reportFile, started: sent.turnStarted }
+    return this.deliver(launch, k, sending)
   }
 
-  // Stops the agents of the task: first waits for the task's launches still waiting for Orca, then closes every
-  // terminal the plugin opened for the task and has not closed yet — and no other terminal. A terminal Orca refuses to
-  // close counts as closed when its workspace no longer lists it. A launch whose answer from Orca was never recorded
-  // (the worker stopped while it was being launched) is reported: its terminal, if any, is unknown.
+  // Stops the agents of the task: refuses its new launches while it runs, waits for its launches still waiting for
+  // Orca, then closes every terminal the plugin opened for the task and has not closed yet — and no other terminal. A
+  // terminal Orca refuses to close counts as closed when its workspace no longer lists it. A launch whose answer from
+  // Orca was never recorded (the worker stopped while it was being launched) is reported: its terminal is unknown.
   async stop(task: TaskRef): Promise<StopResult> {
-    await Promise.all([...(this.pending.get(this.taskDir(task)) ?? [])])
-    const closed: string[] = []
-    const failed: { launch: number; terminalId: string | null; error: string }[] = []
-    for (const record of this.launches(task)) {
-      if (record.outcome === 'pending') {
-        failed.push({
-          launch: record.number,
-          terminalId: null,
-          error: `Orca's answer to launch ${record.number} (the agent "${record.agent}") is not recorded: the worker stopped while it was being launched, and its terminal, if any, is unknown`,
-        })
-        continue
-      }
-      if (record.terminalId === null || record.closed) continue
-      const terminalId = record.terminalId
-      try {
-        await this.host.call('terminal.close', { terminalId })
-      } catch (error) {
-        if (!(await this.isGone(record.workspaceId, terminalId))) {
-          failed.push({ launch: record.number, terminalId, error: hostErrorText(error) })
+    const key = this.taskDir(task)
+    this.stopping.set(key, (this.stopping.get(key) ?? 0) + 1)
+    try {
+      await Promise.all([...(this.pending.get(key) ?? [])])
+      const closed: string[] = []
+      const failed: { launch: number; terminalId: string | null; error: string }[] = []
+      for (const record of this.launches(task)) {
+        if (record.outcome === 'pending') {
+          failed.push({
+            launch: record.number,
+            terminalId: null,
+            error: `Orca's answer to launch ${record.number} (the agent "${record.agent}") is not recorded: the worker stopped while it was being launched, and its terminal, if any, is unknown`,
+          })
           continue
         }
+        if (record.terminalId === null || record.closed) continue
+        const terminalId = record.terminalId
+        try {
+          await this.host.call('terminal.close', { terminalId })
+        } catch (error) {
+          if (!(await this.isGone(record.workspaceId, terminalId))) {
+            failed.push({ launch: record.number, terminalId, error: hostErrorText(error) })
+            continue
+          }
+        }
+        try {
+          await this.machine.createText(dataPath(this.machine, record.dir, CLOSED_FILE), `${this.machine.now()}\n`)
+        } catch {
+          // The terminal is closed all the same; the next stop finds it gone.
+        }
+        closed.push(terminalId)
       }
-      try {
-        await this.machine.createText(dataPath(this.machine, record.dir, CLOSED_FILE), `${this.machine.now()}\n`)
-      } catch {
-        // The terminal is closed all the same; the next stop finds it gone.
-      }
-      closed.push(terminalId)
+      return { closed, failed }
+    } finally {
+      const left = (this.stopping.get(key) ?? 1) - 1
+      if (left > 0) this.stopping.set(key, left)
+      else this.stopping.delete(key)
     }
-    return { closed, failed }
   }
 
   // Every launch of the task the data directory keeps, in order.
@@ -395,22 +477,103 @@ export class Agents {
         `the agent "${agent}" (${field}) was launched, but its launch could not be recorded (${errorMessage(error)}); ${closing}`,
       )
     }
-    return { ok: true, launch: { ...files, task: request.task, number, role, agent, language, workspaceId, launchedAt, terminalId } }
+    const launch: AgentLaunch = { ...files, task: request.task, number, role, agent, language, workspaceId, launchedAt, terminalId }
+    this.known.set(terminalId, launch)
+    return { ok: true, launch }
   }
 
-  private remember(terminalId: string, reading: StateReading): void {
-    const known = this.states.get(terminalId)
-    if (known === undefined || reading.since >= known.since) this.states.set(terminalId, reading)
-    if (reading.state === 'working') this.turns.set(terminalId, Math.max(this.turns.get(terminalId) ?? reading.since, reading.since))
+  // Types the recorded line of message k into the agent's terminal as its request, and records the outcome Orca gives:
+  // the first time, or again after an answer that was lost (the same request id replays it).
+  private async deliver(launch: AgentLaunch, k: number, sending: SendingJson): Promise<MessageResult> {
+    const key = `${launch.dir}#${k}`
+    this.sending.add(key)
+    try {
+      const sent = await this.terminalInput(launch.terminalId, sending.line, sending.requestId)
+      const outcome = (value: OutcomeJson) => this.createJson(launch.dir, `message-${k}.json`, value)
+      if (!sent.ok) {
+        const error = `message ${k} into the agent's terminal ${launch.terminalId}: ${sent.error}`
+        if (sent.delivery === 'unknown') return { ok: false, outcome: 'unknown', error: `the outcome of ${error} is unknown` }
+        await outcome({ taken: false, turnStarted: false, error: sent.error }).catch(() => false)
+        return { ok: false, outcome: 'not-sent', error: `${error}: not sent` }
+      }
+      if (!sent.accepted) {
+        await outcome({ taken: false, turnStarted: false, error: sent.refusedReason }).catch(() => false)
+        return { ok: false, outcome: 'not-sent', error: `the agent's terminal ${launch.terminalId} did not take message ${k}: ${sent.refusedReason}` }
+      }
+      try {
+        await outcome({ taken: true, turnStarted: sent.turnStarted, error: null })
+      } catch (error) {
+        // Unrecorded, the message is not the agent's last input; the report waits and asks Orca again.
+        return { ok: false, outcome: 'unknown', error: `message ${k} went into the agent's terminal, but its outcome could not be recorded: ${errorMessage(error)}` }
+      }
+      if (sent.turnStarted) await this.markStarted(launch, k)
+      return { ok: true, reportFile: sending.reportFile, started: sent.turnStarted }
+    } finally {
+      this.sending.delete(key)
+    }
   }
 
-  // The plugin's last input to the agent: the newest message its terminal took, or else the task.
+  private held(launch: AgentLaunch, input: Input, why: string): ReportReading {
+    const text = this.machine.readText(input.reportFile)
+    return {
+      ready: false,
+      state: this.events.get(launch.terminalId)?.state ?? null,
+      started: input.started,
+      reportFile: input.reportFile,
+      reportExists: text !== null,
+      unresolved: why,
+      failure: null,
+    }
+  }
+
+  // What Orca shows of the agent now: its entry in `agents.list`, else the latest event.
+  private async observe(launch: AgentLaunch): Promise<Observation | null> {
+    this.known.set(launch.terminalId, launch)
+    const { agents } = await this.host.call('agents.list', { workspaceId: launch.workspaceId })
+    const listed = agents.find((agent) => agent.terminalId === launch.terminalId)
+    if (listed === undefined) return this.events.get(launch.terminalId) ?? null
+    const seen: Observation = { state: listed.state, since: listed.stateStartedAt, seq: ++this.seq }
+    if (listed.state === 'working') this.noteTurn(launch.terminalId, listed.stateStartedAt, seen.seq)
+    return seen
+  }
+
+  private noteTurn(terminalId: string, at: number, seq: number): void {
+    // The same turn seen again keeps the order in which it was first heard.
+    const known = this.turns.get(terminalId)
+    if (known === undefined || at > known.at) this.turns.set(terminalId, { at, seq })
+    const launch = this.known.get(terminalId)
+    if (launch === undefined) return
+    const input = this.lastInput(launch)
+    if (!input.started && (input.sending === null || input.resolved) && at >= input.at) void this.markStarted(launch, input.n)
+  }
+
+  // Keeps on disk that the agent was seen starting on input n.
+  private async markStarted(launch: AgentLaunch, n: number): Promise<void> {
+    try {
+      await this.machine.createText(dataPath(this.machine, launch.dir, `started-${n}`), `${this.machine.now()}\n`)
+    } catch {
+      // Not kept: the next report sees the start again, or the report file.
+    }
+  }
+
+  // The plugin's last input to the agent: the newest message whose send is recorded and not refused, or else the task.
   private lastInput(launch: AgentLaunch): Input {
-    let last: Input = { what: 'task', at: launch.launchedAt, reportFile: launch.reportFile, turnStarted: false }
+    const started = (n: number) => this.machine.readText(dataPath(this.machine, launch.dir, `started-${n}`)) !== null
+    let last: Input = { n: 0, at: launch.launchedAt, reportFile: launch.reportFile, sending: null, resolved: true, started: started(0) }
     for (let n = 1; n <= MAX_RECORDS; n++) {
       if (this.machine.readText(dataPath(this.machine, launch.dir, `message-${n}.md`)) === null) break
-      const json = parseMessage(this.machine.readText(dataPath(this.machine, launch.dir, `message-${n}.json`)))
-      if (json !== null) last = { what: 'message', at: json.sentAt, reportFile: json.reportFile, turnStarted: json.turnStarted }
+      const sending = parseSending(this.machine.readText(dataPath(this.machine, launch.dir, `sending-${n}.json`)))
+      if (sending === null) continue
+      const outcome = parseOutcome(this.machine.readText(dataPath(this.machine, launch.dir, `message-${n}.json`)))
+      if (outcome !== null && !outcome.taken) continue
+      last = {
+        n,
+        at: sending.sentAt,
+        reportFile: sending.reportFile,
+        sending,
+        resolved: outcome !== null,
+        started: (outcome?.turnStarted ?? false) || started(n),
+      }
     }
     return last
   }
@@ -459,7 +622,7 @@ export class Agents {
     throw new Error(`more than ${MAX_RECORDS} files in ${dir}`)
   }
 
-  private createJson(dir: string, name: string, value: LaunchingJson | LaunchJson | MessageJson): Promise<boolean> {
+  private createJson(dir: string, name: string, value: LaunchingJson | LaunchJson | SendingJson | OutcomeJson): Promise<boolean> {
     return this.machine.createText(dataPath(this.machine, dir, name), `${JSON.stringify(value, null, 2)}\n`)
   }
 }
@@ -526,12 +689,20 @@ function parseLaunch(text: string | null): LaunchJson | null {
   return { terminalId, error }
 }
 
-function parseMessage(text: string | null): MessageJson | null {
+function parseSending(text: string | null): SendingJson | null {
   const json = parseJson(text)
   if (json === null) return null
-  const { sentAt, messageFile, reportFile, turnStarted } = json
-  if (typeof sentAt !== 'number' || typeof messageFile !== 'string' || typeof reportFile !== 'string' || typeof turnStarted !== 'boolean') {
+  const { sentAt, line, requestId, reportFile } = json
+  if (typeof sentAt !== 'number' || typeof line !== 'string' || typeof requestId !== 'string' || typeof reportFile !== 'string') {
     return null
   }
-  return { sentAt, messageFile, reportFile, turnStarted }
+  return { sentAt, line, requestId, reportFile }
+}
+
+function parseOutcome(text: string | null): OutcomeJson | null {
+  const json = parseJson(text)
+  if (json === null) return null
+  const { taken, turnStarted, error } = json
+  if (typeof taken !== 'boolean' || typeof turnStarted !== 'boolean' || (error !== null && typeof error !== 'string')) return null
+  return { taken, turnStarted, error }
 }

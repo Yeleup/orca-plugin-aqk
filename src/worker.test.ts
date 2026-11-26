@@ -141,7 +141,8 @@ test('воркер слушает agent.status.changed: событие дохо�
     state: 'working',
     receivedAt: orca.clock.now() + 1_000,
   })
-  assert.deepEqual(await started.agents.state(launch), { state: 'working', since: orca.clock.now() + 1_000 })
+  // The event has no main agent's state: when the state began is not known.
+  assert.deepEqual(await started.agents.state(launch), { state: 'working', since: null })
   const after = await started.agents.report(launch)
   assert.ok(!after.ready && after.state === 'working' && after.started, JSON.stringify(after))
   assert.deepEqual(worker.refusals, [])

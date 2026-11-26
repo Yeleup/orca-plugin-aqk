@@ -1,87 +1,120 @@
-// Typing into an Orca terminal by its handle through Orca's CLI (`terminal send`). The plugin API cannot do it for the
-// agents of the queue: in Orca 1.4.274 the host's `terminal.sendText` takes only a terminal of the focused worktree
-// and refuses any other with «terminal is outside the active worktree», while every agent the plugin launches runs in
-// the background, in a worktree the owner is usually not looking at. The CLI's `terminal send` reaches any live
-// terminal by the handle Orca's runtime issued — the very id `agent.launch` returns — and, for an agent, reports
-// whether the prompt started a turn (TZ «Интеграции»: the CLI covers what the plugin API of 1.4.273 lacks).
+// Typing a line into an Orca terminal by its handle through Orca's CLI (`terminal send`). Every message of the plugin
+// to an agent goes this one way, whether the agent's worktree is in the background or the active one (decision «🤖
+// Решение по #10: вопрос», variant A): the host API's `terminal.sendText` of Orca 1.4.274 types only into a terminal
+// of the active worktree and does not tell whether the agent started a turn, so the plugin never calls it, and never
+// moves the focus of Orca's window for a message. The CLI's `terminal send` reaches any live terminal by the handle
+// Orca's runtime issued — the very id `agent.launch` returns — and, for an agent, reports whether the text started a
+// turn. Since it reaches any terminal, the agents layer types only into the terminals of the agents it launched
+// (src/agents/agents.ts). The CLI is the one the plugin finds by Ф14 (src/platform/orca-cli.ts); without it nothing is
+// typed and the result says why.
 //
-// `orca terminal send --terminal <handle> --text <text> --enter --wait-submit <s> --json` answers
-// `{ ok: true, result: { send: { handle, accepted, refusedReason?, prompt?: { stages, observation, … } } } }` — the
-// stages are `input_accepted`, then `turn_started` once Orca saw the agent start a turn — or `{ ok: false, error: {
-// code, message } }` with exit 1 (for example `terminal_handle_stale` for a handle no terminal has). An Orca without
-// --wait-submit refuses it with `incompatible_runtime` before sending anything; the text then goes without it.
+// `orca terminal send --terminal <handle> --text <line> --enter --retry-request <id> --wait-submit <s> --json` answers
+// `{ ok: true, result: { send: { handle, accepted, refusedReason?, prompt?: { requestId, stages, … } }, mutation: {
+// requestId, replayed } } }` — the stages are `input_accepted`, then `turn_started` once Orca saw the agent start a turn
+// — or `{ ok: false, error: { code, message } }` with exit 1. The request id is the plugin's own UUID: the same command
+// with the same id again replays the first one's outcome instead of typing the line twice (`replayed: true`), so a
+// send whose answer was lost is asked about again safely. An Orca that cannot honor --retry-request or --wait-submit
+// refuses before typing anything (`incompatible_runtime`); the line then goes without them, as a send that cannot be
+// asked about again.
 import type { Machine } from './machine'
 import { findOrcaCli } from './orca-cli'
 import { runProgram, type RunResult } from './run'
 
-// How long `terminal send` waits to see the prompt start a turn.
+// How long `terminal send` waits to see the line start a turn.
 export const WAIT_SUBMIT_SECONDS = 30
+
+// Orca's refusals after which nothing was typed: the terminal is gone, the request is wrong, the host is unreachable,
+// or the agent shows a permission or trust prompt that only a person answers.
+const NOT_SENT_CODES = new Set(['terminal_handle_stale', 'invalid_argument', 'runtime_unavailable', 'agent_prompt_blocked'])
 
 export type TerminalSendResult =
   | {
       readonly ok: true
-      // Whether the terminal took the text; when not, Orca's reason.
+      // Whether the terminal took the line; when not, Orca's reason.
       readonly accepted: boolean
       readonly refusedReason: string | null
-      // Whether Orca saw the agent start a turn on the text within the wait.
+      // Whether Orca saw the agent start a turn on the line within the wait.
       readonly turnStarted: boolean
     }
-  // The CLI could not be found or run, or Orca refused the request: nothing is known to have been typed.
-  | { readonly ok: false; readonly error: string }
+  // `not-sent`: nothing was typed (no CLI, Orca refused). `unknown`: the line may have been typed — the answer was lost
+  // or Orca failed after taking the request; the same request id asks about it again.
+  | { readonly ok: false; readonly delivery: 'not-sent' | 'unknown'; readonly error: string }
 
-// Types `text` and Enter into the terminal `terminalId`.
-export type TerminalInput = (terminalId: string, text: string) => Promise<TerminalSendResult>
+// Types `line` and Enter into the terminal `terminalId` as the request `requestId` (a UUID).
+export type TerminalInput = (terminalId: string, line: string, requestId: string) => Promise<TerminalSendResult>
 
-// The terminal input of this computer's Orca CLI, found once (src/platform/orca-cli.ts) and kept while it answers.
+// The terminal input of this computer's Orca CLI, found once (src/platform/orca-cli.ts) and kept while it runs.
 export function orcaCliTerminalInput(machine: Machine): TerminalInput {
   let cli: string | null = null
-  return async (terminalId, text) => {
+  return async (terminalId, line, requestId) => {
     if (cli === null) {
       const search = await findOrcaCli(machine)
-      if (!search.found) return { ok: false, error: `Orca's CLI is not found: ${search.reason}` }
+      if (!search.found) return { ok: false, delivery: 'not-sent', error: `Orca's CLI is not found: ${search.reason}` }
       cli = search.file
     }
-    const send = (wait: boolean) =>
+    const file = cli
+    const send = (durable: boolean) =>
       runProgram(
         machine,
-        cli ?? '',
-        ['terminal', 'send', '--terminal', terminalId, '--text', text, '--enter', ...(wait ? ['--wait-submit', String(WAIT_SUBMIT_SECONDS)] : []), '--json'],
+        file,
+        [
+          'terminal',
+          'send',
+          '--terminal',
+          terminalId,
+          '--text',
+          line,
+          '--enter',
+          ...(durable ? ['--retry-request', requestId, '--wait-submit', String(WAIT_SUBMIT_SECONDS)] : []),
+          '--json',
+        ],
         { timeoutMs: (WAIT_SUBMIT_SECONDS + 60) * 1000 },
       )
     let answer = parseSend(await send(true))
-    if (!answer.ok && answer.code === 'incompatible_runtime' && /--wait-submit/.test(answer.error)) answer = parseSend(await send(false))
-    if (!answer.ok) {
-      // A CLI that could not run is looked for again next time.
-      if (answer.code === null) cli = null
-      return { ok: false, error: answer.error }
+    if (!answer.ok && answer.code === 'incompatible_runtime' && /--(?:wait-submit|retry-request)/.test(answer.error)) {
+      answer = parseSend(await send(false))
     }
-    return { ok: true, accepted: answer.accepted, refusedReason: answer.refusedReason, turnStarted: answer.turnStarted }
+    if (answer.ok) return answer
+    // A CLI that could not be started is looked for again next time.
+    if (answer.code === null && answer.delivery === 'not-sent') cli = null
+    return { ok: false, delivery: answer.delivery, error: answer.error }
   }
 }
 
-// The CLI's answer; `code` is Orca's error code, null when the CLI itself failed (not started, no JSON).
+// The CLI's answer; `code` is Orca's error code, null when the CLI itself failed.
 type Parsed =
   | { readonly ok: true; readonly accepted: boolean; readonly refusedReason: string | null; readonly turnStarted: boolean }
-  | { readonly ok: false; readonly error: string; readonly code: string | null }
+  | { readonly ok: false; readonly delivery: 'not-sent' | 'unknown'; readonly error: string; readonly code: string | null }
 
 function parseSend(result: RunResult): Parsed {
-  if (result.error !== null) return { ok: false, error: `orca terminal send: ${result.error.reason}`, code: null }
+  if (result.error !== null) {
+    // Not started: nothing typed. Stopped after the wait: it may have typed.
+    const delivery = result.error.kind === 'not_found' || result.error.kind === 'start_failed' ? 'not-sent' : 'unknown'
+    return { ok: false, delivery, error: `orca terminal send: ${result.error.reason}`, code: null }
+  }
   let answer: unknown
   try {
     answer = JSON.parse(result.stdout)
   } catch {
     const said = (result.stderr.trim() || result.stdout.trim()).split(/\r?\n/)[0] ?? ''
-    return { ok: false, error: `orca terminal send answered no JSON (exit ${result.code})${said ? `: ${said}` : ''}`, code: null }
+    return {
+      ok: false,
+      delivery: 'unknown',
+      error: `orca terminal send answered no JSON (exit ${result.code})${said ? `: ${said}` : ''}`,
+      code: null,
+    }
   }
   const field = (value: unknown, key: string): unknown =>
     typeof value === 'object' && value !== null && key in value ? (value as Record<string, unknown>)[key] : undefined
   if (field(answer, 'ok') !== true) {
     const code = field(field(answer, 'error'), 'code')
     const message = field(field(answer, 'error'), 'message')
+    const known = typeof code === 'string' ? code : 'unknown'
     return {
       ok: false,
+      delivery: NOT_SENT_CODES.has(known) || known === 'incompatible_runtime' ? 'not-sent' : 'unknown',
       error: `orca terminal send: ${typeof message === 'string' ? message : 'not ok'} (exit ${result.code})`,
-      code: typeof code === 'string' ? code : 'unknown',
+      code: known,
     }
   }
   const send = field(field(answer, 'result'), 'send')
