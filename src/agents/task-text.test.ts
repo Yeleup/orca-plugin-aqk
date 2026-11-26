@@ -4,7 +4,7 @@ import { assert, test } from 'orca/testing'
 import type { GithubLanguage } from '../github-texts/catalog'
 import { fencedBlock, inlineCode } from '../markdown'
 import { taskRulesTemplate } from '../project/task-rules'
-import { commonTaskPart, implementerTask, launchPrompt, messageFileLine, reviewerTask, type RoleTaskInput } from './task-text'
+import { commonTaskPart, implementerTask, launchPrompt, messageLine, reviewerTask, type RoleTaskInput } from './task-text'
 
 const LANGUAGES: readonly GithubLanguage[] = ['ru', 'en']
 
@@ -108,7 +108,7 @@ test('Текст задачи с тройными обратными кавыч�
   assert.ok(task.includes('`````text\n````\n`````'), task)
 })
 
-test('Подсказка запуска и строка сообщения в файле — одна строка с путями файлов', () => {
+test('Подсказка запуска и строка сообщения — одна строка с путями файла задания или сообщения и файла отчёта', () => {
   const taskFile = '/Users/avery/Library/Application Support/orca-agent-queue/projects/sample-shop/issue-42/agents/1/task.md'
   const reportFile = taskFile.replace('task.md', 'report.md')
   assert.equal(
@@ -119,6 +119,12 @@ test('Подсказка запуска и строка сообщения в ф
     launchPrompt('en', taskFile, reportFile),
     `Your task is in the file \`${taskFile}\`: read it whole and carry it out. The report goes to the file \`${reportFile}\`.`,
   )
-  assert.equal(messageFileLine('ru', 'C:\\Users\\Avery\\m.md'), 'Сообщение плагина — в файле `C:\\Users\\Avery\\m.md`: прочитайте его целиком.')
-  assert.equal(messageFileLine('en', '/tmp/m.md'), 'A message from the plugin is in the file `/tmp/m.md`: read it whole.')
+  assert.equal(
+    messageLine('ru', 'C:\\Users\\Avery\\message-1.md', 'C:\\Users\\Avery\\report-1.md'),
+    'Сообщение плагина — в файле `C:\\Users\\Avery\\message-1.md`: прочитайте его целиком и выполните. Отчёт о нём — в файл `C:\\Users\\Avery\\report-1.md`.',
+  )
+  assert.equal(
+    messageLine('en', '/data/message-2.md', '/data/report-2.md'),
+    'A message from the plugin is in the file `/data/message-2.md`: read it whole and carry it out. The report on it goes to the file `/data/report-2.md`.',
+  )
 })

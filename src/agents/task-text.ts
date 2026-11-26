@@ -1,6 +1,6 @@
 // The texts the plugin gives its agents, in the project's language (`language` of .agent-queue.json, `ru` or `en`): the
 // common part of every agent's task, the skeletons of the implementer's and the reviewer's tasks, the one-line prompt
-// that hands an agent its task file, and the line that hands it a message kept in a file.
+// that hands an agent its task file, and the line that hands it a message file; each names the report file.
 //
 // The common part (TZ Ф3, Ф4): the project's data rule; the line that the entry rule of CLAUDE.md and AGENTS.md — put
 // code changes into the queue — is only for entry sessions in the project's main checkout, not for this agent; that
@@ -57,7 +57,7 @@ type AgentTexts = {
   readonly reportHeading: string
   readonly report: string
   readonly prompt: string
-  readonly messageFile: string
+  readonly message: string
 }
 
 const TEXTS: { readonly [L in GithubLanguage]: AgentTexts } = {
@@ -88,7 +88,7 @@ const TEXTS: { readonly [L in GithubLanguage]: AgentTexts } = {
     report:
       'Отчёт запишите в файл {file} (он вне worktree, в каталоге данных плагина) и закончите работу: плагин читает отчёт, когда вы закончили и этот файл есть.',
     prompt: 'Ваше задание — в файле {task}: прочитайте его целиком и выполните. Отчёт — в файл {report}.',
-    messageFile: 'Сообщение плагина — в файле {file}: прочитайте его целиком.',
+    message: 'Сообщение плагина — в файле {file}: прочитайте его целиком и выполните. Отчёт о нём — в файл {report}.',
   },
   en: {
     implementerTitle: "Implementer's task: issue #{issue}",
@@ -117,7 +117,7 @@ const TEXTS: { readonly [L in GithubLanguage]: AgentTexts } = {
     report:
       "Write your report to the file {file} (outside the worktree, in the plugin's data directory) and finish: the plugin reads the report once you have finished and the file is there.",
     prompt: 'Your task is in the file {task}: read it whole and carry it out. The report goes to the file {report}.',
-    messageFile: 'A message from the plugin is in the file {file}: read it whole.',
+    message: 'A message from the plugin is in the file {file}: read it whole and carry it out. The report on it goes to the file {report}.',
   },
 }
 
@@ -207,7 +207,8 @@ export function launchPrompt(language: GithubLanguage, taskFile: string, reportF
   return text(language, 'prompt', { task: inlineCode(taskFile), report: inlineCode(reportFile) })
 }
 
-// The line an agent's terminal gets for a message that goes through a file (src/agents/agents.ts).
-export function messageFileLine(language: GithubLanguage, file: string): string {
-  return text(language, 'messageFile', { file: inlineCode(file) })
+// The one line an agent's terminal gets for a message (src/agents/agents.ts): the message's file and the report file
+// of the report on it.
+export function messageLine(language: GithubLanguage, messageFile: string, reportFile: string): string {
+  return text(language, 'message', { file: inlineCode(messageFile), report: inlineCode(reportFile) })
 }

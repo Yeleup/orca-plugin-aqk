@@ -3,7 +3,7 @@
 // plugin's data directory on this computer and the coordinator id kept there; then the layer of the agents
 // (src/agents/), which hears Orca's agent.status.changed. The MVP's tasks give it the rest of its functions.
 import type { OrcaWorkerApi } from 'orca/worker'
-import { startAgents } from './agents/agents'
+import { startAgents, type Agents } from './agents/agents'
 import { ensureCoordinatorId } from './platform/coordinator-id'
 import { errorMessage, realMachine, type Machine } from './platform/machine'
 import { dataDirectory } from './platform/paths'
@@ -24,10 +24,18 @@ async function connectedProjects(): Promise<Project[]> {
 }
 
 export default async function activate(orca: OrcaWorkerApi): Promise<void> {
-  const context = await startWorker(orca, realMachine())
-  // The agents of the queue's tasks; the coordinator (task `claim`) launches them through this layer.
-  startAgents(orca, context.machine, context.dataDir)
+  await startPlugin(orca, realMachine())
   orca.panels.handle('projects.list', async () => ({ projects: await connectedProjects() }))
+}
+
+// The worker as activate starts it on `machine`: the common layer of the three systems, then the layer of the agents of
+// the queue's tasks, which hears Orca's agent.status.changed; the coordinator (task `claim`) launches agents through it.
+export async function startPlugin(
+  orca: Pick<OrcaWorkerApi, 'log' | 'host' | 'events'>,
+  machine: Machine,
+): Promise<WorkerContext & { readonly agents: Agents }> {
+  const context = await startWorker(orca, machine)
+  return { ...context, agents: startAgents(orca, machine, context.dataDir) }
 }
 
 export async function startWorker(orca: Pick<OrcaWorkerApi, 'log'>, machine: Machine): Promise<WorkerContext> {
