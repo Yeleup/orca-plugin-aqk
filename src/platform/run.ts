@@ -47,8 +47,8 @@ export type RunResult = {
   readonly error: { readonly kind: RunErrorKind; readonly reason: string } | null
 }
 
-// The project's settings this layer needs. The task `project-config` reads them from `.agent-queue.json`; its result
-// fits this type, and tests pass their own.
+// The project's settings this layer needs. ProjectSettings (src/project/settings.ts), read from `.agent-queue.json` of
+// the project's base branch, is built on this type and goes to runProjectTests() as it is; tests pass their own.
 export type ProjectTestSettings = {
   // The command of the full tests, a line for the system's shell.
   readonly testCommand: string
