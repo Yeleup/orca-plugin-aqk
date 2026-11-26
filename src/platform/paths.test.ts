@@ -5,7 +5,7 @@ import { assert, mountWorker, test } from 'orca/testing'
 import { startWorker } from '../worker'
 import { fakeMachine, orcaWorkerEnv, type FakeMachine } from '../testing/fake-machine'
 import { envValue } from './machine'
-import { dataDirectory, dataPath, nativePath, worktreeFile } from './paths'
+import { dataDirectory, dataName, dataPath, nativePath, worktreeFile } from './paths'
 
 // The worker started on `machine`: its log and the files it created.
 async function startOn(machine: FakeMachine) {
@@ -117,5 +117,23 @@ test('пути: имя в каталоге данных и путь в worktree 
       assert.throws(() => worktreeFile(machine, root, repoPath), /not a path inside the repository/)
     }
     assert.throws(() => worktreeFile(machine, 'relative/worktree', 'src/main.ts'), /must be absolute/)
+  }
+})
+
+test('имя в каталоге данных из любого id: простое, читаемое и своё у каждого id, также без учёта регистра', () => {
+  const name = dataName('Example-Org/Sample-Shop')
+  assert.match(name, /^example-org-sample-shop-[0-9a-f]{12}$/)
+  assert.equal(dataName('Example-Org/Sample-Shop'), name)
+  // Ids that differ only in case or in the characters that become `-` get names of their own.
+  const names = ['Example-Org/Sample-Shop', 'example-org/sample-shop', 'example-org:sample-shop', 'example-org-sample-shop'].map(dataName)
+  assert.equal(new Set(names.map((each) => each.toLowerCase())).size, names.length)
+  // Nothing of the id can leave the directory or hide the name; a long id is cut, an id of no letters keeps its hash.
+  for (const id of ['../..', '..\\evil', '.hidden', '_private', 'C:\\Users\\Avery', 'x'.repeat(300), '  ', '']) {
+    const plain = dataName(id)
+    assert.match(plain, /^[a-z0-9][a-z0-9._-]*$/, plain)
+    assert.ok(plain.length <= 53, plain)
+    for (const system of ['linux', 'win32'] as const) {
+      assert.equal(dataPath(fakeMachine({ platform: system }), system === 'win32' ? 'C:\\data' : '/data', plain).endsWith(plain), true)
+    }
   }
 })

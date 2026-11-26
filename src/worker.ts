@@ -1,8 +1,9 @@
 // The plugin's worker. Orca transpiles this file when it loads it: no build step. It answers the panel's
 // plugin.request (src/protocol.ts). On start it settles the common layer of the three systems (src/platform/): the
-// plugin's data directory on this computer and the coordinator id kept there. The MVP's tasks give it the rest of its
-// functions.
+// plugin's data directory on this computer and the coordinator id kept there; then the layer of the agents
+// (src/agents/), which hears Orca's agent.status.changed. The MVP's tasks give it the rest of its functions.
 import type { OrcaWorkerApi } from 'orca/worker'
+import { startAgents } from './agents/agents'
 import { ensureCoordinatorId } from './platform/coordinator-id'
 import { errorMessage, realMachine, type Machine } from './platform/machine'
 import { dataDirectory } from './platform/paths'
@@ -23,7 +24,9 @@ async function connectedProjects(): Promise<Project[]> {
 }
 
 export default async function activate(orca: OrcaWorkerApi): Promise<void> {
-  await startWorker(orca, realMachine())
+  const context = await startWorker(orca, realMachine())
+  // The agents of the queue's tasks; the coordinator (task `claim`) launches them through this layer.
+  startAgents(orca, context.machine, context.dataDir)
   orca.panels.handle('projects.list', async () => ({ projects: await connectedProjects() }))
 }
 

@@ -38,11 +38,28 @@
         ],
         "default": "en"
       }
+    ],
+    "events": [
+      {
+        "on": "agent.status.changed"
+      }
     ]
   },
   "capabilities": [
     {
       "kind": "settings:own"
+    },
+    {
+      "kind": "agent:launch"
+    },
+    {
+      "kind": "agent:read"
+    },
+    {
+      "kind": "terminal:send"
+    },
+    {
+      "kind": "workspace:read"
     }
   ]
 }

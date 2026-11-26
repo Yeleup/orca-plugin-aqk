@@ -102,6 +102,24 @@ test('Каркас панели: воркер отвечает панели на
   })
 })
 
+// The manifest lists Orca's agent.status.changed (with agent:read), and the real worker module hears it: Orca would not
+// deliver an event a manifest does not list, and the mock host refuses to emit it.
+test('воркер слушает agent.status.changed: событие доходит до слоя агентов без вызовов хоста и отказов', async () => {
+  await withTemporaryHome(async () => {
+    const worker = await mountWorker(main)
+    await worker.emit('agent.status.changed', {
+      workspaceId: 'workspace-issue-7',
+      paneKey: 'pane-1',
+      terminalId: 'terminal-1',
+      state: 'done',
+      receivedAt: Date.UTC(2026, 0, 15, 10, 0, 0),
+    })
+    assert.deepEqual(worker.host.calls, [])
+    assert.deepEqual(worker.refusals, [])
+    await worker.deactivate()
+  })
+})
+
 test('id координатора: проигравший одновременный запуск берёт id победителя; файл без id не заменяется', async () => {
   const machine = fakeMachine({ platform: 'linux' })
   const dataDir = dataDirectory(machine)
