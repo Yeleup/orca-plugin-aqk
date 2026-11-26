@@ -92,6 +92,21 @@ if [ -n "$results" ]; then
 fi
 
 status=0
+case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*)
+        if [ -n "$run" ]; then
+            {
+                echo "DEBUG-RECORDER: sh=$(command -v sh) bash=$(command -v bash) git=$(command -v git) cygpath=$(command -v cygpath)"
+                echo "DEBUG-RECORDER: PATH=$PATH"
+                echo "DEBUG-RECORDER: results=$results run=$run pwd=$(pwd) pwdP=$(pwd -P)"
+                bash -c 'echo "DEBUG-RECORDER: bash $BASH_VERSION uname $(uname -a)"; echo "DEBUG-RECORDER: git rev-parse: $(git rev-parse --verify -q HEAD 2>&1; echo " code $?")"'
+                bash -x docker/test-result.sh start "$run" "$results" 2>&1 | sed 's/^/DEBUG-RECORDER-X: /'
+                ls -la "$run" 2>&1 | sed 's/^/DEBUG-RECORDER-LS: /'
+                for note in "$run"/*; do printf 'DEBUG-RECORDER-NOTE %s: %s\n' "$note" "$(cat "$note" 2>&1 | head -3 | tr '\n' '|')"; done
+            } >&2
+        fi
+        ;;
+esac
 [ -z "$run" ] || bash docker/test-result.sh start "$run" "$results"
 for step in $steps; do
     case "$step" in
