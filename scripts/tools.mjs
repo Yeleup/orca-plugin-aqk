@@ -1,5 +1,7 @@
-// The tools of a worktree of this plugin, for its preparation (scripts/setup.mjs, `setup` in orca.yaml) and its tests.
-// Node only, no packages: the same code runs on macOS, Windows and Linux.
+// The tools of a worktree of this plugin, for its preparation (scripts/setup.mjs, `setup` in orca.yaml), its CI
+// (scripts/ci.mjs), its release (scripts/release.mjs) and its tests. Node only, no packages: the same code runs on macOS,
+// Windows and Linux.
+import { spawnSync } from 'node:child_process'
 import { accessSync, constants, statSync } from 'node:fs'
 import { delimiter, extname, join, resolve } from 'node:path'
 
@@ -43,6 +45,21 @@ export function findCommand(command, env = process.env) {
     }
   }
   return null
+}
+
+// Runs `command` with `args` the way a shell of this system finds it (findCommand); on Windows a .cmd or .bat starts
+// through cmd.exe, which Node requires for them. Returns spawnSync's result; `options` are spawnSync's.
+export function spawnCommand(command, args, options = {}) {
+  const env = options.env ?? process.env
+  const file = findCommand(command, env) ?? command
+  if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(file)) {
+    return spawnSync([file, ...args].map(quoteForCmd).join(' '), { ...options, env, shell: true })
+  }
+  return spawnSync(file, args, { ...options, env })
+}
+
+function quoteForCmd(word) {
+  return /^[\w.:\\/=-]+$/.test(word) ? word : `"${word}"`
 }
 
 // The tools `setup` needs that this system does not have, by the names `setup` reports.
