@@ -8,16 +8,18 @@
 // directory. npm runs offline, from the cache the worktree's own preparation filled: no network. The inner `make test`
 // skips these tests (NESTED_RUN), so it runs every other step and test once.
 import { assert, test } from 'orca/testing'
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { findCommand } from '../scripts/tools.mjs'
 import {
   NESTED_RUN,
+  assertGreenTests,
   commitAll,
   exportHead,
   inspect,
   nestedRun,
+  nodeTestSummary,
   offlineNpmEnv,
   orcaCli,
   orcaYamlScripts,
@@ -79,18 +81,17 @@ function preparedTree(temp) {
   return { dir, sha }
 }
 
+// Tests a green inner run passes: the worker's and the manifest's (the delivery tests skip there).
+const GREEN_RUN_TESTS = ['the worker starts without host calls or refusals', 'К2.7: проверка манифеста CLI Orca']
+
 // A full green run: exit 0, every step's summary, the tests really ran (the worker's test and the manifest's passed,
-// only the delivery tests skipped).
+// only the delivery tests skipped), in whichever format `node --test` printed them (nodeTestSummary).
 function assertGreenRun(make, when) {
   assert.equal(make.status, 0, `make test ${when}:\n${make.output}`)
-  for (const summary of ['orca plugin validate: манифест в порядке', 'tsc: типы в порядке', '# fail 0']) {
+  for (const summary of ['orca plugin validate: манифест в порядке', 'tsc: типы в порядке']) {
     assert.ok(make.stdout.includes(summary), `make test ${when}: нет «${summary}»:\n${make.output}`)
   }
-  const passed = Number(/^# pass (\d+)$/m.exec(make.stdout)?.[1] ?? 0)
-  assert.ok(passed > 0, `make test ${when}: ни один тест не прошёл:\n${make.output}`)
-  for (const name of ['the worker starts without host calls or refusals', 'К2.7: проверка манифеста CLI Orca']) {
-    assert.match(make.stdout, new RegExp(`^ok \\d+ - ${name}`, 'm'), `make test ${when}:\n${make.output}`)
-  }
+  assertGreenTests(make.stdout, GREEN_RUN_TESTS, `make test ${when}`, make.output)
 }
 
 // The record the queue merges by: exactly one, a full green unfiltered run of this commit on a clean tree.
@@ -269,10 +270,14 @@ deliveryTest('make test внутри make test: ORCA и test_args внешнег
     STRAY_LOG: strayLog,
   }
   const results = join(temp, 'test-results')
-  const make = makeTest(dir, [`TEST_RESULT_DIR=${results}`], {}, enclosing)
+  // The run's scratch directory for the recorder goes in TMPDIR and is gone after the run.
+  const runTemp = join(temp, 'run-tmp')
+  mkdirSync(runTemp)
+  const make = makeTest(dir, [`TEST_RESULT_DIR=${results}`], { TMPDIR: runTemp }, enclosing)
   assertGreenRun(make, 'под внешним make')
   assertFullGreenRecord(results, sha, make, 'под внешним make')
   assert.equal(existsSync(strayLog), false, `вложенный прогон взял ORCA внешнего make: ${stray}`)
+  assert.deepEqual(readdirSync(runTemp).filter((name) => name.startsWith('test-run.')), [], 'каталог прогона остался')
 })
 
 // The recorder takes only absolute POSIX paths and ~: a native Windows results directory (C:\…) reaches it in the shell's
@@ -326,6 +331,38 @@ deliveryTest('make test: каталог записи итога в виде Wind
   }
 })
 
+// The recorder's scratch directory is made by `make test` itself, in the system's temporary directory (TMPDIR, TMP,
+// TEMP, else /tmp): where none can be made — an unwritable TMPDIR here; on windows-latest the recorder could not
+// create one in /tmp of Git Bash — `make test` stops before the steps and says where, instead of running without a
+// record.
+deliveryTest('make test: временный каталог прогона для записи итога не создать (TMPDIR без права записи) — отказ до шагов, без записи', (temp, t) => {
+  if (windows) {
+    t.skip('права каталога — сценарий POSIX')
+    return
+  }
+  if (process.getuid?.() === 0) {
+    t.skip('root пишет и в каталог без права записи')
+    return
+  }
+  const dir = exportHead(temp)
+  // The preparation's TypeScript as make test looks for it; the run stops before any step uses it.
+  mkdirSync(join(dir, 'node_modules', 'typescript', 'bin'), { recursive: true })
+  writeFileSync(join(dir, 'node_modules', 'typescript', 'bin', 'tsc'), '')
+  const locked = join(temp, 'locked-tmp')
+  mkdirSync(locked)
+  chmodSync(locked, 0o555)
+  try {
+    const results = join(temp, 'test-results')
+    const make = makeTest(dir, [`TEST_RESULT_DIR=${results}`], { TMPDIR: locked })
+    assert.notEqual(make.status, 0, make.output)
+    assert.ok(make.stderr.includes(`временный каталог прогона для записи итога не создать в «${locked}»`), make.output)
+    assert.equal(make.stdout.trim(), '', `шаги шли:\n${make.output}`)
+    assert.equal(existsSync(results), false, 'итог записан')
+  } finally {
+    chmodSync(locked, 0o755)
+  }
+})
+
 // The recorder needs bash 4.4 or newer; with an older bash on PATH (macOS ships 3.2) `make test` stops and says so
 // instead of passing with no record.
 deliveryTest('make test: bash старше 4.4 в PATH — отказ до тестов, без записи итога', (temp, t) => {
@@ -364,6 +401,64 @@ deliveryTest('make test: ORCA_CLI_COMMAND=orca на Linux — отказ до ш
     assert.match(make.stderr, /CLI Orca «orca» без пути на Linux — экранный диктор GNOME/, make.output)
   }
   assert.equal(existsSync(log), false, 'make test запустил голый orca')
+})
+
+// The check of a green run reads what `node --test` really prints with either reporter: TAP (up to Node 22 when the
+// output is not a terminal) and spec (a terminal, and from Node 23 on always; `orca plugin test` runs the `node` of
+// PATH). The same sample runs with both, green and with one failing test.
+test('make test: зелёный прогон узнаётся по сводке node --test и в TAP, и в spec (с Node 23 spec печатается и без терминала)', () => {
+  const temp = tempDir('reporters')
+  try {
+    const sample = (name, failing) => {
+      const file = join(temp.dir, name)
+      writeFileSync(file, "import { test } from 'node:test'\n" +
+        GREEN_RUN_TESTS.map((test) => `test(${JSON.stringify(`${test} (пример)`)}, () => {})\n`).join('') +
+        "test('пропущенный', (t) => t.skip('причина'))\n" +
+        (failing ? "test('падающий', () => { throw new Error('нет') })\n" : ''))
+      return file
+    }
+    const green = sample('green.test.mjs', false)
+    const red = sample('red.test.mjs', true)
+    for (const reporter of ['tap', 'spec']) {
+      const passed = run('node', ['--test', `--test-reporter=${reporter}`, green], { cwd: temp.dir, env: testEnv() })
+      assert.equal(passed.status, 0, passed.output)
+      const summary = assertGreenTests(passed.stdout, GREEN_RUN_TESTS, reporter, passed.output)
+      assert.deepEqual([summary.tests, summary.pass, summary.fail], [3, 2, 0], `${reporter}: ${passed.output}`)
+      assert.deepEqual(summary.passed, GREEN_RUN_TESTS.map((test) => `${test} (пример)`), `${reporter}: ${passed.output}`)
+
+      const failed = run('node', ['--test', `--test-reporter=${reporter}`, red], { cwd: temp.dir, env: testEnv() })
+      assert.notEqual(failed.status, 0, failed.output)
+      assert.equal(nodeTestSummary(failed.stdout).fail, 1, `${reporter}: ${failed.output}`)
+      assert.throws(() => assertGreenTests(failed.stdout, GREEN_RUN_TESTS, reporter), /нет сводки «fail 0» \(1\)/)
+    }
+    // No summary at all is no green run either.
+    assert.throws(() => assertGreenTests('6 test file(s) passed (node).\n', [], 'без сводки'), /нет сводки «fail 0» \(null\)/)
+  } finally {
+    temp.remove()
+  }
+})
+
+// The GNU Make of Windows hands a recipe to sh on the system's ANSI command line, which garbles what is not ASCII (the
+// Russian summaries and messages came out as «Ð¼Ð°Ð½…»): everything make runs is ASCII, the run's text is in
+// scripts/make-test.sh, which the recipe's shell reads itself.
+test('make test: Makefile вне комментариев только ASCII — make на Windows передаёт рецепт sh через ANSI-строку команды', () => {
+  const lines = readFileSync(join(pluginRoot, 'Makefile'), 'utf8').split(/\r?\n/)
+  for (const [index, line] of lines.entries()) {
+    if (/^\s*#/.test(line)) continue
+    assert.ok(/^[\x20-\x7e\t]*$/.test(line), `Makefile:${index + 1}: не ASCII: ${line}`)
+  }
+  assert.ok(lines.includes('\t@. ./scripts/make-test.sh'), 'рецепт test не читает scripts/make-test.sh')
+})
+
+// The bash 3.2 of macOS (its /bin/sh) reads a byte that is not ASCII right after a variable's name as part of the name:
+// `«$dir»` printed «� without the directory. Values go into messages as printf arguments or in braces.
+test('make test: в Makefile и scripts/make-test.sh имя переменной не стоит вплотную к не-ASCII (bash 3.2 macOS)', () => {
+  for (const file of ['Makefile', join('scripts', 'make-test.sh')]) {
+    for (const [index, line] of readFileSync(join(pluginRoot, file), 'utf8').split(/\r?\n/).entries()) {
+      if (/^\s*#/.test(line)) continue
+      assert.ok(!/\$\$?[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]/.test(line), `${file}:${index + 1}: ${line}`)
+    }
+  }
 })
 
 // The Makefile is read by the GNU Make 3.81 of macOS too: nothing that version cannot parse.

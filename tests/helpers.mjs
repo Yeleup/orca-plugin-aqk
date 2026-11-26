@@ -113,6 +113,39 @@ export function inspect(dir) {
   return { ...result, json }
 }
 
+// What a `node --test` run printed, whichever reporter printed it: { tests, pass, fail } of its totals (null when one is
+// missing) and the names of the top-level tests that passed. Node prints TAP (`# pass N`, `ok N - name`) when its
+// output is not a terminal, up to Node 22; spec (`ℹ pass N`, `✔ name (1.2ms)`) in a terminal, and from Node 23 on
+// always — `orca plugin test` takes the `node` of PATH, so the same run prints either.
+export function nodeTestSummary(stdout) {
+  const total = (name) => {
+    const found = [...stdout.matchAll(new RegExp(`^(?:# |ℹ )${name} (\\d+)$`, 'gm'))]
+    return found.length > 0 ? Number(found.at(-1)[1]) : null
+  }
+  const passed = []
+  for (const line of stdout.split(/\r?\n/)) {
+    const tap = /^ok \d+ - (.*)$/.exec(line)
+    if (tap && !/ # (SKIP|TODO)\b/i.test(tap[1])) passed.push(tap[1])
+    const spec = /^✔ (.*) \([\d.]+ms\)$/.exec(line)
+    if (spec) passed.push(spec[1])
+  }
+  return { tests: total('tests'), pass: total('pass'), fail: total('fail'), passed }
+}
+
+// A green `node --test` run in `stdout`: no failure, at least one test passed, and each of `names` (the start of a test's
+// name) among the passed tests. Throws with `output` otherwise.
+export function assertGreenTests(stdout, names, what, output = stdout) {
+  const summary = nodeTestSummary(stdout)
+  if (summary.fail !== 0) throw new Error(`${what}: нет сводки «fail 0» (${summary.fail}):\n${output}`)
+  if (!(summary.pass > 0)) throw new Error(`${what}: ни один тест не прошёл:\n${output}`)
+  for (const name of names) {
+    if (!summary.passed.some((passed) => passed.startsWith(name))) {
+      throw new Error(`${what}: тест «${name}» не прошёл:\n${output}`)
+    }
+  }
+  return summary
+}
+
 // A temporary directory for one test; remove() deletes it with everything in it.
 export function tempDir(name) {
   const dir = mkdtempSync(join(tmpdir(), `orca-plugin-aqk-${name}-`))

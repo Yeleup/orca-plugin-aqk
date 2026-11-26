@@ -4,9 +4,10 @@
 // `plugin inspect` on a clean export of the commit; it prepares the checkout and cleans up with `setup` and `archive`
 // of orca.yaml the way Orca runs them — on Windows through a .cmd file (scripts/ci.mjs hook).
 //
-// Here: the workflow file read as GitHub reads it; its steps run on this machine with a fake Orca release (fake curl,
-// unpack tools, Electron and CLI — no network); the commands of scripts/ci.mjs run in temporary copies with changed
-// manifests and orca.yaml. The run in Actions itself is the owner's (Actions are the owner's to enable).
+// Here, by the rule of tests of the ТЗ, without real Orca and without network: the workflow file read as GitHub reads
+// it; its steps run on this machine with a fake Orca release (fake curl, unpack tools, Electron, CLI and TypeScript);
+// the commands of scripts/ci.mjs run in temporary copies with changed manifests and orca.yaml. The run with the real
+// Orca of engines.orca on the three systems is the workflow's own, in Actions.
 import { assert, test } from 'orca/testing'
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, copyFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
@@ -19,8 +20,6 @@ import {
   exportHead,
   nestedRun,
   offlineNpmEnv,
-  orca,
-  orcaCli,
   orcaHookRunner,
   orcaYamlScripts,
   pluginRoot,
@@ -97,11 +96,11 @@ function lineAfter(lines, wanted, after, what) {
 // the unpack tool of this system (dpkg-deb, ditto, 7z — for 7z an installer with its app as an inner .7z, as Orca's
 // setup.exe for Windows) lays out an Orca package: the Electron executable where Orca's has it and the CLI's entry point
 // resources/app.asar.unpacked/out/cli/index.js. The fake Electron runs only in Node mode (ELECTRON_RUN_AS_NODE=1): it is
-// Node itself (a shell script running Node, a copy of node.exe on Windows). The fake CLI logs every call (its arguments,
-// directory, ELECTRON_RUN_AS_NODE, NODE_OPTIONS; for `plugin inspect` the files of the folder and its README) to
-// FAKE_ORCA_LOG, answers `--version` with the version of the release URL (or FAKE_ORCA_VERSION), hands `plugin types` to
-// the real CLI (REAL_ORCA_CLI) when one is given, and exits 0.
-function fakeOrcaRelease(temp) {
+// Node itself (a shell script running Node, a copy of node.exe on Windows). The fake CLI (FAKE_CLI) logs every call to
+// FAKE_ORCA_LOG and answers as Orca's CLI would. With `typescript`, `node node_modules/typescript/bin/tsc …` runs a fake
+// TypeScript (FAKE_TSC, a `node` on PATH that hands every other command to Node): it logs its call with the typings the
+// project's tsconfig.json extends to FAKE_TOOLS_LOG and passes only on the typings the fake `plugin types` wrote.
+function fakeOrcaRelease(temp, { typescript = false } = {}) {
   const dir = join(temp, 'fake-release')
   const bin = join(dir, 'bin')
   mkdirSync(bin, { recursive: true })
@@ -113,6 +112,15 @@ function fakeOrcaRelease(temp) {
     writeExecutable(bin, tool, {
       sh: `#!/bin/sh\nexec ${quote(node)} ${quote(tools)} ${tool} "$@"\n`,
       cmd: `@echo off\n"${node}" "${tools}" ${tool} %*\nexit /b %errorlevel%\n`,
+    })
+  }
+  if (typescript) {
+    const tsc = join(dir, 'fake-tsc.mjs')
+    writeFileSync(tsc, FAKE_TSC, 'utf8')
+    // The fake TypeScript gets TypeScript's path as its first argument too, and drops it.
+    writeExecutable(bin, 'node', {
+      sh: `#!/bin/sh\nif [ "$1" = ${TSC} ]; then exec ${quote(node)} ${quote(tsc)} "$@"; fi\nexec ${quote(node)} "$@"\n`,
+      cmd: `@echo off\nif "%~1"=="${TSC}" (\n  "${node}" "${tsc}" %*\n  exit /b\n)\n"${node}" %*\nexit /b %errorlevel%\n`,
     })
   }
   const toolsLog = join(dir, 'tools.log')
@@ -171,9 +179,13 @@ if (tool === 'dpkg-deb') {
 }
 `
 
-const FAKE_CLI = `const { appendFileSync, existsSync, readFileSync, readdirSync } = require('node:fs')
+// The fake CLI: logs every call (its arguments, directory, ELECTRON_RUN_AS_NODE, NODE_OPTIONS; for `plugin inspect` the
+// files of the folder and its README; for `plugin test` whether the folder is prepared — TypeScript installed) to
+// FAKE_ORCA_LOG; answers `--version` with the version of its package (version.txt beside it); `plugin types <dir>`
+// writes typings marked as its own into <dir>/.orca/types; `plugin test` fails in a folder that is not prepared;
+// everything else exits 0.
+const FAKE_CLI = `const { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } = require('node:fs')
 const { join, relative } = require('node:path')
-const { spawnSync } = require('node:child_process')
 const args = process.argv.slice(2)
 const call = { args, cwd: process.cwd(), electronRunAsNode: process.env.ELECTRON_RUN_AS_NODE ?? null, nodeOptions: process.env.NODE_OPTIONS ?? null }
 if (args[0] === 'plugin' && args[1] === 'inspect') {
@@ -190,18 +202,60 @@ if (args[0] === 'plugin' && args[1] === 'inspect') {
   call.files = files.sort()
   call.readme = existsSync(join(dir, 'README.md')) ? readFileSync(join(dir, 'README.md'), 'utf8') : null
 }
+const plugin = (command) => args[0] === 'plugin' && args[1] === command
+if (plugin('test')) call.prepared = existsSync(join(process.cwd(), args[2] ?? '.', 'node_modules', 'typescript', 'bin', 'tsc'))
 if (process.env.FAKE_ORCA_LOG) appendFileSync(process.env.FAKE_ORCA_LOG, JSON.stringify(call) + '\\n', 'utf8')
 if (args.length === 1 && args[0] === '--version') {
   process.stdout.write(readFileSync(join(__dirname, 'version.txt'), 'utf8') + '\\n')
   process.exit(0)
 }
-const real = process.env.REAL_ORCA_CLI
-if (real && args[0] === 'plugin' && args[1] === 'types') {
-  const result = spawnSync(real, args, { stdio: 'inherit', env: { ...process.env, ORCA_CLI_COMMAND: real } })
-  process.exit(result.status ?? 1)
+if (plugin('types')) {
+  const types = join(process.cwd(), args[2] ?? '.', '.orca', 'types')
+  mkdirSync(types, { recursive: true })
+  writeFileSync(join(types, 'tsconfig.json'), JSON.stringify({ compilerOptions: { noEmit: true }, fakeOrcaTypes: true }))
+  process.exit(0)
+}
+if (plugin('test') && !call.prepared) {
+  console.error('fake orca plugin test: no node_modules/typescript — the folder is not prepared')
+  process.exit(1)
 }
 process.exit(0)
 `
+
+// TypeScript's path in a prepared folder, as the workflow runs it.
+const TSC = 'node_modules/typescript/bin/tsc'
+
+// The fake TypeScript: \`tsc -p <dir>\` logs its call ({ tool: 'tsc', args, cwd, typings }) to FAKE_TOOLS_LOG, where
+// typings is the file <dir>/tsconfig.json extends, read; it passes only when those are the fake CLI's typings.
+const FAKE_TSC = `import { appendFileSync, existsSync, readFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
+const args = process.argv.slice(3)
+const project = args[args.indexOf('-p') + 1] ?? '.'
+const config = JSON.parse(readFileSync(join(project, 'tsconfig.json'), 'utf8'))
+const base = typeof config.extends === 'string' ? resolve(project, config.extends) : null
+const typings = base && existsSync(base) ? JSON.parse(readFileSync(base, 'utf8')) : null
+appendFileSync(process.env.FAKE_TOOLS_LOG, JSON.stringify({ tool: 'tsc', args, cwd: process.cwd(), typings }) + '\\n', 'utf8')
+if (typings?.fakeOrcaTypes !== true) {
+  console.error('fake tsc: tsconfig.json does not extend the typings of orca plugin types')
+  process.exit(2)
+}
+`
+
+// The fake CLI (FAKE_CLI) on its own, as Orca's CLI of this system run by Node: { path, env, calls() }.
+function fakeCli(temp) {
+  const dir = join(temp, 'fake-cli')
+  mkdirSync(dir)
+  const script = join(dir, 'fake-orca.cjs')
+  writeFileSync(script, FAKE_CLI, 'utf8')
+  const node = findCommand('node') ?? process.execPath
+  const quote = (text) => `'${text.replaceAll("'", "'\\''")}'`
+  const path = writeExecutable(dir, 'orca-ide', {
+    sh: `#!/bin/sh\nexec ${quote(node)} ${quote(script)} "$@"\n`,
+    cmd: `@echo off\n"${node}" "${script}" %*\nexit /b %errorlevel%\n`,
+  })
+  const log = join(temp, 'fake-cli.log')
+  return { path, env: { FAKE_ORCA_LOG: log }, calls: () => jsonLines(log) }
+}
 
 // A copy of the plugin's CI commands (scripts/) in `temp`, with `manifest` and `orcaYaml` of its own.
 function ciCopy(temp, { manifest, orcaYaml } = {}) {
@@ -257,6 +311,10 @@ test('К14.3 (workflow): матрица ubuntu-latest, macos-latest и windows-l
     const archive = lineAfter(lines, /^git archive --format=tar HEAD \| tar -x -f - -C "\$export_dir"$/, pluginTest, what)
     const inspect = lineAfter(lines, '"$ORCA_CLI_COMMAND" plugin inspect "$export_dir"', archive, what)
     assert.equal(lines[inspect].index, lines[archive].index, `${what}: inspect не той выгрузки`)
+    // The Node.js of setup-node stays the `node` of the run (plugin test takes the node of PATH): Homebrew's whole bin,
+    // with its own node, never goes ahead of it.
+    const brewBin = lines.find((entry) => /brew --prefix\)\/bin"?\s*>>\s*"?\$GITHUB_PATH/.test(entry.line))
+    assert.equal(brewBin, undefined, `${what}: весь bin Homebrew в PATH раньше Node.js: ${brewBin?.line}`)
   }
 })
 
@@ -327,32 +385,28 @@ outerTest('К14.3 (установка, контроль): CLI в пакете н
 })
 
 // The workflow's steps for Linux, run here as the runner runs them, in a local git repository of the commit's export
-// with a change that is not committed and a file that is not in the commit. What the fake CLI logs is what the
-// workflow ran on the CLI it installed.
+// with a change that is not committed and a file that is not in the commit. Orca is the fake release (no real Orca, no
+// network): what the fake CLI logs is what the workflow ran on the CLI it installed, and the type check's TypeScript is
+// the fake one, which passes only on the typings that CLI's `plugin types` wrote. The run in Actions does all of it
+// with the real Orca of engines.orca.
 outerTest('К14.3 (шаги): шаги workflow ставят CLI Orca минимальной версии из engines.orca и гоняют на нём plugin validate, проверку типов, plugin test и plugin inspect чистой выгрузки коммита', (temp, t) => {
   if (process.platform !== 'linux') {
     t.skip('шаги workflow с подделками гоняет Linux; на macOS и Windows их выполняет сам прогон в Actions')
     return
   }
-  const real = findCommand(orcaCli())
-  assert.ok(real, `CLI Orca не найден: ${orcaCli()}`)
   const dir = exportHead(temp)
   commitAll(dir)
   const committedReadme = readFileSync(join(dir, 'README.md'), 'utf8')
   writeFileSync(join(dir, 'README.md'), `${committedReadme}\nНе закоммичено.\n`)
   writeFileSync(join(dir, 'scratch.txt'), 'не в коммите\n')
-  const fakes = fakeOrcaRelease(temp)
+  const fakes = fakeOrcaRelease(temp, { typescript: true })
   const runnerTemp = join(temp, 'runner-temp')
   mkdirSync(runnerTemp)
 
   // The workflow of the commit, run in the commit's checkout.
   const committedJob = readWorkflow(join(dir, '.github', 'workflows', 'plugin.yml')).jobs.plugin
-  const records = runJob(committedJob, {
-    runnerOs: 'Linux',
-    cwd: dir,
-    runnerTemp,
-    env: ciEnv({ ...fakes.env, [pathKey]: `${fakes.bin}:${process.env[pathKey]}`, REAL_ORCA_CLI: real }),
-  })
+  const env = ciEnv({ ...fakes.env, [pathKey]: `${fakes.bin}:${process.env[pathKey]}` })
+  const records = runJob(committedJob, { runnerOs: 'Linux', cwd: dir, runnerTemp, env })
   for (const record of records.filter((r) => r.ran)) {
     assert.equal(record.status, 0, `шаг «${record.step.name}»:\n${record.output}`)
   }
@@ -380,10 +434,17 @@ outerTest('К14.3 (шаги): шаги workflow ставят CLI Orca миним
   for (const call of calls) assert.equal(call.electronRunAsNode, '1', JSON.stringify(call))
   for (const call of calls.slice(1, 4)) assert.equal(realpathSync.native(call.cwd), realpathSync.native(dir))
 
-  // setup of orca.yaml prepared the checkout (TypeScript without bin links), the type check ran on this CLI's typings.
+  // setup of orca.yaml prepared the checkout (TypeScript without bin links) before plugin test.
   assert.ok(existsSync(join(dir, 'node_modules', 'typescript', 'bin', 'tsc')), 'setup не поставил TypeScript')
   assert.deepEqual(symlinksIn(join(dir, 'node_modules')), [])
-  assert.ok(existsSync(join(dir, '.orca', 'types', 'tsconfig.json')), 'plugin types не писал типы')
+  assert.equal(calls[3].prepared, true, 'plugin test до подготовки чекаута')
+
+  // The type check: TypeScript by the path of its package, in the checkout, on the typings `plugin types` of the
+  // installed CLI wrote (the project's tsconfig.json extends them).
+  const typeChecks = fakes.toolCalls().filter((call) => call.tool === 'tsc')
+  assert.deepEqual(typeChecks.map((call) => call.args), [['-p', '.']], JSON.stringify(fakes.toolCalls()))
+  assert.equal(realpathSync.native(typeChecks[0].cwd), realpathSync.native(dir))
+  assert.equal(typeChecks[0].typings?.fakeOrcaTypes, true, 'tsc не на типах plugin types')
   const typeCheck = records.find((r) => r.ran && r.step.run.includes('plugin types'))
   assert.match(typeCheck.stdout, /tsc: типы в порядке/)
 
@@ -434,9 +495,16 @@ test('К14.6 (.cmd): на Windows scripts/ci.mjs hook пишет строки с
 
 // scripts/ci.mjs hook in a copy whose orca.yaml has lines of its own: they run in the plugin folder, in order, from the
 // runner file of this system (.cmd through cmd.exe on Windows), and the first failing line stops the hook with its code.
+// Comments, which YAML allows at any indent and after a key, belong to no script: one without indent between setup and
+// archive ends setup and leaves archive to follow.
 outerTest('К14.6 (строки orca.yaml): scripts/ci.mjs hook запускает строки самого orca.yaml так, как Orca на этой системе, и останавливается на первой ошибке', (temp) => {
-  const orcaYaml = 'scripts:\n  setup: |\n    node mark.mjs one\n    node mark.mjs two\n' +
-    '  archive: |\n    node mark.mjs one\n    node fail.mjs\n    node mark.mjs three\n'
+  const orcaYaml = 'scripts: # хуки worktree\n  setup: |\n    node mark.mjs one\n    node mark.mjs two\n' +
+    '# archive — уборка при удалении worktree\n' +
+    '  archive: | # с ошибкой во второй строке\n    node mark.mjs one\n    node fail.mjs\n    node mark.mjs three\n'
+  assert.deepEqual(orcaYamlScripts(orcaYaml), {
+    setup: 'node mark.mjs one\nnode mark.mjs two\n',
+    archive: 'node mark.mjs one\nnode fail.mjs\nnode mark.mjs three\n',
+  })
   const dir = ciCopy(temp, { orcaYaml })
   writeFileSync(join(dir, 'mark.mjs'), "import { appendFileSync } from 'node:fs'\n" +
     "appendFileSync(process.env.MARK_LOG, JSON.stringify([process.argv[2], process.cwd()]) + '\\n')\n")
@@ -465,26 +533,48 @@ outerTest('К14.6 (строки orca.yaml): scripts/ci.mjs hook запускае
   assert.match(missing.stderr, /в orca\.yaml нет скрипта deploy; есть: setup, archive/)
 })
 
-// The workflow's preparation and cleanup on a clean export of the commit, by the same command: setup of orca.yaml (on
-// Windows through .cmd and cmd.exe), then `plugin test` of the prepared folder passes, then archive exits with 0. npm
-// runs offline, from the cache the worktree's own preparation filled.
-outerTest('К14.6: setup из orca.yaml так, как его запускает workflow (на Windows — через .cmd), после него plugin test проходит; archive выходит с кодом 0', (temp) => {
+// The workflow's own steps of windows-latest that prepare, test and clean up, in its order, on a clean export of the
+// commit: setup of orca.yaml the way Orca runs it (on Windows through .cmd and cmd.exe — К14.6 (.cmd)), then
+// `plugin test` of the fake CLI, which passes only in a prepared folder, then archive the same way as setup. npm runs
+// offline, from the cache the worktree's own preparation filled; the run in Actions does the same with the real Orca.
+outerTest('К14.6: на windows-latest workflow выполняет setup из orca.yaml так, как его запускает Orca (через .cmd), после него plugin test проходит; archive тем же способом выходит с кодом 0', (temp) => {
   const dir = exportHead(temp)
   commitAll(dir)
-  const ci = join(dir, 'scripts', 'ci.mjs')
-  const setup = run('node', [ci, 'hook', 'setup'], { cwd: dir, env: ciEnv({ ORCA_CLI_COMMAND: orcaCli() }) })
-  assert.equal(setup.status, 0, setup.output)
-  assert.match(setup.stdout, windows ? /--- \S*setup-runner\.cmd\n@echo off\n/ : /--- \S*setup-runner\.sh\n#!\/usr\/bin\/env bash\n/)
+  const wanted = ['node scripts/ci.mjs hook setup', '"$ORCA_CLI_COMMAND" plugin test .', 'node scripts/ci.mjs hook archive']
+  const committedJob = readWorkflow(join(dir, '.github', 'workflows', 'plugin.yml')).jobs.plugin
+  const steps = committedJob.steps.filter((step) => step.run !== undefined && runsOn(step, 'Windows') && wanted.includes(step.run.trim()))
+  assert.deepEqual(steps.map((step) => step.run.trim()), wanted, 'на windows-latest нет этих шагов в этом порядке')
+  const cli = fakeCli(temp)
+  const runnerTemp = join(temp, 'runner-temp')
+  mkdirSync(runnerTemp)
+
+  const records = runJob({ defaults: committedJob.defaults, steps }, {
+    runnerOs: 'Windows',
+    cwd: dir,
+    runnerTemp,
+    env: ciEnv({ ...cli.env, ORCA_CLI_COMMAND: cli.path }),
+  })
+  assert.deepEqual(
+    records.map((record) => [record.step.run.trim(), record.status]),
+    wanted.map((run) => [run, 0]),
+    records.map((record) => record.output).join('\n'),
+  )
+  const [setup, , archive] = records
+  const runner = (name) => windows
+    ? new RegExp(`--- \\S*${name}-runner\\.cmd\\n@echo off\\n`)
+    : new RegExp(`--- \\S*${name}-runner\\.sh\\n#!/usr/bin/env bash\\n`)
+  assert.match(setup.stdout, runner('setup'), setup.output)
+  assert.match(setup.stdout, /^orca\.yaml setup: код 0$/m, setup.output)
   assert.ok(existsSync(join(dir, 'node_modules', 'typescript', 'bin', 'tsc')), `setup не поставил TypeScript:\n${setup.output}`)
+  assert.deepEqual(symlinksIn(join(dir, 'node_modules')), [])
 
-  const pluginTest = orca(['plugin', 'test', '.'], { cwd: dir, env: testEnv({ [NESTED_RUN]: '1' }) })
-  assert.equal(pluginTest.status, 0, `plugin test после setup:\n${pluginTest.output}`)
-  assert.match(pluginTest.stdout, /^# fail 0$/m, pluginTest.output)
-  assert.ok(Number(/^# pass (\d+)$/m.exec(pluginTest.stdout)?.[1] ?? 0) > 0, pluginTest.output)
-  assert.match(pluginTest.stdout, /^ok \d+ - the worker starts without host calls or refusals/m, pluginTest.output)
+  // plugin test ran once, in the folder setup had prepared, and archive came after it.
+  const calls = cli.calls()
+  assert.deepEqual(calls.map((call) => call.args), [['plugin', 'test', '.']])
+  assert.equal(realpathSync.native(calls[0].cwd), realpathSync.native(dir))
+  assert.equal(calls[0].prepared, true, 'plugin test до подготовки чекаута')
 
-  const archive = run('node', [ci, 'hook', 'archive'], { cwd: dir, env: ciEnv() })
-  assert.equal(archive.status, 0, archive.output)
+  assert.match(archive.stdout, runner('archive'), archive.output)
   assert.match(archive.stdout, /orca-plugin-aqk archive: nothing to clean up/)
-  assert.match(archive.stdout, /orca\.yaml archive: код 0/)
+  assert.match(archive.stdout, /^orca\.yaml archive: код 0$/m, archive.output)
 })

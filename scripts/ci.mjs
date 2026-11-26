@@ -235,4 +235,3 @@ if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToP
     process.exitCode = 1
   }
 }
-

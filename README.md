@@ -49,6 +49,7 @@ Orca ставит новейший тег версии `vX.Y.Z` (без тего
 - `tests/*.test.mjs` — тесты поставки, workflow и релиза: манифест, подготовка worktree, `plugin inspect` чистой
   выгрузки коммита, шаги workflow GitHub Actions, команда релиза.
 - `scripts/setup.mjs` — подготовка worktree (`setup` в `orca.yaml`).
+- `Makefile` и `scripts/make-test.sh` — `make test`: настройки и сам прогон с записью итога.
 - `.github/workflows/plugin.yml` и `scripts/ci.mjs` — проверка плагина на трёх системах в GitHub Actions.
 - `scripts/release.mjs` — команда релиза: запись для каталога Orca.
 - `package.json` — только инструменты разработки (TypeScript для проверки типов).
@@ -83,8 +84,12 @@ CLI Orca — `ORCA_CLI_COMMAND` (его задают терминалы Orca), �
 bash 3.2 — поставьте новый (например `brew install bash`) раньше в PATH; со старым bash `make test` останавливается
 до тестов, а не проходит без записи. Каталог записи `TEST_RESULT_DIR` в виде Windows (`C:\…`) `make test` передаёт
 регистратору в виде оболочки (`cygpath -u` в Git Bash и MSYS2); если каталог не преобразовался, `make test`
-останавливается до тестов, а не идёт без записи. Фильтра по имени теста у `orca plugin test` нет:
-прогон с `test_args="--compact --filter=…"` запускает все тесты и записывается как отфильтрованный.
+останавливается до тестов, а не идёт без записи. Так же он останавливается, если во временном каталоге системы
+(`TMPDIR`, `TMP`, `TEMP`, иначе `/tmp`; путь Windows — через `cygpath -u`) не создать каталог прогона для записи.
+Фильтра по имени теста у `orca plugin test` нет: прогон с `test_args="--compact --filter=…"` запускает все тесты
+и записывается как отфильтрованный. Сводку тестов печатает `node` из PATH, которым `orca plugin test` их гоняет:
+без терминала Node до 22-й версии включительно печатает TAP, с 23-й — spec (`✔`, `ℹ pass N`); проверки
+зелёного прогона читают обе.
 
 ## Проверка на трёх системах (GitHub Actions)
 

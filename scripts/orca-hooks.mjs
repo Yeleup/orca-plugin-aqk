@@ -7,20 +7,23 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-// The scripts of orca.yaml (`scripts:` — each one a block scalar `name: |` or a one-line plain value), by name.
+// The scripts of orca.yaml (`scripts:` — each one a block scalar `name: |` or a one-line plain value), by name. A
+// comment line, at any indent, and a comment after a key belong to no script, as in YAML.
 export function orcaYamlScripts(text) {
   const lines = text.split(/\r?\n/)
-  const start = lines.findIndex((line) => /^scripts:\s*$/.test(line))
+  const start = lines.findIndex((line) => /^scripts:\s*(#.*)?$/.test(line))
   if (start < 0) throw new Error('orca.yaml has no scripts:')
   const scripts = {}
   for (let i = start + 1; i < lines.length; i++) {
     const line = lines[i]
+    if (/^\s*(#.*)?$/.test(line)) continue
     if (/^\S/.test(line)) break
-    const key = /^(\s+)([A-Za-z][\w-]*):\s*(.*)$/.exec(line)
+    const key = /^(\s+)([A-Za-z][\w-]*):(?:\s+(.*))?$/.exec(line)
     if (!key) continue
-    const [, indent, name, value] = key
+    const [, indent, name] = key
+    const value = (key[3] ?? '').replace(/(^|\s+)#.*$/, '').trim()
     if (!/^\|[-+]?$/.test(value)) {
-      scripts[name] = value.trim()
+      scripts[name] = value
       continue
     }
     const body = []
