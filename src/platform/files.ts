@@ -1,5 +1,6 @@
-// The file operations of the real machine: whether a file can be run, reading a text file, the entries of a directory,
-// and creating a file only if it is absent, in a way no reader ever sees half written.
+// The file operations of the real machine: whether a file can be run, reading a text file and the time of its last
+// write, the entries of a directory, and creating a file only if it is absent, in a way no reader ever sees half
+// written.
 import { randomUUID } from 'node:crypto'
 import { accessSync, constants, linkSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
@@ -19,6 +20,18 @@ export function isRunnableFile(path: string, system: Platform): boolean {
 export function readText(path: string): string | null {
   try {
     return readFileSync(path, 'utf8')
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return null
+    throw error
+  }
+}
+
+// When the file was last written (its modification time), in whole milliseconds since the epoch — as Date.now() counts
+// them, so that a time Orca took with it compares with the file's at the same precision; null when there is no such
+// file.
+export function modifiedAt(path: string): number | null {
+  try {
+    return Math.floor(statSync(path).mtimeMs)
   } catch (error) {
     if (errorCode(error) === 'ENOENT') return null
     throw error

@@ -1,21 +1,28 @@
 // The agents layer of the worker (src/agents/agents.ts) over a fake Orca (src/testing/fake-orca.ts: Orca's mock host
-// with the refusals of Orca 1.4.274, on a fake computer): which agent is launched where and with which prompt, what each
-// launch leaves in the data directory, which errors a launch gives, and what a stop closes and what it leaves. The layer
-// runs in a worker as Orca runs it (`mountWorker`: the host refuses what the manifest's capabilities do not allow); the
-// clock moves only when the test moves it. Invented project, issues, terminals and workspaces only.
+// with the refusals of Orca 1.4.274, on a fake computer): which agent is launched where and with which prompt, what
+// each launch leaves in the data directory, which errors a launch gives, what a stop closes and what it leaves, what
+// state of the agent Orca shows, when the task counts as delivered and when the report on it is ready. The layer runs
+// in a worker as Orca runs it (`mountWorker`: the host refuses what the manifest's capabilities do not allow, and
+// delivers the events the manifest lists); the clock moves only when the test moves it, and a file's time of last write
+// is the clock's reading when it was written. Invented project, issues, terminals and workspaces only.
 import { assert, hostError, mountWorker, test, type TestWorker } from 'orca/testing'
+import type { PluginEvents } from 'orca/worker'
 import type { Machine } from '../platform/machine'
 import { dataDirectory, dataName, dataPath } from '../platform/paths'
-import type { AgentRole, ProjectAgents } from '../project/settings'
+import { DEFAULT_AGENTS, type AgentRole, type ProjectAgents } from '../project/settings'
 import { fakeOrca, type FakeOrca } from '../testing/fake-orca'
 import {
-  Agents,
+  DELIVERY_DEADLINE_MS,
   issueTask,
   ORCA_TEXT_MAX,
+  startAgents,
   type AgentLaunch,
+  type Agents,
+  type AgentState,
   type LaunchFiles,
   type LaunchRequest,
   type ProjectRef,
+  type ReportReading,
   type StopResult,
   type TaskRef,
 } from './agents'
@@ -28,15 +35,16 @@ const AGENTS: ProjectAgents = { implementer: 'codex', reviewer: 'claude', solver
 
 type Rig = { readonly orca: FakeOrca; readonly worker: TestWorker; readonly agents: Agents; readonly dataDir: string }
 
-// A worker with the agents layer on the fake Orca: its host is the worker's, the computer the fake one (or `machine`,
-// which wraps it), the data directory the one of that computer unless the test names another.
+// A worker with the agents layer on the fake Orca, as the worker starts it (startAgents: Orca's agent.status.changed
+// goes to it): its host is the worker's, the computer the fake one (or `machine`, which wraps it), the data directory
+// the one of that computer unless the test names another.
 async function mount(orca: FakeOrca, options: { readonly machine?: Machine; readonly dataDir?: string } = {}): Promise<Rig> {
   const dataDir = options.dataDir ?? dataDirectory(orca.machine)
   let agents: Agents | undefined
   const worker = await mountWorker(
     {
       default: (api) => {
-        agents = new Agents({ host: api.host, machine: options.machine ?? orca.machine, dataDir })
+        agents = startAgents(api, options.machine ?? orca.machine, dataDir)
       },
     },
     { host: orca.host },
@@ -107,6 +115,63 @@ function gate(): { readonly promise: Promise<void>; readonly open: () => void } 
 async function settle(): Promise<void> {
   // No timer: every pending promise gets the turns it needs.
   for (let turn = 0; turn < 100; turn++) await Promise.resolve()
+}
+
+// Orca's event for the agent of `launch`: its state, when Orca got it, and — `since` given — the main agent's same
+// state since then (without it Orca does not say when the state began).
+function status(
+  launch: Pick<AgentLaunch, 'workspaceId' | 'terminalId'>,
+  state: AgentState,
+  receivedAt: number,
+  since?: number,
+): PluginEvents['agent.status.changed'] {
+  return {
+    workspaceId: launch.workspaceId,
+    paneKey: `pane-${launch.terminalId}`,
+    terminalId: launch.terminalId,
+    state,
+    receivedAt,
+    ...(since === undefined ? {} : { mainAgent: { state, stateStartedAt: since } }),
+  }
+}
+
+// The reading «not ready» of the launch's report: Orca shows nothing, the agent has not started, no report file —
+// unless `fields` say otherwise.
+function notReady(launch: AgentLaunch, fields: Partial<Extract<ReportReading, { ready: false }>> = {}): ReportReading {
+  return {
+    ready: false,
+    state: null,
+    listed: false,
+    started: false,
+    reportFile: launch.reportFile,
+    reportExists: false,
+    writtenAfterDone: false,
+    failure: null,
+    ...fields,
+  }
+}
+
+// Launch `number` of the task as a new worker knows it: from its records in the data directory.
+function recorded(rig: Rig, task: TaskRef, number: number): AgentLaunch {
+  const record = rig.agents.launches(task).find((each) => each.number === number)
+  assert.ok(
+    record !== undefined &&
+      record.outcome === 'launched' &&
+      record.terminalId !== null &&
+      record.role !== null &&
+      record.agent !== null &&
+      record.language !== null &&
+      record.workspaceId !== null &&
+      record.launchedAt !== null,
+    JSON.stringify(record),
+  )
+  const { dir, taskFile, reportFile, role, agent, language, workspaceId, launchedAt, terminalId } = record
+  return { dir, taskFile, reportFile, task: record.task, number, role, agent, language, workspaceId, launchedAt, terminalId }
+}
+
+// The start of the launch's task, as the data directory keeps it.
+function startMark(orca: FakeOrca, launch: Pick<AgentLaunch, 'dir'>): string {
+  return dataPath(orca.machine, launch.dir, 'started-0')
 }
 
 test('Запуски решателя и агента старта берут агентов своих ролей из настроек проекта; каждый запуск задачи — свой номер и каталог с заданием, записью до запроса к Orca и записью её ответа; подсказка длиннее 4096 знаков — ошибка, Orca не вызвана', async () => {
@@ -1021,4 +1086,383 @@ test('Повторная остановка: запуск с меткой closed
   })
   assert.deepEqual(closes(orca), [first.terminalId, second.terminalId, third.terminalId, fourth.terminalId])
   await unlisted.worker.deactivate()
+})
+
+test('Запуск исполнителя через поддельный хост → agent.launch с агентом из настроек, worktree задачи и заданием; отчёт готов только после состояния «done» и появления файла отчёта', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const launch = await launched(r, 12, 'implementer')
+
+  // agent.launch: the implementer's agent of the settings, in the task's worktree, with the prompt naming the task file
+  // and the report file; the task file is the implementer's task, and it names the report file.
+  const dir = launchDir(r, 'issue-12', 1)
+  assert.deepEqual([launch.taskFile, launch.reportFile, launch.terminalId], [`${dir}/task.md`, `${dir}/report.md`, 'terminal-1'])
+  assert.deepEqual(orca.host.calls, [
+    {
+      method: 'agent.launch',
+      params: { workspaceId: 'workspace-issue-12', agent: 'codex', prompt: launchPrompt('ru', launch.taskFile, launch.reportFile) },
+    },
+  ])
+  assert.equal(orca.machine.files.get(launch.taskFile), request(12, 'implementer').taskText(launch))
+  assert.ok(orca.machine.files.get(launch.taskFile)?.startsWith('# Задание исполнителя: задача #12\n'))
+  assert.ok(orca.machine.files.get(launch.taskFile)?.includes(launch.reportFile))
+
+  // Orca has said nothing of the agent yet: the terminal is there, the agent has not started.
+  assert.deepEqual(await r.agents.report(launch), notReady(launch))
+  // The agent works on its task (Orca lists it and tells it) and writes its report, still in its turn: not ready.
+  orca.clock.advance(1_000)
+  orca.list(launch.terminalId, 'working', orca.clock.now())
+  await r.worker.emit('agent.status.changed', status(launch, 'working', orca.clock.now(), orca.clock.now()))
+  assert.deepEqual(await r.agents.report(launch), notReady(launch, { state: 'working', listed: true, started: true }))
+  orca.clock.advance(60_000)
+  orca.machine.files.set(launch.reportFile, 'Черновик отчёта.\n')
+  assert.deepEqual(await r.agents.report(launch), notReady(launch, { state: 'working', listed: true, started: true, reportExists: true }))
+  // It ends its turn with the report: ready, with the file's text.
+  orca.clock.advance(30_000)
+  orca.finishTurn(launch, 'Сделано: фильтр по цвету.\n')
+  assert.deepEqual(await r.agents.report(launch), { ready: true, text: 'Сделано: фильтр по цвету.\n', reportFile: launch.reportFile })
+
+  // The reviewer of the same task ends a turn without a report: «done» without the file is not ready.
+  const reviewer = await launched(r, 12, 'reviewer')
+  assert.equal(reviewer.agent, 'claude')
+  orca.list(reviewer.terminalId, 'done', orca.clock.now())
+  assert.deepEqual(await r.agents.report(reviewer), notReady(reviewer, { state: 'done', listed: true }))
+  // Orca was asked only its list of the task's workspace.
+  assert.deepEqual(orca.host.callsOf('agents.list'), Array(5).fill({ workspaceId: 'workspace-issue-12' }))
+  assert.deepEqual(r.worker.refusals, [])
+  await r.worker.deactivate()
+})
+
+test('Отчёт: файл есть, а агент working, blocked или waiting → не готов; «done» без файла → не готов; файл записан позже начала «done» → не готов, и ответ это называет; «done», начавшийся не раньше последней записи файла, → готов с текстом файла', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const launch = await launched(r, 30, 'implementer')
+  orca.clock.advance(1_000)
+  orca.list(launch.terminalId, 'working', orca.clock.now())
+  orca.clock.advance(60_000)
+  orca.machine.files.set(launch.reportFile, 'Отчёт: фильтр по цвету.\n')
+  // The report file is there, and the agent is still in its turn: working, waiting for a permission, idle.
+  for (const state of ['working', 'blocked', 'waiting'] as const) {
+    orca.clock.advance(1_000)
+    orca.list(launch.terminalId, state, orca.clock.now())
+    assert.deepEqual(await r.agents.report(launch), notReady(launch, { state, listed: true, started: true, reportExists: true }))
+  }
+
+  // «done» without the report file: not ready.
+  const silent = await launched(r, 31, 'implementer')
+  orca.list(silent.terminalId, 'done', orca.clock.now())
+  assert.deepEqual(await r.agents.report(silent), notReady(silent, { state: 'done', listed: true }))
+
+  // The agent is «done», and its report file is written after that «done» began — by one millisecond: not ready, and
+  // the reading says the file was written after it.
+  orca.clock.advance(1_000)
+  const doneAt = orca.clock.now()
+  orca.list(launch.terminalId, 'done', doneAt)
+  orca.clock.advance(1)
+  orca.machine.files.set(launch.reportFile, 'Отчёт: фильтр по цвету и размеру.\n')
+  assert.equal(orca.machine.modifiedAt(launch.reportFile), doneAt + 1)
+  assert.deepEqual(
+    await r.agents.report(launch),
+    notReady(launch, { state: 'done', listed: true, started: true, reportExists: true, writtenAfterDone: true }),
+  )
+  // A «done» that began at the very time of the file's last write: ready, with the text of the file.
+  orca.list(launch.terminalId, 'done', doneAt + 1)
+  assert.deepEqual(await r.agents.report(launch), {
+    ready: true,
+    text: 'Отчёт: фильтр по цвету и размеру.\n',
+    reportFile: launch.reportFile,
+  })
+  // And one that began later.
+  orca.list(launch.terminalId, 'done', doneAt + 5_000)
+  assert.equal((await r.agents.report(launch)).ready, true)
+  assert.deepEqual(r.worker.refusals, [])
+  await r.worker.deactivate()
+})
+
+test('Агент закончил ход без отчёта, начал новый ход и записал черновик, а задержанный ответ agents.list несёт снимок прежнего «done» → не готов, с событием нового working до ответа и без него', async () => {
+  for (const event of [false, true]) {
+    const orca = fakeOrca()
+    const r = await mount(orca)
+    const launch = await launched(r, 33, 'implementer')
+    // Turn 1: the agent works, then ends its turn without a report.
+    orca.clock.advance(1_000)
+    orca.list(launch.terminalId, 'working', orca.clock.now())
+    assert.deepEqual(await r.agents.report(launch), notReady(launch, { state: 'working', listed: true, started: true }))
+    orca.clock.advance(60_000)
+    const firstDone = orca.clock.now()
+    orca.list(launch.terminalId, 'done', firstDone)
+    assert.deepEqual(await r.agents.report(launch), notReady(launch, { state: 'done', listed: true, started: true }))
+
+    // The report is asked for: Orca answers with that «done», and its answer reaches the worker late.
+    const held = gate()
+    orca.listGate = held.promise
+    const reading = r.agents.report(launch)
+    await settle()
+    // Meanwhile the agent starts a new turn — Orca tells it to the worker or not — and writes a draft of its report.
+    orca.clock.advance(5_000)
+    orca.list(launch.terminalId, 'working', orca.clock.now())
+    // The test worker's emit settles once the host has no call pending: its handler runs at once, and the emit is
+    // awaited after the list's answer is let go.
+    const emitted = event ? r.worker.emit('agent.status.changed', status(launch, 'working', orca.clock.now(), orca.clock.now())) : null
+    orca.clock.advance(5_000)
+    orca.machine.files.set(launch.reportFile, 'Черновик отчёта.\n')
+    orca.listGate = null
+    held.open()
+    await emitted
+    // The late answer's «done» began before the draft was written: not ready.
+    assert.deepEqual(
+      await reading,
+      notReady(launch, { state: 'done', listed: true, started: true, reportExists: true, writtenAfterDone: true }),
+      `the event of the new turn ${event ? 'heard' : 'not heard'}`,
+    )
+    // Orca's current list: the new turn.
+    assert.deepEqual(await r.agents.report(launch), notReady(launch, { state: 'working', listed: true, started: true, reportExists: true }))
+    // The agent ends the new turn with its report: ready, with that text.
+    orca.clock.advance(30_000)
+    orca.finishTurn(launch, 'Отчёт: фильтр по цвету.\n')
+    assert.deepEqual(await r.agents.report(launch), { ready: true, text: 'Отчёт: фильтр по цвету.\n', reportFile: launch.reportFile })
+    assert.deepEqual(r.worker.refusals, [])
+    await r.worker.deactivate()
+  }
+})
+
+test('При файле отчёта событие «done», с временем начала и без него, не делает отчёт готовым, когда список Orca называет агента working или не называет его вовсе; ответ говорит, называет ли агента список; список с «done» не раньше записи файла → готов', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const launch = await launched(r, 34, 'implementer')
+  orca.clock.advance(1_000)
+  orca.list(launch.terminalId, 'working', orca.clock.now())
+  orca.clock.advance(60_000)
+  orca.machine.files.set(launch.reportFile, 'Отчёт: фильтр по цвету.\n')
+  orca.clock.advance(1_000)
+  const after = orca.clock.now()
+
+  // Orca tells «done» — with the main agent's start after the file's last write, then without a start — while its list
+  // names the agent working: the list's state, not ready.
+  const working = notReady(launch, { state: 'working', listed: true, started: true, reportExists: true })
+  await r.worker.emit('agent.status.changed', status(launch, 'done', after, after))
+  assert.deepEqual(await r.agents.report(launch), working)
+  await r.worker.emit('agent.status.changed', status(launch, 'done', after + 1_000))
+  assert.deepEqual(await r.agents.report(launch), working)
+
+  // The list no longer names the agent: its state is the latest event's, and the report is not confirmed — with the
+  // start of «done» after the file and without it.
+  orca.unlist(launch.terminalId)
+  const unlisted = notReady(launch, { state: 'done', listed: false, started: true, reportExists: true })
+  assert.deepEqual(await r.agents.report(launch), unlisted)
+  assert.deepEqual(await r.agents.state(launch), { state: 'done', since: null })
+  await r.worker.emit('agent.status.changed', status(launch, 'done', after + 2_000, after + 2_000))
+  assert.deepEqual(await r.agents.state(launch), { state: 'done', since: after + 2_000 })
+  assert.deepEqual(await r.agents.report(launch), unlisted)
+  // A late event of an earlier state, both starts known, does not replace the later one.
+  await r.worker.emit('agent.status.changed', status(launch, 'working', after + 3_000, after - 30_000))
+  assert.deepEqual(await r.agents.state(launch), { state: 'done', since: after + 2_000 })
+
+  // After a restart of the worker the same: a «done» the new worker hears for an agent the list does not name confirms
+  // nothing.
+  await r.worker.deactivate()
+  const restarted = await mount(orca)
+  const again = recorded(restarted, issueTask(PROJECT, 34), 1)
+  await restarted.worker.emit('agent.status.changed', status(again, 'done', after + 4_000))
+  assert.deepEqual(await restarted.agents.report(again), unlisted)
+
+  // The list names the agent «done», begun after the file's last write: ready.
+  orca.list(launch.terminalId, 'done', after + 5_000)
+  assert.deepEqual(await restarted.agents.report(again), { ready: true, text: 'Отчёт: фильтр по цвету.\n', reportFile: launch.reportFile })
+  assert.deepEqual(restarted.worker.refusals, [])
+  await restarted.worker.deactivate()
+})
+
+test('Терминал открыт, хода нет → через 10 минут после запуска ответ называет сбой доставки с состоянием Orca, для blocked — что агент ждёт человека; working, увиденный вовремя, → сбоя нет и через несколько сроков', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  // Orca opened the terminals; the prompts did not get through. One agent Orca lists idle, one waits for a person
+  // (a trust prompt) before its first turn, of one Orca says nothing.
+  const idle = await launched(r, 40, 'implementer')
+  orca.list(idle.terminalId, 'waiting', idle.launchedAt + 2_000)
+  const blocked = await launched(r, 41, 'implementer')
+  orca.list(blocked.terminalId, 'blocked', blocked.launchedAt + 2_000)
+  const silent = await launched(r, 42, 'implementer')
+  // One agent starts its turn in time: Orca tells it in an event.
+  const working = await launched(r, 43, 'implementer')
+  await r.worker.emit('agent.status.changed', status(working, 'working', working.launchedAt + 3_000, working.launchedAt + 3_000))
+  assert.ok(orca.machine.files.has(startMark(orca, working)))
+
+  orca.clock.advance(DELIVERY_DEADLINE_MS - 1)
+  assert.deepEqual(await r.agents.report(idle), notReady(idle, { state: 'waiting', listed: true }))
+  assert.deepEqual(await r.agents.report(silent), notReady(silent))
+
+  orca.clock.advance(1)
+  assert.deepEqual(
+    await r.agents.report(idle),
+    notReady(idle, {
+      state: 'waiting',
+      listed: true,
+      failure: {
+        state: 'waiting',
+        error: 'the task did not reach the agent "codex" in terminal terminal-1: no turn in 10 minutes after the launch (Orca shows it waiting)',
+      },
+    }),
+  )
+  assert.deepEqual(
+    await r.agents.report(blocked),
+    notReady(blocked, {
+      state: 'blocked',
+      listed: true,
+      failure: {
+        state: 'blocked',
+        error:
+          'the agent "codex" in terminal terminal-2 has not started on its task in 10 minutes after the launch: Orca shows it blocked — it waits for a person (a permission, a trust prompt)',
+      },
+    }),
+  )
+  assert.deepEqual(
+    await r.agents.report(silent),
+    notReady(silent, {
+      failure: {
+        state: null,
+        error: 'the task did not reach the agent "codex" in terminal terminal-3: no turn in 10 minutes after the launch (Orca shows nothing of it)',
+      },
+    }),
+  )
+  for (const launch of [idle, blocked, silent]) assert.equal(orca.machine.files.has(startMark(orca, launch)), false)
+
+  // The turn seen in time: no failure several deadlines later, also while the agent now waits for a permission.
+  orca.clock.advance(3 * DELIVERY_DEADLINE_MS)
+  assert.deepEqual(await r.agents.report(working), notReady(working, { state: 'working', started: true }))
+  orca.list(working.terminalId, 'blocked', orca.clock.now())
+  assert.deepEqual(await r.agents.report(working), notReady(working, { state: 'blocked', listed: true, started: true }))
+  assert.deepEqual(r.worker.refusals, [])
+  await r.worker.deactivate()
+})
+
+test('working до перезапуска воркера, после него blocked без отчёта за сроком → не сбой; working, услышанный до ответа Orca на запуск, оставляет ту же отметку на диске', async () => {
+  // The agent starts its task (Orca tells it), then the worker restarts. The start is on disk.
+  const orca = fakeOrca()
+  const first = await mount(orca)
+  const launch = await launched(first, 50, 'implementer')
+  assert.equal(orca.machine.files.has(startMark(orca, launch)), false)
+  await first.worker.emit('agent.status.changed', status(launch, 'working', launch.launchedAt + 1_000, launch.launchedAt + 1_000))
+  assert.equal(orca.machine.files.get(startMark(orca, launch)), `${launch.launchedAt}\n`)
+  await first.worker.deactivate()
+
+  // After the restart the agent waits for a person's permission: blocked, no report, the deadline long past — no
+  // failure.
+  orca.list(launch.terminalId, 'blocked', launch.launchedAt + 2_000)
+  orca.clock.advance(DELIVERY_DEADLINE_MS + 1)
+  const restarted = await mount(orca)
+  const again = recorded(restarted, issueTask(PROJECT, 50), 1)
+  assert.deepEqual(await restarted.agents.report(again), notReady(again, { state: 'blocked', listed: true, started: true }))
+  // An agent of the new worker that never started — blocked before its first turn — is the failed delivery.
+  const other = await launched(restarted, 51, 'implementer')
+  orca.list(other.terminalId, 'blocked', other.launchedAt + 500)
+  orca.clock.advance(DELIVERY_DEADLINE_MS)
+  const late = await restarted.agents.report(other)
+  assert.ok(!late.ready && late.failure?.state === 'blocked', JSON.stringify(late))
+  await restarted.worker.deactivate()
+
+  // Orca tells the turn of the agent in the terminal it opens (terminal-1) before it answers the launch.
+  const early = fakeOrca()
+  const r = await mount(early)
+  const held = gate()
+  early.launchGate = held.promise
+  const launching = r.agents.launch(request(52, 'implementer'))
+  await settle()
+  const startedAt = early.clock.now() + 500
+  // The test worker's emit settles once the host has no call pending: its handler runs at once, and the emit is
+  // awaited after Orca's answer is let go.
+  const emitted = r.worker.emit('agent.status.changed', {
+    workspaceId: 'workspace-issue-52',
+    paneKey: 'pane-terminal-1',
+    terminalId: 'terminal-1',
+    state: 'working',
+    receivedAt: startedAt,
+    mainAgent: { state: 'working', stateStartedAt: startedAt },
+  })
+  early.launchGate = null
+  held.open()
+  await emitted
+  const result = await launching
+  assert.ok(result.ok && result.launch.terminalId === 'terminal-1', JSON.stringify(result))
+  // The same mark, there when the launch's result is.
+  assert.ok(early.machine.files.has(startMark(early, result.launch)))
+  await r.worker.deactivate()
+  early.list('terminal-1', 'blocked', startedAt + 1_000)
+  early.clock.advance(DELIVERY_DEADLINE_MS + 1)
+  const later = await mount(early)
+  const relaunch = recorded(later, issueTask(PROJECT, 52), 1)
+  assert.deepEqual(await later.agents.report(relaunch), notReady(relaunch, { state: 'blocked', listed: true, started: true }))
+  assert.deepEqual(later.worker.refusals, [])
+  await later.worker.deactivate()
+})
+
+test('Запуск прежнего воркера новый воркер знает с первого чтения его состояния или отчёта: ход, услышанный до чтения, отмечается на диске при чтении, после чтения — сразу; до чтения отметки нет', async () => {
+  const orca = fakeOrca()
+  const first = await mount(orca)
+  const heardBefore = await launched(first, 70, 'implementer')
+  const heardAfter = await launched(first, 71, 'implementer')
+  await first.worker.deactivate()
+
+  const restarted = await mount(orca)
+  const before = recorded(restarted, issueTask(PROJECT, 70), 1)
+  const after = recorded(restarted, issueTask(PROJECT, 71), 1)
+  // A turn of launch 70 before the new worker has read anything of it: no mark yet.
+  orca.clock.advance(1_000)
+  await restarted.worker.emit('agent.status.changed', status(before, 'working', orca.clock.now(), orca.clock.now()))
+  assert.equal(orca.machine.files.has(startMark(orca, heardBefore)), false)
+  // Its first reading — of the state — keeps that turn on disk.
+  assert.deepEqual(await restarted.agents.state(before), { state: 'working', since: orca.clock.now() })
+  assert.equal(orca.machine.files.get(startMark(orca, heardBefore)), `${orca.clock.now()}\n`)
+  // Launch 71: read first, its turn heard later — on disk at once, with no reading after it.
+  assert.equal(await restarted.agents.state(after), null)
+  orca.clock.advance(1_000)
+  await restarted.worker.emit('agent.status.changed', status(after, 'working', orca.clock.now(), orca.clock.now()))
+  assert.equal(orca.machine.files.get(startMark(orca, heardAfter)), `${orca.clock.now()}\n`)
+  await restarted.worker.deactivate()
+
+  // A worker started later sees both started, though Orca now shows them blocked and the deadline is long past.
+  orca.list(before.terminalId, 'blocked', orca.clock.now())
+  orca.list(after.terminalId, 'blocked', orca.clock.now())
+  orca.clock.advance(DELIVERY_DEADLINE_MS)
+  const third = await mount(orca)
+  for (const launch of [before, after]) {
+    assert.deepEqual(await third.agents.report(launch), notReady(launch, { state: 'blocked', listed: true, started: true }))
+  }
+  assert.deepEqual(third.worker.refusals, [])
+  await third.worker.deactivate()
+})
+
+test('После перезапуска воркера без единого события список Orca с «done» не раньше записи файла → готов; список не читается → ошибка, а не «не готов»', async () => {
+  const orca = fakeOrca({ platform: 'win32' })
+  const first = await mount(orca)
+  const launch = await launched(first, 60, 'implementer', DEFAULT_AGENTS)
+  assert.equal(launch.agent, 'claude')
+  assert.ok(launch.reportFile.startsWith('C:\\Users\\Avery\\AppData\\Local\\orca-agent-queue\\projects\\'), launch.reportFile)
+  await first.worker.deactivate()
+  // While no worker runs the agent works and ends its turn with its report.
+  orca.clock.advance(5 * 60_000)
+  orca.finishTurn(launch, 'Готово.\n')
+  orca.ownerTerminal('workspace-issue-60')
+
+  // The new worker has heard no event: Orca's list gives the state, and confirms the report.
+  const restarted = await mount(orca)
+  const again = recorded(restarted, issueTask(PROJECT, 60), 1)
+  assert.deepEqual(await restarted.agents.state(again), { state: 'done', since: orca.clock.now() })
+  assert.deepEqual(await restarted.agents.report(again), { ready: true, text: 'Готово.\n', reportFile: launch.reportFile })
+
+  // Orca cannot give its list: an error, neither «not ready» nor «no state».
+  orca.listError = { code: 'unavailable', message: 'Orca is restarting' }
+  const unreadable = (error: unknown) =>
+    error instanceof Error &&
+    error.message === "Orca's list of the agents of workspace workspace-issue-60 could not be read: unavailable: Orca is restarting"
+  await assert.rejects(restarted.agents.report(again), unreadable)
+  await assert.rejects(restarted.agents.state(again), unreadable)
+  orca.listError = null
+
+  // Orca no longer names the agent and this worker heard nothing of it: no state, the report not confirmed.
+  orca.unlist(launch.terminalId)
+  assert.equal(await restarted.agents.state(again), null)
+  assert.deepEqual(await restarted.agents.report(again), notReady(again, { started: true, reportExists: true }))
+  assert.deepEqual(restarted.worker.refusals, [])
+  await restarted.worker.deactivate()
 })

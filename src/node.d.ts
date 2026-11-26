@@ -60,6 +60,8 @@ declare module 'node:fs' {
   export function closeSync(fd: number): void
   export function unlinkSync(path: string): void
   export function chmodSync(path: string, mode: number): void
+  // Times as seconds since the epoch (a fraction for less than a second) or as dates.
+  export function utimesSync(path: string, atime: number | Date, mtime: number | Date): void
   export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void
 }
 

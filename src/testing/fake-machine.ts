@@ -1,7 +1,9 @@
 // A fake computer for the plugin's tests: any system (linux, darwin, win32) on any real one, an invented environment
 // and home directory, files in memory, a clock that moves only when told, and a process start that records each
 // request and answers it as the test says. Nothing here touches the real disk or starts a real process. Symbolic links
-// (`links`) work as on a disk: reads and writes through one land in its target, and a directory lists it as a link.
+// (`links`) work as on a disk: reads and writes through one land in its target, and a directory lists it as a link. A
+// file's time of last write is the clock's reading at the moment it was written — by the test (`files.set`) or by
+// createText.
 import type { DirectoryEntry, Env, Machine, Platform, StartOutcome, StartRequest } from '../platform/machine'
 
 export type FakeAnswer = Partial<Omit<StartOutcome, 'startError'>> & {
@@ -15,7 +17,8 @@ export type FakeClock = { now(): number; advance(ms: number): void }
 export type FakeMachine = Machine & {
   // Every process start, in order.
   readonly starts: StartRequest[]
-  // The files in memory by their exact path, including those createText made.
+  // The files in memory by their exact path, including those createText made. Setting one is writing it: its time of
+  // last write becomes the clock's reading.
   readonly files: Map<string, string>
   // Symbolic links (or Windows junctions) to directories: the link's path and the directory it points to.
   readonly links: Map<string, string>
@@ -107,7 +110,27 @@ export function fakeMachine(options: FakeMachineOptions): FakeMachine {
   // Windows file names have no case.
   const same = (a: string, b: string) => (windows ? a.toLowerCase() === b.toLowerCase() : a === b)
   const executables = [...(options.executables ?? [])]
-  const files = new Map<string, string>(Object.entries(options.files ?? {}))
+  const clock = options.clock ?? fakeClock()
+  // When each file was last written: the fake clock's reading at the moment the test (files.set) or createText wrote
+  // it.
+  const written = new Map<string, number>()
+  const files = new Map<string, string>()
+  const put = files.set.bind(files)
+  const remove = files.delete.bind(files)
+  const empty = files.clear.bind(files)
+  files.set = (path, text) => {
+    written.set(path, clock.now())
+    return put(path, text)
+  }
+  files.delete = (path) => {
+    written.delete(path)
+    return remove(path)
+  }
+  files.clear = () => {
+    written.clear()
+    empty()
+  }
+  for (const [path, text] of Object.entries(options.files ?? {})) files.set(path, text)
   const links = new Map<string, string>()
   const separators = windows ? /[\\/]/ : /\//
   const parts = (path: string) => path.split(separators).filter((part) => part !== '')
@@ -128,7 +151,6 @@ export function fakeMachine(options: FakeMachineOptions): FakeMachine {
     return [...files.keys()].find((key) => same(key, target))
   }
   const starts: StartRequest[] = []
-  const clock = options.clock ?? fakeClock()
   return {
     platform: options.platform,
     env: options.env ?? {},
@@ -140,6 +162,10 @@ export function fakeMachine(options: FakeMachineOptions): FakeMachine {
     readText: (path) => {
       const key = find(path)
       return key === undefined ? null : (files.get(key) ?? null)
+    },
+    modifiedAt: (path) => {
+      const key = find(path)
+      return key === undefined ? null : (written.get(key) ?? null)
     },
     // A directory exists while a file is in it (or deeper), or a link: what is right inside it, in order of names.
     listEntries: (path) => {

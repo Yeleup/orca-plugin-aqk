@@ -1,15 +1,21 @@
 // A fake Orca for the tests of the agents layer, over Orca's mock host (`mockHost` refuses a call without its manifest
 // capability, or with params Orca would refuse — an agent it does not know among them — exactly as Orca does): the
 // workspaces' terminals, the ones the plugin opened with `agent.launch` and the ones the owner opened, the focused
-// workspace, and a fake computer with a clock that moves only when the test moves it. It refuses what Orca 1.4.274
-// refuses (out/main/index.js of its app.asar): `terminal.close` of a terminal the plugin neither opened nor has in the
-// focused workspace — action_failed, as for a terminal that is no longer there. `agent.launch` shows the test its
-// params the moment it is called (`onLaunch`, before any wait), opens the agent's terminal and answers (`launchGate`
-// holds the answer back); `terminal.close` waits for `closeGate`; `terminal.list` names the open terminals of a
-// workspace, and says the list is cut short while `listTruncated` is set.
+// workspace, the agents Orca lists, and a fake computer with a clock that moves only when the test moves it. It refuses
+// what Orca 1.4.274 refuses (out/main/index.js of its app.asar): `terminal.close` of a terminal the plugin neither
+// opened nor has in the focused workspace — action_failed, as for a terminal that is no longer there. `agent.launch`
+// shows the test its params the moment it is called (`onLaunch`, before any wait), opens the agent's terminal and
+// answers (`launchGate` holds the answer back); `terminal.close` waits for `closeGate`; `terminal.list` names the open
+// terminals of a workspace, and says the list is cut short while `listTruncated` is set. `agents.list` names the agents
+// of a workspace in the states the test listed (`list`, `unlist`), as they are when Orca gets the call: `listGate`
+// holds that answer back — it reaches the worker late, with the states of the moment of the call — and `listError`
+// makes Orca refuse it. `finishTurn` is an agent ending its turn with its report: the report file written, the agent
+// listed «done» from that moment. Orca's events (`agent.status.changed`) the test sends to its worker itself (`emit`).
 import { hostError, mockHost, type MockHost } from 'orca/testing'
 import type { Platform } from '../platform/machine'
 import { fakeMachine, type FakeClock, type FakeMachine } from './fake-machine'
+
+export type FakeAgentState = 'working' | 'blocked' | 'waiting' | 'done'
 
 export type FakeTerminal = {
   readonly id: string
@@ -38,6 +44,17 @@ export type FakeOrca = {
   closeGate: Promise<void> | null
   // While set, `terminal.list` answers that its list is cut short (Orca lists at most 50 terminals).
   listTruncated: boolean
+  // While set, `agents.list` answers only once the promise settles — with the states listed when it was called.
+  listGate: Promise<void> | null
+  // While set, Orca refuses `agents.list` with this error.
+  listError: { readonly code: string; readonly message: string } | null
+  // The agent of a terminal as `agents.list` names it from now on: its state, and since when.
+  list(terminalId: string, state: FakeAgentState, stateStartedAt: number): void
+  // `agents.list` no longer names the agent of the terminal.
+  unlist(terminalId: string): void
+  // The agent of the terminal ends its turn with its report: `text` written to `reportFile` now, and the agent listed
+  // «done» from now on (the clock's reading, which is also the file's time of last write).
+  finishTurn(launch: { readonly terminalId: string; readonly reportFile: string }, text: string): void
   // A terminal the owner opened in a workspace.
   ownerTerminal(workspaceId: string): string
 }
@@ -45,6 +62,7 @@ export type FakeOrca = {
 export function fakeOrca(options: { readonly platform?: Platform; readonly results?: Record<string, unknown> } = {}): FakeOrca {
   const machine = fakeMachine({ platform: options.platform ?? 'linux' })
   const terminals = new Map<string, FakeTerminal>()
+  const listed = new Map<string, { readonly state: FakeAgentState; readonly stateStartedAt: number }>()
   let opened = 0
 
   const host = mockHost({
@@ -79,6 +97,18 @@ export function fakeOrca(options: { readonly platform?: Platform; readonly resul
         terminals: [...terminals.values()].filter((t) => t.open && t.workspaceId === params.workspaceId).map((t) => ({ id: t.id })),
         truncated: fake.listTruncated,
       }),
+      'agents.list': async (params: { workspaceId?: string }) => {
+        if (fake.listError !== null) throw hostError(fake.listError.code, fake.listError.message)
+        // The states as Orca has them when it gets the call.
+        const agents = [...terminals.values()].flatMap((terminal) => {
+          const entry = listed.get(terminal.id)
+          if (entry === undefined || terminal.workspaceId !== params.workspaceId) return []
+          return [{ terminalId: terminal.id, title: null, agent: terminal.agent, state: entry.state, stateStartedAt: entry.stateStartedAt }]
+        })
+        const gate = fake.listGate
+        if (gate !== null) await gate
+        return { agents }
+      },
       ...options.results,
     },
   })
@@ -93,6 +123,18 @@ export function fakeOrca(options: { readonly platform?: Platform; readonly resul
     launchGate: null,
     closeGate: null,
     listTruncated: false,
+    listGate: null,
+    listError: null,
+    list: (terminalId, state, stateStartedAt) => {
+      listed.set(terminalId, { state, stateStartedAt })
+    },
+    unlist: (terminalId) => {
+      listed.delete(terminalId)
+    },
+    finishTurn: (launch, text) => {
+      machine.files.set(launch.reportFile, text)
+      listed.set(launch.terminalId, { state: 'done', stateStartedAt: machine.clock.now() })
+    },
     ownerTerminal: (workspaceId) => {
       const id = `terminal-of-the-owner-${terminals.size + 1}`
       terminals.set(id, { id, workspaceId, agent: null, byPlugin: false, open: true, prompt: null })

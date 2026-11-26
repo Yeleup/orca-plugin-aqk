@@ -1,11 +1,13 @@
 // Creating a file only if absent (the coordinator id's file), on the real disk: the finished text gets its name by a
 // hard link only, so an existing file is never replaced; without hard links nothing is created. The entries of a
-// directory, on the real disk.
+// directory, on the real disk. The time of a file's last write, on the real disk and on the fake computer.
 import { assert, test } from 'orca/testing'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fakeMachine } from '../testing/fake-machine'
 import { createText, listEntries } from './files'
+import { realMachine } from './machine'
 
 async function withTempDir(body: (dir: string) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'agent-queue-files-'))
@@ -63,4 +65,45 @@ test('записи каталога: настоящий каталог, файл
     // A file, not a directory: an error, not «no directory».
     assert.throws(() => listEntries(join(agents, 'notes.md')))
   })
+})
+
+test('Время последней записи файла читается на настоящем компьютере во временном каталоге и на поддельном — по его часам', async () => {
+  await withTempDir(async (dir) => {
+    const machine = realMachine()
+    const path = join(dir, 'agents', '1', 'report.md')
+    assert.equal(machine.modifiedAt(path), null)
+    await machine.createText(path, 'Черновик.\n')
+    // The time the disk keeps for the file, in whole milliseconds.
+    assert.equal(machine.modifiedAt(path), Math.floor(statSync(path).mtimeMs))
+    // A time set on the file, with a fraction of a millisecond: read in whole milliseconds, the fraction dropped.
+    const written = Date.UTC(2026, 0, 15, 9, 30, 0, 250)
+    utimesSync(path, (written + 0.7) / 1000, (written + 0.7) / 1000)
+    assert.equal(machine.modifiedAt(path), written)
+    // Written again: a later time.
+    writeFileSync(path, 'Отчёт.\n')
+    const rewritten = machine.modifiedAt(path)
+    assert.ok(rewritten !== null && rewritten > written, String(rewritten))
+    rmSync(path)
+    assert.equal(machine.modifiedAt(path), null)
+  })
+
+  // The fake computer: the clock's reading when the test or createText wrote the file.
+  const fake = fakeMachine({ platform: 'win32', files: { 'C:\\data\\given.md': 'given\n' } })
+  const t0 = fake.clock.now()
+  assert.equal(fake.modifiedAt('C:\\data\\given.md'), t0)
+  fake.clock.advance(1_500)
+  fake.files.set('C:\\data\\report.md', 'Черновик.\n')
+  fake.clock.advance(500)
+  assert.equal(await fake.createText('C:\\data\\created.md', 'created\n'), true)
+  fake.clock.advance(500)
+  assert.deepEqual(
+    ['C:\\data\\given.md', 'C:\\data\\report.md', 'C:\\data\\created.md'].map((path) => fake.modifiedAt(path)),
+    [t0, t0 + 1_500, t0 + 2_000],
+  )
+  // Names without case, as on Windows; a file written again has the new reading; no file — null.
+  fake.files.set('C:\\data\\report.md', 'Отчёт.\n')
+  assert.equal(fake.modifiedAt('c:\\DATA\\Report.md'), t0 + 2_500)
+  fake.files.delete('C:\\data\\report.md')
+  assert.equal(fake.modifiedAt('C:\\data\\report.md'), null)
+  assert.equal(fake.modifiedAt('C:\\data\\missing.md'), null)
 })

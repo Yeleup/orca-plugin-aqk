@@ -8,11 +8,14 @@ import { hostname, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { platform } from 'node:process'
 import * as main from './worker'
-import { startWorker } from './worker'
+import { startPlugin, startWorker } from './worker'
+import { issueTask } from './agents/agents'
 import { COORDINATOR_ID_FILE, ensureCoordinatorId, isCoordinatorId } from './platform/coordinator-id'
 import { realPlatform } from './platform/machine'
 import { dataDirectory, dataPath } from './platform/paths'
+import { DEFAULT_AGENTS } from './project/settings'
 import { fakeMachine } from './testing/fake-machine'
+import { fakeOrca } from './testing/fake-orca'
 import { withTemporaryHome } from './testing/temporary-home'
 
 const STARTED = /^agent-queue: worker started, coordinator ([0-9a-f-]{36})$/
@@ -100,6 +103,62 @@ test('Каркас панели: воркер отвечает панели на
     assert.deepEqual(worker.posts, [])
     await worker.deactivate()
   })
+})
+
+// The manifest lists Orca's agent.status.changed (with agent:read): Orca delivers no event a manifest does not list,
+// and the mock host refuses to emit it. The worker is started as activate starts it (startPlugin), on a fake computer
+// and a fake Orca: files in memory, a clock that moves only when told.
+test('Воркер, запущенный так же, как в activate, получает agent.status.changed, и состояние агента в слое меняется; событие чужого терминала ничего не меняет', async () => {
+  const orca = fakeOrca()
+  let started: Awaited<ReturnType<typeof startPlugin>> | undefined
+  const worker = await mountWorker(
+    {
+      default: async (api) => {
+        started = await startPlugin(api, orca.machine)
+      },
+    },
+    { host: orca.host },
+  )
+  assert.ok(started)
+  assert.ok(started.coordinatorId !== null && isCoordinatorId(started.coordinatorId))
+  coordinatorOf(worker.logs)
+  const result = await started.agents.launch({
+    task: issueTask({ id: 'example-org/sample-shop', hostId: 'local' }, 7),
+    role: 'implementer',
+    agents: DEFAULT_AGENTS,
+    language: 'en',
+    workspaceId: 'workspace-issue-7',
+    taskText: () => '# Task\n',
+  })
+  assert.ok(result.ok, JSON.stringify(result))
+  const { launch } = result
+  assert.equal(await started.agents.state(launch), null)
+  const event = (terminalId: string, state: 'working' | 'blocked' | 'done', since?: number) => ({
+    workspaceId: 'workspace-issue-7',
+    paneKey: `pane-${terminalId}`,
+    terminalId,
+    state,
+    receivedAt: orca.clock.now(),
+    ...(since === undefined ? {} : { mainAgent: { state, stateStartedAt: since } }),
+  })
+
+  // Another terminal's agent: nothing changes for this one.
+  await worker.emit('agent.status.changed', event('terminal-of-someone-else', 'working', orca.clock.now()))
+  assert.equal(await started.agents.state(launch), null)
+  // Its own terminal: the state Orca tells, since when the main agent's state began.
+  orca.clock.advance(1_000)
+  await worker.emit('agent.status.changed', event(launch.terminalId, 'working', orca.clock.now()))
+  assert.deepEqual(await started.agents.state(launch), { state: 'working', since: orca.clock.now() })
+  const startMark = dataPath(orca.machine, launch.dir, 'started-0')
+  assert.equal(orca.machine.files.get(startMark), `${orca.clock.now()}\n`)
+  // Without the main agent's state Orca does not say when the state began.
+  orca.clock.advance(1_000)
+  await worker.emit('agent.status.changed', event(launch.terminalId, 'blocked'))
+  assert.deepEqual(await started.agents.state(launch), { state: 'blocked', since: null })
+  await worker.emit('agent.status.changed', event('terminal-of-someone-else', 'done', orca.clock.now()))
+  assert.deepEqual(await started.agents.state(launch), { state: 'blocked', since: null })
+  assert.deepEqual(worker.refusals, [])
+  await worker.deactivate()
 })
 
 test('id координатора: проигравший одновременный запуск берёт id победителя; файл без id не заменяется', async () => {
