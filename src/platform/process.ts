@@ -35,8 +35,10 @@ export type ProcessIo = {
   write(fd: number, bytes: Uint8Array, offset: number): number
   close(fd: number): void
   codePage(): Promise<number | null>
-  // The taskkill program of the run's environment.
-  taskkill(env: Env): string
+  // The taskkill command that stops the tree of process `pid`, in the run's environment.
+  taskkill(env: Env, pid: number): { readonly file: string; readonly args: readonly string[] }
+  // How long taskkill may take before it is stopped itself.
+  readonly taskkillTimeoutMs: number
 }
 
 export const REAL_IO: ProcessIo = {
@@ -45,10 +47,12 @@ export const REAL_IO: ProcessIo = {
   write: (fd, bytes, offset) => writeSync(fd, bytes, offset),
   close: closeSync,
   codePage: () => consoleCodePage(),
-  taskkill: (variables) => {
+  taskkill: (variables, pid) => {
     const root = Object.entries(variables).find(([name]) => name.toUpperCase() === 'SYSTEMROOT')?.[1]
-    return root ? `${root}\\System32\\taskkill.exe` : 'taskkill.exe'
+    const file = root ? `${root}\\System32\\taskkill.exe` : 'taskkill.exe'
+    return { file, args: ['/pid', String(pid), '/T', '/F'] }
   },
+  taskkillTimeoutMs: TASKKILL_TIMEOUT_MS,
 }
 
 export function startProcess(request: StartRequest, io: ProcessIo = REAL_IO): Promise<StartOutcome> {
@@ -111,7 +115,10 @@ export function startProcess(request: StartRequest, io: ProcessIo = REAL_IO): Pr
       try {
         file = io.open(request.outputFile)
       } catch (error) {
-        finish({ code: null, signal: null, startError: { code: errorCode(error), message: errorMessage(error) } })
+        // Not a missing program: the code stays null, so the run reports start_failed with the file's path.
+        const message =
+          `the output file ${request.outputFile} cannot be opened (${errorMessage(error)}); the program was not started`
+        finish({ code: null, signal: null, startError: { code: null, message } })
         return
       }
     }
@@ -181,6 +188,7 @@ function stopTree(child: ChildProcess, request: StartRequest, io: ProcessIo): Pr
   return new Promise((resolve) => {
     let done = false
     let said = ''
+    let killer: ChildProcess | null = null
     const end = (problem: string | null) => {
       if (done) return
       done = true
@@ -189,12 +197,15 @@ function stopTree(child: ChildProcess, request: StartRequest, io: ProcessIo): Pr
       child.kill('SIGKILL')
       resolve(`${problem}; only the started process was stopped, the processes it started may still run`)
     }
-    const limit = setTimeout(() => end(`taskkill gave no answer in ${TASKKILL_TIMEOUT_MS} ms`), TASKKILL_TIMEOUT_MS)
+    // At the limit the helper itself is stopped and its stderr closed, so nothing of it outlives the result.
+    const limit = setTimeout(() => {
+      killer?.kill('SIGKILL')
+      killer?.stderr?.destroy()
+      end(`taskkill gave no answer in ${io.taskkillTimeoutMs} ms`)
+    }, io.taskkillTimeoutMs)
     try {
-      const killer = spawn(io.taskkill(request.env), ['/pid', String(pid), '/T', '/F'], {
-        stdio: ['ignore', 'ignore', 'pipe'],
-        windowsHide: true,
-      })
+      const command = io.taskkill(request.env, pid)
+      killer = spawn(command.file, command.args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true })
       killer.stderr?.on('data', (chunk) => (said += new TextDecoder().decode(chunk)))
       killer.on('error', (error) => end(`taskkill did not start: ${error.message}`))
       killer.on('close', (code) => {

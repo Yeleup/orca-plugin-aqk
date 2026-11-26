@@ -1,7 +1,7 @@
 // Starting real processes with parts of the system replaced (ProcessIo): a disk that writes little at a time or fails, a
 // Windows run on any system with a taskkill that fails or a console code page, and the decoding of Windows output.
 import { assert, test } from 'orca/testing'
-import { mkdtempSync, readFileSync, rmSync, writeSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execPath, kill } from 'node:process'
@@ -73,14 +73,15 @@ test('файл вывода: запись по частям доходит до 
 })
 
 test('тайм-аут на Windows: taskkill запустился, но вышел с ошибкой — остановлен хотя бы запущенный процесс, причина в результате', async () => {
-  // A taskkill that fails: Node.js run with taskkill's arguments exits 1 (there is no script «/pid»).
-  const io: ProcessIo = { ...REAL_IO, windows: true, taskkill: () => execPath }
+  // A taskkill that starts and fails, as taskkill does without the right to stop a process.
+  const failing = "process.stderr.write('ERROR: Access is denied.\\n'); process.exit(1)"
+  const io: ProcessIo = { ...REAL_IO, windows: true, taskkill: () => ({ file: execPath, args: ['-e', failing] }) }
   const began = Date.now()
   const script = "process.stdout.write(process.pid + '\\n'); setInterval(() => {}, 1000)"
   const result = await runProgram(machineWith(io), execPath, ['-e', script], { timeoutMs: 1000 })
   assert.ok(Date.now() - began < 15_000, `the result took ${Date.now() - began} ms`)
   assert.equal(result.error?.kind, 'timed_out')
-  assert.match(result.error?.reason ?? '', /stopped after 1000 ms without an answer; taskkill exited 1/)
+  assert.match(result.error?.reason ?? '', /stopped after 1000 ms without an answer; taskkill exited 1: ERROR: Access is denied\./)
   assert.match(result.error?.reason ?? '', /only the started process was stopped/)
   const pid = Number(result.stdout.trim())
   let alive = true
@@ -135,4 +136,56 @@ test('вывод на Windows: все OEM-страницы консоли — 43
   assert.equal(decodeOutput(new Uint8Array([0x8e, 0xe8, 0xa8, 0xa1, 0xaa, 0xa0]), 866), 'Ошибка')
   // A code page nobody knows: UTF-8 with replacement characters (the output file keeps the bytes).
   assert.equal(decodeOutput(new Uint8Array([0x41, 0x9b]), 12345), 'A�')
+})
+
+// Whether process `pid` still runs after up to 3 s of waiting; a process left running is stopped, so a failing test
+// does not keep the test run waiting.
+async function stillRuns(pid: number): Promise<boolean> {
+  for (let i = 0; i < 30; i++) {
+    try {
+      kill(pid, 0)
+    } catch {
+      return false
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  kill(pid, 'SIGKILL')
+  return true
+}
+
+test('тайм-аут на Windows: taskkill завис — по своему пределу он сам остановлен, запущенный процесс остановлен, причина в результате', async () => {
+  await withTempDir(async (dir) => {
+    // A taskkill that starts and never answers; it notes its pid first.
+    const helperPid = join(dir, 'taskkill.pid')
+    const hang = `require('fs').writeFileSync(${JSON.stringify(helperPid)}, String(process.pid)); setInterval(() => {}, 1000)`
+    const io: ProcessIo = {
+      ...REAL_IO,
+      windows: true,
+      taskkill: () => ({ file: execPath, args: ['-e', hang] }),
+      taskkillTimeoutMs: 700,
+    }
+    const began = Date.now()
+    const script = "process.stdout.write(process.pid + '\\n'); setInterval(() => {}, 1000)"
+    const result = await runProgram(machineWith(io), execPath, ['-e', script], { timeoutMs: 500 })
+    assert.ok(Date.now() - began < 10_000, `the result took ${Date.now() - began} ms`)
+    assert.equal(result.error?.kind, 'timed_out')
+    assert.match(result.error?.reason ?? '', /taskkill gave no answer in 700 ms; only the started process was stopped/)
+    assert.equal(await stillRuns(Number(result.stdout.trim())), false, 'the started process still runs')
+    assert.equal(await stillRuns(Number(readFileSync(helperPid, 'utf8'))), false, 'taskkill still runs after the result')
+  })
+})
+
+test('файл вывода не открылся (нет его каталога) — программа не запускается: start_failed с путём файла, кода нет', async () => {
+  await withTempDir(async (dir) => {
+    const marker = join(dir, 'ran.txt')
+    const output = join(dir, 'missing', 'run.log')
+    const result = await runProgram(realMachine(), execPath, ['-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], {
+      outputFile: output,
+    })
+    assert.equal(result.error?.kind, 'start_failed', JSON.stringify(result))
+    assert.ok(result.error?.reason.includes(`the output file ${output} cannot be opened (ENOENT`), result.error?.reason)
+    assert.match(result.error?.reason ?? '', /the program was not started/)
+    assert.equal(result.code, null)
+    assert.equal(existsSync(marker), false, 'the program ran')
+  })
 })

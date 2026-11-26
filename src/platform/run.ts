@@ -124,12 +124,17 @@ export async function runProgram(
 // `%%cd:~,%`, which cmd.exe expands to a lone % instead of a variable. Delayed expansion is off (/v:OFF), command
 // extensions on (/e:ON). A batch file gets %1 in quotes and %~1 without them; a program a wrapper hands %* to reads
 // `""` inside quotes as one quote. An argument with a line break or NUL cannot reach a batch file intact: refused.
+// The batch file's own path is not escaped: one with " ^ or % in it (cmd.exe would read %TOOLS% as a variable) is
+// refused before the start, as Rust std's make_bat_command_line does.
 export function programInvocation(
   machine: Pick<Machine, 'platform' | 'env'>,
   file: string,
   args: readonly string[],
 ): Omit<StartRequest, 'env'> {
   if (machine.platform !== 'win32' || !/\.(cmd|bat)$/i.test(file)) return { file, args }
+  if (/["^%]/.test(file)) {
+    throw new Error(`cmd.exe cannot run a batch file whose path holds " ^ or %: ${file}; not started`)
+  }
   const line = [`"${file}"`, ...args.map(batchArgument)].join(' ')
   const cmdArgs = ['/e:ON', '/v:OFF', '/d', '/c', `"${line}"`]
   return { file: windowsShell(machine), args: cmdArgs, windowsVerbatimArguments: true }

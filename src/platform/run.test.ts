@@ -454,3 +454,20 @@ test('запуск программы на Windows: путь с расширен
     [`${cli} status --json`, 'C:\\Windows\\System32\\cmd.exe /e:ON /v:OFF /d /c ""C:\\Tools\\orca.cmd" status --json"'],
   )
 })
+
+test('запуск batch-файла на Windows: путь с " ^ или % — отказ до запуска (cmd.exe прочёл бы его по-своему); .exe с % в пути запускается как задан', async () => {
+  const win = fakeMachine({
+    platform: 'win32',
+    env: { Path: 'C:\\Tools', PATHEXT: '.COM;.EXE;.BAT;.CMD', COMSPEC: 'C:\\Windows\\System32\\cmd.exe', TOOLS: 'C:\\Tools' },
+    executables: ['C:\\work\\%TOOLS%\\check.cmd', 'C:\\work\\tools^x\\check.bat', 'C:\\work\\50%\\check.exe'],
+  })
+  for (const file of ['C:\\work\\%TOOLS%\\check.cmd', 'C:\\work\\tools^x\\check.bat']) {
+    const result = await runProgram(win, file, ['--strict'])
+    assert.equal(result.error?.kind, 'start_failed', file)
+    assert.ok(result.error?.reason.includes(`path holds " ^ or %: ${file}; not started`), result.error?.reason)
+    assert.equal(result.file, null)
+  }
+  assert.deepEqual(win.starts, [])
+  await runProgram(win, 'C:\\work\\50%\\check.exe', ['--strict'])
+  assert.deepEqual(win.starts.map(({ file, args }) => [file, ...args]), [['C:\\work\\50%\\check.exe', '--strict']])
+})

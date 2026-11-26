@@ -37,9 +37,11 @@ const NO_HARD_LINKS = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EXDE
 // The text is written whole to a temporary file beside the target, and only then gets the target's name by a hard
 // link, which the system makes only while the name is free (EEXIST otherwise). So an existing file is never replaced,
 // two writers at once leave exactly one winner, and a reader sees the whole text or no file, also after a writer was
-// killed half way (its temporary file has another name). There is no other way of publishing: on a file system without
-// hard links (the plugin's data directory is under the home directory, where NTFS, APFS, ext4, btrfs, xfs, NFS and SMB
-// all have them) it is an error with that reason, and the file is not created.
+// killed half way (its temporary file has another name). There is no other way of publishing (decision «🤖 Решение по
+// #4: review»): the data directory needs a file system with hard links — the home directory's usual ones (NTFS, APFS,
+// ext4, btrfs, xfs, NFS) have them; FAT, exFAT and a network share without them do not. There it is an error with that
+// reason and the file is not created: the worker starts without a coordinator id, the reason in its log, and the queue
+// does not work on that computer.
 export async function createText(path: string, text: string, ops: PublishOps = NODE_OPS): Promise<boolean> {
   mkdirSync(dirname(path), { recursive: true })
   const temporary = `${path}.${randomUUID()}.tmp`
