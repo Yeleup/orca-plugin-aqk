@@ -20,17 +20,22 @@
 // this layer; the worker starts the layer together with them.
 //
 // What each launch leaves in the data directory, <data>/projects/<project>/<task>/agents/<n>/ (n = 1, 2, … in the order
-// of the task's launches: the next number is one more than the largest launch directory of the task):
+// of the task's launches: the next number is one more than the largest number in the task's agents directory):
 // - task.md — the task the agent got, and report.md — its report, which the agent writes;
 // - launching.json — role, agent, language, workspace and time, written before Orca is asked; launch.json — Orca's
 //   answer: the terminal it opened, or null and the error (also the plugin's own reason when Orca was not asked);
 // - closed — the plugin has closed the agent's terminal.
 // Every file is created once and never rewritten, so the records survive a restart of the worker: a new worker stops
 // the agents an earlier one launched. A stop reads each launch's records by themselves: a launch whose task file is
-// gone is still stopped, and one whose records cannot be read is reported with the reason while the others are stopped.
+// gone is still stopped, one the plugin has closed (its `closed` mark is in its directory) is done whatever its other
+// records say, and one whose records cannot be read is reported with the reason while the others are stopped.
+// Launches are the real directories with a number for a name: a link (or a junction) or a file there is none — its
+// number stays taken — and a link or a file on the way from the data directory to them is an error, so that the
+// records of another place are never taken for the task's. The task's identity is copied when a launch or a stop is
+// asked for.
 import type { OrcaWorkerApi } from 'orca/worker'
 import type { GithubLanguage } from '../github-texts/catalog'
-import { errorCode, errorMessage, type Machine } from '../platform/machine'
+import { errorCode, errorMessage, type DirectoryEntry, type Machine } from '../platform/machine'
 import { dataName, dataPath } from '../platform/paths'
 import type { Project } from '../protocol'
 import { AGENT_ROLES, SETTINGS_FILE, type AgentRole, type ProjectAgents } from '../project/settings'
@@ -157,12 +162,34 @@ export type AgentsOptions = {
   readonly dataDir: string
 }
 
+// Where a task's launches live, worked out once for each launch, stop or reading from a copy of the task's identity:
+// what the caller changes in its objects afterwards moves nothing.
+type TaskPlace = {
+  // The copy of the task's identity.
+  readonly task: TaskRef
+  // The names below the data directory: projects/<project>/<task>/agents.
+  readonly names: readonly string[]
+  // The task's agents directory: <data>/projects/<project>/<task>/agents.
+  readonly dir: string
+}
+
+// A launch as asked for, copied when it is asked for.
+type Launching = {
+  readonly place: TaskPlace
+  readonly role: AgentRole
+  readonly agent: string
+  readonly language: GithubLanguage
+  readonly workspaceId: string
+  readonly taskText: (files: LaunchFiles) => string
+}
+
 // The agents layer of one worker.
 export class Agents {
   private readonly host: WorkerHost
   private readonly machine: Machine
   private readonly dataDir: string
-  // The launches under way, and the stops under way, by the task's directory (its project's id and host, its key).
+  // The launches under way, and the stops under way, by the task's agents directory (its project's id and host, its
+  // key).
   private readonly pending = new Map<string, Set<Promise<LaunchResult>>>()
   private readonly stopping = new Map<string, number>()
 
@@ -172,19 +199,23 @@ export class Agents {
     this.dataDir = options.dataDir
   }
 
-  // Launches the agent of `request.role` from the project's agents. It is under way from this call on: a stop of the
-  // task that begins before it asks Orca refuses it, a later one waits for Orca's answer and closes its terminal. While
-  // a stop of the task runs, it is refused at once.
+  // Launches the agent of `request.role` from the project's agents. The request's values are taken now. It is under
+  // way from this call on: a stop of the task that begins before it asks Orca refuses it, a later one waits for Orca's
+  // answer and closes its terminal. While a stop of the task runs, it is refused at once.
   launch(request: LaunchRequest): Promise<LaunchResult> {
-    let key: string
+    const { role, language, workspaceId, taskText } = request
+    const agent = request.agents[role]
+    let place: TaskPlace
     try {
-      key = this.taskDir(request.task)
+      place = this.place(request.task)
     } catch (error) {
-      return Promise.resolve(refusal(request, errorMessage(error)))
+      return Promise.resolve(refusal(role, agent, errorMessage(error)))
     }
-    if (this.isStopping(key)) return Promise.resolve(refusal(request, stoppingReason(request.task)))
+    const key = place.dir
+    if (this.isStopping(key)) return Promise.resolve(refusal(role, agent, stoppingReason(place.task)))
+    const launching: Launching = { place, role, agent, language, workspaceId, taskText }
     // Registered before any code of the caller runs (its taskText, which may start a stop of the task).
-    const running = Promise.resolve().then(() => this.runLaunch(request, key))
+    const running = Promise.resolve().then(() => this.runLaunch(launching))
     const set = this.pending.get(key) ?? new Set<Promise<LaunchResult>>()
     set.add(running)
     this.pending.set(key, set)
@@ -196,26 +227,29 @@ export class Agents {
     return running
   }
 
-  // Stops the agents of the task: refuses its new launches while it runs, waits for its launches under way, then
-  // closes every terminal the plugin opened for the task and has not closed yet — and no other terminal. A terminal
-  // Orca refuses to close counts as closed when a complete list of its workspace no longer names it. A launch whose
-  // terminal is unknown — Orca's answer not recorded, or its records unreadable — is reported with the reason, and the
+  // Stops the agents of the task (taken as it is now): refuses its new launches while it runs, waits for its launches
+  // under way, then closes every terminal the plugin opened for the task and has not closed yet — and no other
+  // terminal. A launch the plugin has closed (its `closed` mark is there) is done, whatever else its records say. A
+  // terminal Orca refuses to close counts as closed when a complete list of its workspace no longer names it. A launch
+  // whose terminal is unknown — Orca's answer not recorded, its records unreadable — is reported with the reason, and the
   // other launches are stopped all the same. Rejects only for a task key that is not one.
   async stop(task: TaskRef): Promise<StopResult> {
-    const key = this.taskDir(task)
+    const place = this.place(task)
+    const key = place.dir
     this.stopping.set(key, (this.stopping.get(key) ?? 0) + 1)
     try {
       await Promise.all([...(this.pending.get(key) ?? [])].map((running) => running.catch(() => undefined)))
       let records: LaunchRecord[]
       try {
-        records = this.launches(task)
+        records = this.records(place)
       } catch (error) {
-        const reason = `the launches of ${task.key} could not be listed: ${errorMessage(error)}`
+        const reason = `the launches of ${place.task.key} could not be listed: ${errorMessage(error)}`
         return { closed: [], failed: [{ launch: null, terminalId: null, error: reason }] }
       }
       const closed: string[] = []
       const failed: { launch: number; terminalId: string | null; error: string }[] = []
       for (const record of records) {
+        if (record.closed) continue
         if (record.outcome === 'pending' || record.outcome === 'unreadable') {
           const agent = record.agent === null ? '' : ` (the agent "${record.agent}")`
           const why =
@@ -225,7 +259,7 @@ export class Agents {
           failed.push({ launch: record.number, terminalId: null, error: `${why}: its terminal, if any, is unknown` })
           continue
         }
-        if (record.terminalId === null || record.closed) continue
+        if (record.terminalId === null) continue
         const terminalId = record.terminalId
         try {
           await this.host.call('terminal.close', { terminalId })
@@ -254,24 +288,32 @@ export class Agents {
   // itself, whatever is missing or unreadable in the others. Throws for a task key that is not one, and when the task's
   // launch directories cannot be listed.
   launches(task: TaskRef): LaunchRecord[] {
+    return this.records(this.place(task))
+  }
+
+  private records(place: TaskPlace): LaunchRecord[] {
     const records: LaunchRecord[] = []
-    for (const number of this.launchNumbers(task)) {
-      const record = this.readRecord(task, number)
+    const numbers = (this.agentsEntries(place) ?? [])
+      .filter((entry) => entry.kind === 'directory')
+      .map((entry) => launchNumber(entry.name))
+      .filter((number): number is number => number !== null)
+      .sort((a, b) => a - b)
+    for (const number of numbers) {
+      const record = this.readRecord(place, number)
       if (record !== null) records.push(record)
     }
     return records
   }
 
-  private async runLaunch(request: LaunchRequest, key: string): Promise<LaunchResult> {
-    const { role, language, workspaceId } = request
-    const agent = request.agents[role]
+  private async runLaunch(launching: Launching): Promise<LaunchResult> {
+    const { place, role, agent, language, workspaceId } = launching
     const field = `agents.${role} in ${SETTINGS_FILE}`
     const failure = (kind: LaunchFailure['kind'], error: string): LaunchFailure => ({ ok: false, kind, role, agent, error })
     const notLaunched = (reason: string) => failure('launch-failed', `the agent "${agent}" (${field}) was not launched: ${reason}`)
 
     let reserved: LaunchFiles & { readonly number: number }
     try {
-      reserved = await this.reserveLaunch(request)
+      reserved = await this.reserveLaunch(launching)
     } catch (error) {
       return notLaunched(`its task file: ${errorMessage(error)}`)
     }
@@ -297,8 +339,8 @@ export class Agents {
 
     // One line: a line break would submit the prompt before its end.
     const prompt = launchPrompt(language, files.taskFile, files.reportFile)
-    const unfit = this.isStopping(key)
-      ? stoppingReason(request.task)
+    const unfit = this.isStopping(place.dir)
+      ? stoppingReason(place.task)
       : prompt.length > ORCA_TEXT_MAX
         ? `the paths of its task and report files make a prompt of ${prompt.length} characters, Orca takes ${ORCA_TEXT_MAX}`
         : /[\r\n]/.test(prompt)
@@ -330,13 +372,27 @@ export class Agents {
         `the agent "${agent}" (${field}) was launched, but its launch could not be recorded (${errorMessage(error)}); ${closing}`,
       )
     }
-    return { ok: true, launch: { ...files, task: request.task, number, role, agent, language, workspaceId, launchedAt, terminalId } }
+    return { ok: true, launch: { ...files, task: place.task, number, role, agent, language, workspaceId, launchedAt, terminalId } }
   }
 
-  // The records of launch `number`, each file read by itself; null when Orca was never asked for it (no launch record).
-  private readRecord(task: TaskRef, number: number): LaunchRecord | null {
-    const files = this.launchFiles(task, number)
+  // The records of launch `number`: what its directory holds — whether the `closed` mark is there is seen in the
+  // directory's list, not by reading the mark — and each record read by itself. Null when Orca was never asked for it
+  // (no launch record).
+  private readRecord(place: TaskPlace, number: number): LaunchRecord | null {
+    const files = this.launchFiles(place, number)
+    const base = { ...files, task: place.task, number, role: null, agent: null, language: null, workspaceId: null, launchedAt: null }
+    let entries: DirectoryEntry[] | null
+    try {
+      entries = this.machine.listEntries(files.dir)
+    } catch (error) {
+      // Whether the plugin closed it is not known either.
+      const reason = `its directory: ${errorMessage(error)}`
+      return { ...base, outcome: 'unreadable', terminalId: null, error: reason, closed: false }
+    }
+    if (entries === null) return null
+    const has = (name: string) => entries.some((entry) => this.sameName(entry.name, name))
     const read = (name: string): { readonly text: string | null; readonly error: string | null } => {
+      if (!has(name)) return { text: null, error: null }
       try {
         return { text: this.machine.readText(dataPath(this.machine, files.dir, name)), error: null }
       } catch (error) {
@@ -367,12 +423,8 @@ export class Agents {
       // Only the task file, or not even that: the launch ended before asking Orca.
       return null
     }
-    // A mark that cannot be read counts as not closed: closing again is harmless (Orca's refusal, then its list).
-    const closed = read(CLOSED_FILE).text !== null
     return {
-      ...files,
-      task,
-      number,
+      ...base,
       role: launching?.role ?? null,
       agent: launching?.agent ?? null,
       language: launching?.language ?? null,
@@ -381,7 +433,7 @@ export class Agents {
       outcome,
       terminalId: answer?.terminalId ?? null,
       error,
-      closed,
+      closed: has(CLOSED_FILE),
     }
   }
 
@@ -400,38 +452,51 @@ export class Agents {
     return (this.stopping.get(key) ?? 0) > 0
   }
 
-  // The task's directory: the project's own name — from its id and its host, so that copies of one project on two hosts
-  // never share it — and the task's key.
-  private taskDir(task: TaskRef): string {
-    if (!isTaskKey(task.key)) throw new Error(`not a task key: ${JSON.stringify(task.key)}`)
-    const project = dataName(JSON.stringify([task.project.id, task.project.hostId]))
-    return dataPath(this.machine, this.dataDir, 'projects', project, task.key)
+  // The place of the task's launches, from a copy of its identity: the project's own name — from its id and its host,
+  // so that copies of one project on two hosts never share it — and the task's key.
+  private place(task: TaskRef): TaskPlace {
+    const copy: TaskRef = { project: { id: task.project.id, hostId: task.project.hostId }, key: task.key }
+    if (!isTaskKey(copy.key)) throw new Error(`not a task key: ${JSON.stringify(copy.key)}`)
+    const names = ['projects', dataName(JSON.stringify([copy.project.id, copy.project.hostId])), copy.key, AGENTS_DIR]
+    return { task: copy, names, dir: dataPath(this.machine, this.dataDir, ...names) }
   }
 
-  private launchFiles(task: TaskRef, number: number): LaunchFiles {
-    const dir = dataPath(this.machine, this.taskDir(task), AGENTS_DIR, String(number))
+  // The entries of the task's agents directory, reached from the data directory through real directories only: null
+  // when one on the way is not there (no launches yet). A link (or a junction) or a file on the way is an error: the
+  // plugin never takes the records of another place for this task's.
+  private agentsEntries(place: TaskPlace): DirectoryEntry[] | null {
+    let dir = this.dataDir
+    for (const name of place.names) {
+      const entries = this.machine.listEntries(dir)
+      const entry = entries?.find((each) => this.sameName(each.name, name))
+      if (entry === undefined) return null
+      dir = dataPath(this.machine, dir, name)
+      if (entry.kind !== 'directory') throw new Error(`${dir} is a link or a file, not a directory: the plugin reads no launches through it`)
+    }
+    return this.machine.listEntries(dir)
+  }
+
+  // Names as the system's file names compare: without case on Windows and macOS.
+  private sameName(a: string, b: string): boolean {
+    return this.machine.platform === 'linux' ? a === b : a.toLowerCase() === b.toLowerCase()
+  }
+
+  private launchFiles(place: TaskPlace, number: number): LaunchFiles {
+    const dir = dataPath(this.machine, place.dir, String(number))
     return { dir, taskFile: dataPath(this.machine, dir, TASK_FILE), reportFile: dataPath(this.machine, dir, REPORT_FILE) }
   }
 
-  // The numbers of the task's launch directories, in order; other names there are not launches.
-  private launchNumbers(task: TaskRef): number[] {
-    const names = this.machine.listNames(dataPath(this.machine, this.taskDir(task), AGENTS_DIR)) ?? []
-    return names
-      .filter((name) => /^[1-9][0-9]*$/.test(name))
-      .map(Number)
-      .filter((number) => Number.isSafeInteger(number))
-      .sort((a, b) => a - b)
-  }
-
-  // The next launch of the task: one more than its largest launch directory, taken by creating the task file there
-  // (only one launch can create it); when another launch took that number meanwhile, the next one.
-  private async reserveLaunch(request: LaunchRequest): Promise<LaunchFiles & { readonly number: number }> {
+  // The next launch of the task: one more than the largest number any entry of its agents directory has — a launch
+  // directory, or a link or a file with a number for a name, which is no launch but keeps its number — taken by
+  // creating the task file there (only one launch can create it); when another launch took that number meanwhile, the
+  // next one.
+  private async reserveLaunch(launching: Launching): Promise<LaunchFiles & { readonly number: number }> {
     for (let attempt = 0; attempt < RESERVE_ATTEMPTS; attempt++) {
-      const number = this.launchNumbers(request.task).reduce((largest, each) => Math.max(largest, each), 0) + 1
-      const files = this.launchFiles(request.task, number)
-      if (await this.machine.createText(files.taskFile, request.taskText(files))) return { ...files, number }
+      const largest = (this.agentsEntries(launching.place) ?? []).reduce((most, entry) => Math.max(most, launchNumber(entry.name) ?? 0), 0)
+      const files = this.launchFiles(launching.place, largest + 1)
+      if (await this.machine.createText(files.taskFile, launching.taskText(files))) return { ...files, number: largest + 1 }
     }
-    throw new Error(`no free launch number for ${request.task.key} in ${RESERVE_ATTEMPTS} attempts`)
+    throw new Error(`no free launch number for ${launching.place.task.key} in ${RESERVE_ATTEMPTS} attempts`)
   }
 
   // Creates a record of the launch once: a record already there is not this launch's, and is an error.
@@ -441,19 +506,25 @@ export class Agents {
   }
 }
 
+// The number of a launch directory's name: a whole number from 1 without leading zeros; null for any other name.
+function launchNumber(name: string): number | null {
+  if (!/^[1-9][0-9]*$/.test(name)) return null
+  const number = Number(name)
+  return Number.isSafeInteger(number) ? number : null
+}
+
 function stoppingReason(task: TaskRef): string {
   return `the agents of ${task.key} are being stopped`
 }
 
 // A launch refused before anything of it is written.
-function refusal(request: LaunchRequest, reason: string): LaunchFailure {
-  const agent = request.agents[request.role]
+function refusal(role: AgentRole, agent: string, reason: string): LaunchFailure {
   return {
     ok: false,
     kind: 'launch-failed',
-    role: request.role,
+    role,
     agent,
-    error: `the agent "${agent}" (agents.${request.role} in ${SETTINGS_FILE}) was not launched: ${reason}`,
+    error: `the agent "${agent}" (agents.${role} in ${SETTINGS_FILE}) was not launched: ${reason}`,
   }
 }
 

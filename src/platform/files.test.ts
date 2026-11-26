@@ -1,11 +1,11 @@
 // Creating a file only if absent (the coordinator id's file), on the real disk: the finished text gets its name by a
-// hard link only, so an existing file is never replaced; without hard links nothing is created. The names in a
+// hard link only, so an existing file is never replaced; without hard links nothing is created. The entries of a
 // directory, on the real disk.
 import { assert, test } from 'orca/testing'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createText, listNames } from './files'
+import { createText, listEntries } from './files'
 
 async function withTempDir(body: (dir: string) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'agent-queue-files-'))
@@ -44,14 +44,23 @@ test('создание файла без жёстких ссылок: ошибк
   })
 })
 
-test('имена в каталоге: файлы и каталоги внутри, каталога нет — null, файл вместо каталога — ошибка', async () => {
+test('записи каталога: настоящий каталог, файл и ссылка на каталог — ссылка не раскрывается; каталога нет — null, файл вместо каталога — ошибка', async () => {
   await withTempDir(async (dir) => {
-    assert.equal(listNames(join(dir, 'agents')), null)
-    await createText(join(dir, 'agents', '1', 'task.md'), 'one\n')
-    await createText(join(dir, 'agents', '2', 'task.md'), 'two\n')
-    await createText(join(dir, 'agents', 'notes.md'), 'notes\n')
-    assert.deepEqual((listNames(join(dir, 'agents')) ?? []).sort(), ['1', '2', 'notes.md'])
+    const agents = join(dir, 'agents')
+    assert.equal(listEntries(agents), null)
+    await createText(join(agents, '1', 'task.md'), 'one\n')
+    await createText(join(agents, 'notes.md'), 'notes\n')
+    const elsewhere = join(dir, 'elsewhere')
+    mkdirSync(elsewhere)
+    // A link to a directory: a symbolic link, on Windows a junction (it needs no rights there).
+    symlinkSync(elsewhere, join(agents, '7'), 'junction')
+    const entries = (listEntries(agents) ?? []).sort((a, b) => (a.name < b.name ? -1 : 1))
+    assert.deepEqual(entries, [
+      { name: '1', kind: 'directory' },
+      { name: '7', kind: 'other' },
+      { name: 'notes.md', kind: 'file' },
+    ])
     // A file, not a directory: an error, not «no directory».
-    assert.throws(() => listNames(join(dir, 'agents', 'notes.md')))
+    assert.throws(() => listEntries(join(agents, 'notes.md')))
   })
 })

@@ -1,7 +1,8 @@
 // A fake computer for the plugin's tests: any system (linux, darwin, win32) on any real one, an invented environment
 // and home directory, files in memory, a clock that moves only when told, and a process start that records each
-// request and answers it as the test says. Nothing here touches the real disk or starts a real process.
-import type { Env, Machine, Platform, StartOutcome, StartRequest } from '../platform/machine'
+// request and answers it as the test says. Nothing here touches the real disk or starts a real process. Symbolic links
+// (`links`) work as on a disk: reads and writes through one land in its target, and a directory lists it as a link.
+import type { DirectoryEntry, Env, Machine, Platform, StartOutcome, StartRequest } from '../platform/machine'
 
 export type FakeAnswer = Partial<Omit<StartOutcome, 'startError'>> & {
   readonly startError?: StartOutcome['startError']
@@ -16,6 +17,8 @@ export type FakeMachine = Machine & {
   readonly starts: StartRequest[]
   // The files in memory by their exact path, including those createText made.
   readonly files: Map<string, string>
+  // Symbolic links (or Windows junctions) to directories: the link's path and the directory it points to.
+  readonly links: Map<string, string>
   readonly clock: FakeClock
 }
 
@@ -105,7 +108,25 @@ export function fakeMachine(options: FakeMachineOptions): FakeMachine {
   const same = (a: string, b: string) => (windows ? a.toLowerCase() === b.toLowerCase() : a === b)
   const executables = [...(options.executables ?? [])]
   const files = new Map<string, string>(Object.entries(options.files ?? {}))
-  const find = (path: string) => [...files.keys()].find((key) => same(key, path))
+  const links = new Map<string, string>()
+  const separators = windows ? /[\\/]/ : /\//
+  const parts = (path: string) => path.split(separators).filter((part) => part !== '')
+  const within = (path: string[], dir: string[]) => path.length >= dir.length && dir.every((part, at) => same(part, path[at] ?? ''))
+  // The path with every link on its way replaced by the link's target, as a disk follows them.
+  const resolve = (path: string): string => {
+    let resolved = path
+    for (let turn = 0; turn < 40; turn++) {
+      const link = [...links.keys()].find((each) => within(parts(resolved), parts(each)))
+      if (link === undefined) return resolved
+      const rest = parts(resolved).slice(parts(link).length)
+      resolved = [links.get(link) ?? '', ...rest].join(windows ? '\\' : '/')
+    }
+    throw new Error(`ELOOP: too many symbolic links, ${path}`)
+  }
+  const find = (path: string) => {
+    const target = resolve(path)
+    return [...files.keys()].find((key) => same(key, target))
+  }
   const starts: StartRequest[] = []
   const clock = options.clock ?? fakeClock()
   return {
@@ -120,22 +141,25 @@ export function fakeMachine(options: FakeMachineOptions): FakeMachine {
       const key = find(path)
       return key === undefined ? null : (files.get(key) ?? null)
     },
-    // A directory exists while a file is in it (or deeper): the names of what is right inside it, in order.
-    listNames: (path) => {
-      const separators = windows ? /[\\/]/ : /\//
-      const parts = (file: string) => file.split(separators).filter((part) => part !== '')
-      const dir = parts(path)
-      const names = new Set<string>()
+    // A directory exists while a file is in it (or deeper), or a link: what is right inside it, in order of names.
+    listEntries: (path) => {
+      const dir = parts(resolve(path))
+      const entries = new Map<string, DirectoryEntry['kind']>()
       for (const file of files.keys()) {
-        const inside = parts(file)
-        if (inside.length > dir.length && dir.every((part, at) => same(part, inside[at] ?? ''))) names.add(inside[dir.length] ?? '')
+        const each = parts(file)
+        if (each.length > dir.length && within(each, dir)) entries.set(each[dir.length] ?? '', each.length === dir.length + 1 ? 'file' : 'directory')
       }
-      return names.size === 0 ? null : [...names].sort()
+      for (const link of links.keys()) {
+        const each = parts(link)
+        if (each.length === dir.length + 1 && within(each, dir)) entries.set(each[dir.length] ?? '', 'other')
+      }
+      if (entries.size === 0) return null
+      return [...entries].map(([name, kind]) => ({ name, kind })).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
     },
     createText: async (path, text) => {
       if (options.createError) throw options.createError
       if (find(path) !== undefined) return false
-      files.set(path, text)
+      files.set(resolve(path), text)
       return true
     },
     start: async (request) => {
@@ -156,6 +180,7 @@ export function fakeMachine(options: FakeMachineOptions): FakeMachine {
     },
     starts,
     files,
+    links,
     clock,
   }
 }

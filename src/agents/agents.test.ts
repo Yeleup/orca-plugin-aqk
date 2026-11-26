@@ -85,6 +85,11 @@ function json(orca: FakeOrca, path: string): unknown {
   return text === undefined ? undefined : JSON.parse(text)
 }
 
+// The directory a path is in.
+function parent(path: string): string {
+  return path.slice(0, path.lastIndexOf('/'))
+}
+
 // The ids of the terminals `terminal.close` was asked to close, in order.
 function closes(orca: FakeOrca): string[] {
   return orca.host.callsOf('terminal.close').map((params) => (params as { terminalId: string }).terminalId)
@@ -725,8 +730,9 @@ test('Записи запуска читаются каждая сама по с
   const unlisted = await mount(orca, {
     machine: {
       ...orca.machine,
-      listNames: (path) => {
-        throw new Error(`EACCES: permission denied, scandir '${path}'`)
+      listEntries: (path) => {
+        if (path === agentsDir) throw new Error(`EACCES: permission denied, scandir '${path}'`)
+        return orca.machine.listEntries(path)
       },
     },
   })
@@ -877,4 +883,142 @@ test('Номер запуска — следующий после наиболь
     ],
   )
   await racing.worker.deactivate()
+})
+
+test('Проект и ключ задачи берутся в момент вызова: ProjectRef, изменённый потом, не переносит ни запуск, ни остановку в каталог другой копии проекта', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const remote: ProjectRef = { id: PROJECT.id, hostId: 'ssh:build-box' }
+  // The caller changes its project object right after asking for the launch: the launch stays the local copy's.
+  const project = { id: PROJECT.id, hostId: 'local' }
+  const launching = r.agents.launch({ ...request(12, 'implementer'), task: { project, key: 'issue-12' } })
+  project.hostId = 'ssh:build-box'
+  const result = await launching
+  assert.ok(result.ok, JSON.stringify(result))
+  assert.deepEqual(result.launch.task, { project: PROJECT, key: 'issue-12' })
+  assert.equal(result.launch.dir, launchDir(r, 'issue-12', 1))
+  assert.deepEqual(r.agents.launches(issueTask(remote, 12)), [])
+  assert.deepEqual(await r.agents.stop(issueTask(remote, 12)), { closed: [], failed: [] })
+  assert.equal(orca.terminals.get(result.launch.terminalId)?.open, true)
+
+  // A stop of the remote copy whose project object turns local while the stop waits: it stays the remote copy's.
+  const turning = { id: PROJECT.id, hostId: 'ssh:build-box' }
+  const stopping = r.agents.stop({ project: turning, key: 'issue-12' })
+  turning.hostId = 'local'
+  assert.deepEqual(await stopping, { closed: [], failed: [] })
+  assert.equal(orca.terminals.get(result.launch.terminalId)?.open, true)
+  // Nor does a key changed after the call move a stop to another task.
+  const task = { project: { ...PROJECT }, key: 'issue-12' }
+  const stoppingLocal = r.agents.stop(task)
+  task.key = 'issue-13'
+  assert.deepEqual(await stoppingLocal, { closed: [result.launch.terminalId], failed: [] })
+  await r.worker.deactivate()
+})
+
+test('В каталоге запусков задачи запуски — только настоящие каталоги с номером: ссылка с номером на запись другой задачи и файл с номером — не запуски, но их номера заняты; ссылка на пути к запускам задачи — ошибка, а не чужие записи', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const mine = await launched(r, 12, 'implementer')
+  const foreign = await launched(r, 13, 'implementer')
+  assert.deepEqual([mine.terminalId, foreign.terminalId], ['terminal-1', 'terminal-2'])
+  // Restored by hand: issue 12's agents/7 is a link to issue 13's launch 1 (its terminal open), agents/9 a file.
+  const agents12 = parent(mine.dir)
+  orca.machine.links.set(`${agents12}/7`, foreign.dir)
+  orca.machine.files.set(`${agents12}/9`, 'not a launch\n')
+  // Through the link the disk shows issue 13's records.
+  assert.equal(orca.machine.readText(`${agents12}/7/launch.json`), orca.machine.files.get(`${foreign.dir}/launch.json`))
+  assert.deepEqual(r.agents.launches(issueTask(PROJECT, 12)).map((record) => record.number), [1])
+  // A new launch takes a number no entry has: after 9.
+  const next = await launched(r, 12, 'reviewer')
+  assert.equal(next.number, 10)
+  assert.equal(next.dir, `${agents12}/10`)
+  assert.deepEqual(await r.agents.stop(issueTask(PROJECT, 12)), { closed: ['terminal-1', 'terminal-3'], failed: [] })
+  assert.equal(orca.terminals.get('terminal-2')?.open, true)
+  assert.ok(!orca.machine.files.has(`${foreign.dir}/closed`))
+
+  // Issue 14's task directory is a link to issue 13's: its launches are an error, a stop closes nothing, and a launch
+  // writes nothing through the link.
+  const task14 = parent(parent(launchDir(r, 'issue-14', 1)))
+  orca.machine.links.set(task14, parent(parent(foreign.dir)))
+  const linked = `${task14} is a link or a file, not a directory: the plugin reads no launches through it`
+  assert.throws(() => r.agents.launches(issueTask(PROJECT, 14)), /is a link or a file, not a directory/)
+  assert.deepEqual(await r.agents.stop(issueTask(PROJECT, 14)), {
+    closed: [],
+    failed: [{ launch: null, terminalId: null, error: `the launches of issue-14 could not be listed: ${linked}` }],
+  })
+  const refused = await r.agents.launch(request(14, 'implementer'))
+  assert.deepEqual(refused, {
+    ok: false,
+    kind: 'launch-failed',
+    role: 'implementer',
+    agent: 'codex',
+    error: `the agent "codex" (agents.implementer in .agent-queue.json) was not launched: its task file: ${linked}`,
+  })
+  assert.equal(orca.host.callsOf('agent.launch').length, 3)
+  assert.deepEqual(r.agents.launches(issueTask(PROJECT, 13)).map((record) => record.number), [1])
+  assert.equal(orca.terminals.get('terminal-2')?.open, true)
+  await r.worker.deactivate()
+})
+
+test('Повторная остановка: запуск с меткой closed — не ошибка, даже если его launch.json не прочитать или он испорчен; есть ли метка, не узнать — ошибка этого запуска; другие открытые терминалы закрыты', async () => {
+  const orca = fakeOrca()
+  const r = await mount(orca)
+  const task = issueTask(PROJECT, 31)
+  const first = await launched(r, 31, 'implementer')
+  assert.deepEqual(await r.agents.stop(task), { closed: [first.terminalId], failed: [] })
+  assert.ok(orca.machine.files.has(`${first.dir}/closed`))
+  const second = await launched(r, 31, 'reviewer')
+  await r.worker.deactivate()
+
+  // Launch 1's answer can no longer be read; its mark is there: the stop closes launch 2 and reports nothing else.
+  const denied: Machine = {
+    ...orca.machine,
+    readText: (path) => {
+      if (path === `${first.dir}/launch.json`) throw new Error(`EACCES: permission denied, open '${path}'`)
+      return orca.machine.readText(path)
+    },
+  }
+  const unreadable = await mount(orca, { machine: denied })
+  assert.deepEqual(
+    unreadable.agents.launches(task).map((record) => [record.number, record.outcome, record.closed]),
+    [
+      [1, 'unreadable', true],
+      [2, 'launched', false],
+    ],
+  )
+  assert.deepEqual(await unreadable.agents.stop(task), { closed: [second.terminalId], failed: [] })
+  const third = await launched(unreadable, 31, 'solver')
+  await unreadable.worker.deactivate()
+
+  // Launch 1's answer damaged: the same.
+  orca.machine.files.set(`${first.dir}/launch.json`, '{ "terminalId": ')
+  const damaged = await mount(orca)
+  assert.deepEqual(await damaged.agents.stop(task), { closed: [third.terminalId], failed: [] })
+  const fourth = await launched(damaged, 31, 'implementer')
+  await damaged.worker.deactivate()
+
+  // Launch 1's directory cannot be listed, so whether its mark is there is not known: an error for launch 1, with the
+  // reason; launch 4's terminal is closed all the same.
+  const reason = `EACCES: permission denied, scandir '${first.dir}'`
+  const unlisted = await mount(orca, {
+    machine: {
+      ...orca.machine,
+      listEntries: (path) => {
+        if (path === first.dir) throw new Error(reason)
+        return orca.machine.listEntries(path)
+      },
+    },
+  })
+  assert.deepEqual(await unlisted.agents.stop(task), {
+    closed: [fourth.terminalId],
+    failed: [
+      {
+        launch: 1,
+        terminalId: null,
+        error: `the records of launch 1 cannot be read: its directory: ${reason}: its terminal, if any, is unknown`,
+      },
+    ],
+  })
+  assert.deepEqual(closes(orca), [first.terminalId, second.terminalId, third.terminalId, fourth.terminalId])
+  await unlisted.worker.deactivate()
 })
