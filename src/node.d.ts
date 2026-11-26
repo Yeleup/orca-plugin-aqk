@@ -69,6 +69,7 @@ declare module 'node:process' {
   export const platform: string
   export const env: Record<string, string | undefined>
   export const execPath: string
+  export const pid: number
   export function cwd(): string
   export function kill(pid: number, signal?: 'SIGKILL' | 'SIGTERM' | 0): true
 }

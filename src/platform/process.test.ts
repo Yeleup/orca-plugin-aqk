@@ -4,7 +4,8 @@ import { assert, test } from 'orca/testing'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { execPath, kill } from 'node:process'
+import { execPath, pid as ownPid } from 'node:process'
+import { pidIn, pidInFile, stillRuns } from '../testing/processes'
 import { realMachine } from './machine'
 import { askCodePage, decodeOutput, REAL_IO, startProcess, type ProcessIo } from './process'
 import { runProgram } from './run'
@@ -83,18 +84,8 @@ test('тайм-аут на Windows: taskkill запустился, но выше
   assert.equal(result.error?.kind, 'timed_out')
   assert.match(result.error?.reason ?? '', /stopped after 1000 ms without an answer; taskkill exited 1: ERROR: Access is denied\./)
   assert.match(result.error?.reason ?? '', /only the started process was stopped/)
-  const pid = Number(result.stdout.trim())
-  let alive = true
-  for (let i = 0; i < 30 && alive; i++) {
-    try {
-      kill(pid, 0)
-      await new Promise((resolve) => setTimeout(resolve, 100))
-    } catch {
-      alive = false
-    }
-  }
-  if (alive) kill(pid, 'SIGKILL')
-  assert.equal(alive, false, `the started process ${pid} still runs`)
+  const pid = pidIn(result.stdout, 'the started process')
+  assert.equal(await stillRuns(pid), false, `the started process ${pid} still runs`)
 })
 
 test('вывод на Windows: кодовая страница консоли спрашивается только для вывода не в UTF-8, со своим пределом времени', async () => {
@@ -138,21 +129,6 @@ test('вывод на Windows: все OEM-страницы консоли — 43
   assert.equal(decodeOutput(new Uint8Array([0x41, 0x9b]), 12345), 'A�')
 })
 
-// Whether process `pid` still runs after up to 3 s of waiting; a process left running is stopped, so a failing test
-// does not keep the test run waiting.
-async function stillRuns(pid: number): Promise<boolean> {
-  for (let i = 0; i < 30; i++) {
-    try {
-      kill(pid, 0)
-    } catch {
-      return false
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100))
-  }
-  kill(pid, 'SIGKILL')
-  return true
-}
-
 test('тайм-аут на Windows: taskkill завис — по своему пределу он сам остановлен, запущенный процесс остановлен, причина в результате', async () => {
   await withTempDir(async (dir) => {
     // A taskkill that starts and never answers; it notes its pid first.
@@ -170,8 +146,11 @@ test('тайм-аут на Windows: taskkill завис — по своему п
     assert.ok(Date.now() - began < 10_000, `the result took ${Date.now() - began} ms`)
     assert.equal(result.error?.kind, 'timed_out')
     assert.match(result.error?.reason ?? '', /taskkill gave no answer in 700 ms; only the started process was stopped/)
-    assert.equal(await stillRuns(Number(result.stdout.trim())), false, 'the started process still runs')
-    assert.equal(await stillRuns(Number(readFileSync(helperPid, 'utf8'))), false, 'taskkill still runs after the result')
+    // Both pids are checked before any signal: a missing one fails the test instead of reaching a process group.
+    const started = pidIn(result.stdout, 'the started process')
+    const helper = pidInFile(helperPid, 'the fake taskkill')
+    assert.equal(await stillRuns(started), false, 'the started process still runs')
+    assert.equal(await stillRuns(helper), false, 'taskkill still runs after the result')
   })
 })
 
@@ -188,4 +167,15 @@ test('файл вывода не открылся (нет его каталог�
     assert.equal(result.code, null)
     assert.equal(existsSync(marker), false, 'the program ran')
   })
+})
+
+test('pid из вывода или файла поддельной программы: пустой, 0, отрицательный, не число или свой — ошибка теста до любого сигнала', async () => {
+  for (const text of ['', '  \n', '0', '-1', '12a', String(ownPid)]) {
+    assert.throws(() => pidIn(text, 'a fake program'), /a fake program: no pid of its own .*; no signal was sent/)
+  }
+  await assert.rejects(stillRuns(0), /no pid of its own/)
+  await withTempDir(async (dir) => {
+    assert.throws(() => pidInFile(join(dir, 'missing.pid'), 'the fake taskkill'), /the fake taskkill: no pid file/)
+  })
+  assert.equal(pidIn(' 4242\n', 'a fake program'), 4242)
 })

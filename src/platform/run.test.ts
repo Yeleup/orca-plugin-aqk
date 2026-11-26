@@ -4,8 +4,9 @@ import { assert, test } from 'orca/testing'
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { env, execPath, kill, platform } from 'node:process'
+import { env, execPath, platform } from 'node:process'
 import { fakeClock, fakeMachine, orcaWorkerEnv } from '../testing/fake-machine'
+import { pidInFile, stillRuns } from '../testing/processes'
 import { realMachine, realPlatform, type Machine } from './machine'
 import { decodeOutput } from './process'
 import { projectTestCommand, runProgram, runProjectTests, runShell } from './run'
@@ -376,19 +377,9 @@ test('тайм-аут: останавливается всё дерево про
     assert.equal(result.error?.kind, 'timed_out', JSON.stringify(result))
     assert.ok(Date.now() - began < 10_000, `the result took ${Date.now() - began} ms`)
     assert.equal(result.stdout, 'started\n')
-    const grandchild = Number(readFileSync(pidFile, 'utf8'))
-    let alive = true
-    for (let i = 0; i < 30 && alive; i++) {
-      try {
-        kill(grandchild, 0)
-        await new Promise((resolve) => setTimeout(resolve, 100))
-      } catch {
-        alive = false
-      }
-    }
-    // Stopped here if the tree was not: a failed test, not one that keeps the test run waiting.
-    if (alive) kill(grandchild, 'SIGKILL')
-    assert.equal(alive, false, `the child ${grandchild} of the stopped program still runs`)
+    // The pid is checked before any signal; stopped here if the tree was not: a failed test, not one that waits.
+    const grandchild = pidInFile(pidFile, 'the child of the stopped program')
+    assert.equal(await stillRuns(grandchild), false, `the child ${grandchild} of the stopped program still runs`)
   })
 })
 
