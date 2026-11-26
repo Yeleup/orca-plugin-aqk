@@ -8,7 +8,15 @@
 import { GITHUB_LANGUAGES, isGithubLanguage, type GithubLanguage } from '../github-texts/catalog'
 import { errorMessage, type Machine } from '../platform/machine'
 import type { ProjectTestSettings } from '../platform/run'
-import { defaultBranch, readBaseBranchFile, REMOTE, type BaseBranchCommit } from './base-branch'
+import {
+  branchNameProblem,
+  defaultBranch,
+  readBaseBranchFile,
+  REMOTE,
+  remoteBranches,
+  textsInCommits,
+  type BaseBranchCommit,
+} from './base-branch'
 
 export const SETTINGS_FILE = '.agent-queue.json'
 
@@ -139,7 +147,8 @@ export function describeProblems(problems: readonly SettingsProblem[]): string {
 
 export type ReadSettingsResult =
   | { readonly ok: true; readonly settings: ProjectSettings; readonly source: BaseBranchCommit }
-  // The base branch has no .agent-queue.json: the project is not connected there.
+  // No .agent-queue.json: the project is not connected. Read from the caller's branch: that branch has none; otherwise
+  // neither the default branch (`source`) nor any other branch of origin has a file that names its own branch.
   | { readonly ok: false; readonly kind: 'missing'; readonly error: string; readonly source: BaseBranchCommit }
   // The file is there but wrong: `problems` names each field at fault.
   | {
@@ -149,13 +158,22 @@ export type ReadSettingsResult =
       readonly problems: readonly SettingsProblem[]
       readonly source: BaseBranchCommit
     }
+  // The default branch has no file, and several branches of origin each have one that names its own branch: which of
+  // them is the base branch is not known.
+  | { readonly ok: false; readonly kind: 'ambiguous'; readonly error: string; readonly branches: readonly string[] }
   // git failed, or the clone lacks the branch: nothing is known about the file.
   | { readonly ok: false; readonly kind: 'unreadable'; readonly error: string }
 
 // Reads the project's settings from its base branch: the committed .agent-queue.json of origin/<branch>, never the
-// working tree of the checkout. Reading starts at `options.branch` or else at the repository's default branch. A file
-// that names another base branch (`baseBranch`) hands over to the file of that branch, which must name its own branch:
-// the settings are always those of the base branch they name.
+// working tree of the checkout.
+// - A caller that knows the base branch names it (`options.branch`), and reading starts there.
+// - Otherwise reading starts at the repository's default branch. When that branch has no file, the project may be
+//   connected on another base branch (the connection commit goes only to the branch the owner chose, Ф1): the base
+//   branch is then the branch of origin whose file names that very branch (`baseBranch`) — the file the connection
+//   wizard wrote there. A file on any other branch (a task's branch, a branch made from the base) names the base, not
+//   its own branch, and does not count.
+// A file that names another base branch hands over to the file of that branch, which must name its own branch: the
+// settings are always those of the base branch they name.
 export async function readProjectSettings(
   machine: Machine,
   checkout: string,
@@ -173,9 +191,30 @@ export async function readProjectSettings(
     if (!checked.ok) return invalid(source, checked.problems)
     return { ok: true, settings: { ...checked.settings, baseBranch: checked.settings.baseBranch ?? (await fallback()) }, source }
   }
+  // The default branch has no file: the branch of origin whose file names it.
+  const discover = async (missing: Extract<ReadSettingsResult, { kind: 'missing' }>): Promise<ReadSettingsResult> => {
+    const branches = (await remoteBranches(machine, checkout)).filter(({ branch }) => branch !== missing.source.branch)
+    const texts = await textsInCommits(machine, checkout, branches.map(({ commit }) => commit), SETTINGS_FILE)
+    const named = branches
+      .filter(({ branch, commit }) => namesOwnBranch(texts.get(commit), branch))
+      .map(({ branch }) => branch)
+      .sort()
+    const [only] = named
+    if (only === undefined) {
+      const error = `${missing.error}, and no other branch of ${REMOTE} has one that names its own branch as baseBranch`
+      return { ...missing, error }
+    }
+    if (named.length > 1) {
+      const list = named.map((branch) => `${REMOTE}/${branch}`).join(', ')
+      const error = `${SETTINGS_FILE}: ${list} each have one that names its own branch as baseBranch; which one is the base branch is not known`
+      return { ok: false, kind: 'ambiguous', error, branches: named }
+    }
+    return readFrom(only)
+  }
   try {
     const start = options.branch ?? (await fallback())
     const first = await readFrom(start)
+    if (!first.ok && first.kind === 'missing' && options.branch === undefined) return await discover(first)
     if (!first.ok || first.settings.baseBranch === start) return first
     const base = first.settings.baseBranch
     const second = await readFrom(base)
@@ -195,6 +234,18 @@ export async function readProjectSettings(
     return second
   } catch (error) {
     return { ok: false, kind: 'unreadable', error: `${SETTINGS_FILE}: ${errorMessage(error)}` }
+  }
+}
+
+// Whether a settings file's text names `branch` as its base branch: the mark of the base branch's own file. Only its
+// `baseBranch` counts here; the whole file is checked when it is read.
+function namesOwnBranch(text: string | undefined, branch: string): boolean {
+  if (text === undefined) return false
+  try {
+    const json: unknown = JSON.parse(text.replace(/^\uFEFF/, ''))
+    return isObject(json) && json.baseBranch === branch
+  } catch {
+    return false
   }
 }
 
@@ -469,19 +520,4 @@ function described(value: unknown): string {
   if (typeof value === 'object') return 'an object'
   if (typeof value === 'string') return `the text ${JSON.stringify(value.length > 40 ? `${value.slice(0, 40)}…` : value)}`
   return `${typeof value === 'number' ? 'the number' : typeof value} ${String(value)}`
-}
-
-// Why `name` cannot be a git branch (the rules of `git check-ref-format --branch`), or null when it can.
-function branchNameProblem(name: string): string | null {
-  if (name.startsWith('-')) return 'it starts with -'
-  if (/[\x00-\x20\x7f~^:?*[\\]/.test(name)) return 'it holds a space, a control character or one of ~ ^ : ? * [ \\'
-  if (name.includes('..')) return 'it holds ..'
-  if (name.includes('@{') || name === '@') return 'it holds @{ or is @'
-  if (name.startsWith('/') || name.endsWith('/') || name.includes('//')) return 'it has an empty part between slashes'
-  if (name.endsWith('.')) return 'it ends with .'
-  for (const part of name.split('/')) {
-    if (part.startsWith('.')) return 'a part of it starts with .'
-    if (part.endsWith('.lock')) return 'a part of it ends with .lock'
-  }
-  return null
 }

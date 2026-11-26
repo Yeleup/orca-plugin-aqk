@@ -9,6 +9,7 @@ import { realMachine } from '../platform/machine'
 import { projectTestCommand } from '../platform/run'
 import { fakeClock, fakeMachine } from '../testing/fake-machine'
 import { withRepository } from '../testing/git-repository'
+import { textsInCommits } from './base-branch'
 import {
   formatProjectSettings,
   forbiddenPatternRegExps,
@@ -75,6 +76,7 @@ test('в .agent-queue.json неизвестное поле или поле не�
     { why: 'missing test command', file: json({ ...MINIMAL, testCommand: undefined }), fields: ['testCommand'] },
     { why: 'two-line command', file: json({ ...MINIMAL, testCommand: 'make test\nmake lint' }), fields: ['testCommand'] },
     { why: 'not a branch name', file: json({ ...MINIMAL, baseBranch: 'main branch' }), fields: ['baseBranch'] },
+    { why: 'HEAD is not a branch', file: json({ ...MINIMAL, baseBranch: 'HEAD' }), fields: ['baseBranch'] },
     {
       why: 'stand address without http',
       file: json({ ...MINIMAL, acceptanceStand: { setup: 'make stand-setup', up: 'make stand-up', url: 'localhost:47391', down: 'make stand-down' } }),
@@ -183,13 +185,74 @@ test('настройки читаются из базовой ветки на or
   })
 })
 
-test('файл в ветке по умолчанию называет другую базовую ветку → настройки берутся из файла той ветки', async () => {
+test('проект подключён на выбранной базовой ветке, а в ветке по умолчанию файла нет → клон на другом компьютере находит её по файлу, который называет свою ветку', async () => {
+  await withRepository(async (repo) => {
+    // The connection commit goes only to the base branch the owner chose, develop; main never gets the file.
+    await repo.git(['checkout', '--quiet', '-b', 'develop'])
+    const connected = await repo.commit({ [SETTINGS_FILE]: json({ ...MINIMAL, baseBranch: 'develop' }) }, 'connect')
+    // A task's branch made from develop carries the same file, which names develop, not its own branch.
+    await repo.git(['checkout', '--quiet', '-b', 'agent-queue/issue-5'])
+    await repo.commit({ 'src/cart.ts': 'export {}\n' }, 'task')
+    await repo.push()
+    // Branches whose file is empty or not JSON do not name a branch either.
+    await repo.git(['checkout', '--quiet', '-b', 'notes', 'main'])
+    await repo.commit({ [SETTINGS_FILE]: '' }, 'empty')
+    await repo.push()
+    await repo.git(['checkout', '--quiet', '-b', 'draft', 'main'])
+    await repo.commit({ [SETTINGS_FILE]: '{ "baseBranch": "draft", ' }, 'not json')
+    await repo.push()
+
+    // Another computer: a clone that knows only origin. develop is not pushed yet: no branch names itself.
+    const other = await repo.clone('shop-demo-2')
+    let result = await readProjectSettings(machine, other)
+    assert.ok(!result.ok && result.kind === 'missing', JSON.stringify(result))
+    assert.equal(result.source.branch, 'main')
+    assert.match(result.error, /origin\/main has no \.agent-queue\.json, and no other branch/)
+
+    await repo.push('develop')
+    await repo.git(['fetch', '--quiet'], other)
+    result = await readProjectSettings(machine, other)
+    assert.equal(settingsOf(result).baseBranch, 'develop')
+    assert.deepEqual(result.ok && result.source, { branch: 'develop', commit: connected })
+
+    // The file of the base branch found this way is checked whole: a wrong field there is named.
+    await repo.git(['checkout', '--quiet', 'develop'])
+    const broken = await repo.commit({ [SETTINGS_FILE]: json({ ...MINIMAL, baseBranch: 'develop', maxInProgress: 0 }) })
+    await repo.push()
+    await repo.git(['fetch', '--quiet'], other)
+    result = await readProjectSettings(machine, other)
+    assert.ok(!result.ok && result.kind === 'invalid', JSON.stringify(result))
+    assert.deepEqual(result.problems.map((problem) => problem.field), ['maxInProgress'])
+    assert.deepEqual(result.source, { branch: 'develop', commit: broken })
+
+    // A second branch whose file names itself: which one is the base branch is not known.
+    await repo.git(['checkout', '--quiet', '-b', 'staging'])
+    await repo.commit({ [SETTINGS_FILE]: json({ ...MINIMAL, baseBranch: 'staging' }) })
+    await repo.push()
+    await repo.git(['fetch', '--quiet'], other)
+    result = await readProjectSettings(machine, other)
+    assert.ok(!result.ok && result.kind === 'ambiguous', JSON.stringify(result))
+    assert.deepEqual(result.branches, ['develop', 'staging'])
+    assert.match(result.error, /origin\/develop, origin\/staging/)
+    // A caller that knows the base branch reads it directly.
+    result = await readProjectSettings(machine, other, { branch: 'staging' })
+    assert.equal(settingsOf(result).baseBranch, 'staging')
+  })
+})
+
+test('базовая ветка develop влита в ветку по умолчанию: файл в main называет develop → настройки берутся из файла develop', async () => {
   await withRepository(async (repo) => {
     await repo.git(['checkout', '--quiet', '-b', 'develop'])
-    const develop = await repo.commit({ [SETTINGS_FILE]: json({ ...MINIMAL, baseBranch: 'develop', maxInProgress: 2 }) })
+    await repo.commit({ [SETTINGS_FILE]: json({ ...MINIMAL, baseBranch: 'develop' }) }, 'connect')
     await repo.push()
+    // A release: develop is merged into main, which now carries develop's file.
     await repo.git(['checkout', '--quiet', 'main'])
-    const main = await repo.commit({ [SETTINGS_FILE]: json({ ...MINIMAL, baseBranch: 'develop', maxInProgress: 5 }) })
+    await repo.git(['merge', '--quiet', '--no-ff', '--no-edit', 'develop'])
+    const main = (await repo.git(['rev-parse', 'HEAD'])).trim()
+    await repo.push()
+    // The owner then changes the settings on the base branch; main keeps the older file.
+    await repo.git(['checkout', '--quiet', 'develop'])
+    const develop = await repo.commit({ [SETTINGS_FILE]: json({ ...MINIMAL, baseBranch: 'develop', maxInProgress: 2 }) })
     await repo.push()
 
     let result = await readProjectSettings(machine, repo.checkout)
@@ -202,7 +265,6 @@ test('файл в ветке по умолчанию называет другу
     assert.deepEqual(result.ok && result.source, { branch: 'develop', commit: develop })
 
     // The named branch's file names yet another branch: refused, naming baseBranch.
-    await repo.git(['checkout', '--quiet', 'develop'])
     const other = await repo.commit({ [SETTINGS_FILE]: json({ ...MINIMAL, baseBranch: 'release' }) })
     await repo.push()
     result = await readProjectSettings(machine, repo.checkout)
@@ -218,6 +280,27 @@ test('файл в ветке по умолчанию называет другу
     assert.ok(!result.ok && result.kind === 'invalid', JSON.stringify(result))
     assert.deepEqual(result.problems.map((problem) => problem.field), ['baseBranch'])
     assert.deepEqual(result.source, { branch: 'main', commit: main })
+  })
+})
+
+test('поиск файла настроек по многим веткам: найден каждый коммит с файлом, и за пределом одного запуска git grep; каталог с тем же именем — не файл', async () => {
+  await withRepository(async (repo) => {
+    await repo.commit({ [SETTINGS_FILE]: json(MINIMAL) })
+    const withFile = (await repo.git(['rev-parse', 'HEAD^{tree}'])).trim()
+    const withoutFile = (await repo.git(['rev-parse', 'HEAD~1^{tree}'])).trim()
+    // 230 commits, more than one git grep takes; every tenth has no settings file.
+    const commits: string[] = []
+    for (let i = 0; i < 230; i++) {
+      commits.push((await repo.git(['commit-tree', i % 10 === 9 ? withoutFile : withFile, '-m', `commit ${i}`])).trim())
+    }
+    // A commit with a directory of that name instead of the file has no settings file either.
+    await repo.git(['rm', '--quiet', SETTINGS_FILE])
+    const directory = await repo.commit({ [`${SETTINGS_FILE}/settings.json`]: json(MINIMAL) })
+    // Searched from a subdirectory of the checkout: paths count from the root all the same.
+    repo.write('src/app/main.ts', 'export {}\n')
+    const texts = await textsInCommits(machine, join(repo.checkout, 'src', 'app'), [...commits, directory], SETTINGS_FILE)
+    assert.deepEqual([...texts.keys()].sort(), commits.filter((_, i) => i % 10 !== 9).sort())
+    for (const text of texts.values()) assert.deepEqual(JSON.parse(text), MINIMAL)
   })
 })
 
@@ -249,6 +332,11 @@ test('git не может прочитать файл → «не прочита�
     const result = await readProjectSettings(machine, repo.checkout, { branch: 'release' })
     assert.ok(!result.ok && result.kind === 'unreadable', JSON.stringify(result))
     assert.match(result.error, /origin\/release/)
+
+    // HEAD is git's name for the current commit, never a base branch: origin/HEAD is not read as one.
+    const head = await readProjectSettings(machine, repo.checkout, { branch: 'HEAD' })
+    assert.ok(!head.ok && head.kind === 'unreadable', JSON.stringify(head))
+    assert.match(head.error, /"HEAD" is not a branch name/)
 
     // The settings path is a directory.
     await repo.commit({ [`${SETTINGS_FILE}/x.json`]: '{}' })

@@ -23,6 +23,9 @@ export type TestRepository = {
   write(path: string, text: string): void
   // Pushes the current branch (or `branch`) to origin.
   push(branch?: string): Promise<void>
+  // Clones origin into a new directory `name` beside the checkout: the project's checkout on another computer, which
+  // knows only what origin has.
+  clone(name: string): Promise<string>
 }
 
 export type TestRepositoryOptions = {
@@ -76,9 +79,14 @@ export async function withRepository(
       return (await git(['rev-parse', 'HEAD'])).trim()
     },
     push: async (target) => {
-      const current = target ?? (await git(['symbolic-ref', '--short', 'HEAD'])).trim()
-      await git(['push', '--quiet', 'origin', `HEAD:refs/heads/${current}`])
+      const branch = target ?? (await git(['symbolic-ref', '--short', 'HEAD'])).trim()
+      await git(['push', '--quiet', 'origin', `refs/heads/${branch}:refs/heads/${branch}`])
       await git(['fetch', '--quiet', 'origin'])
+    },
+    clone: async (name) => {
+      const dir = join(root, name)
+      await git(['clone', '--quiet', origin, dir], root)
+      return dir
     },
   }
   try {
