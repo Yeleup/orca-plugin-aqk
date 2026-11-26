@@ -3,8 +3,11 @@
 /** A project connected to the queue, as the panel's project selector shows it. */
 export type Project = {
   /** Orca's id of the project (`project.list`): the panel keeps it as the selected project, the worker finds the
-   *  project's main checkout by it. */
+   *  project's main checkout by it and `hostId`. */
   id: string
+  /** Orca's host of the project (`project.list`: `local`, `ssh:…`, `runtime:…`): one id can name copies of a project
+   *  on two hosts. */
+  hostId: string
   /** Name shown in the selector. */
   name: string
 }
@@ -20,9 +23,12 @@ declare module 'orca' {
   interface PluginRequests {
     /** The projects connected to the queue on this computer. */
     'projects.list': { output: { projects: Project[] } }
-    /** Opens one of the project's files of «Настройки проекта» in Orca's editor, in the project's main checkout. A file
-     *  that is not one of PROJECT_FILES is refused with `invalid_params`; Orca's refusal of the editor comes as is. */
-    'project.openFile': { input: { projectId: string; file: ProjectFile }; output: OpenProjectFileAnswer }
+    /** Shows the project's main checkout in Orca and opens one of its files of «Настройки проекта» there in Orca's
+     *  editor. A file that is not one of PROJECT_FILES is refused with `invalid_params`; Orca's refusals come as is. */
+    'project.openFile': {
+      input: { projectId: string; hostId: string; file: ProjectFile }
+      output: OpenProjectFileAnswer
+    }
   }
   interface PluginPanelEvents {
     /** Posted to every open panel when the connected projects change: the whole new list. */

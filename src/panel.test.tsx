@@ -79,8 +79,8 @@ async function pressWhileWaiting<T>(
 
 type ProjectsAnswer = { projects: Project[] }
 
-const SHOP: Project = { id: 'shop-demo', name: 'shop-demo' }
-const BLOG: Project = { id: 'blog-demo', name: 'blog-demo' }
+const SHOP: Project = { id: 'shop-demo', hostId: 'local', name: 'shop-demo' }
+const BLOG: Project = { id: 'blog-demo', hostId: 'local', name: 'blog-demo' }
 
 let view: TestPanel | undefined
 afterEach(async () => {

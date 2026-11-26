@@ -29,7 +29,7 @@ export const ru: { readonly [K in MessageKey]: string } = {
   'settings.languageEnglish': 'English',
   'settings.languageRussian': 'Русский',
   'settings.interval': 'Интервал проверки очереди, минут',
-  'settings.intervalInvalid': 'Введите целое число минут от {min} до {max}',
+  'settings.intervalInvalid': 'Введите целое число минут, не меньше {min}',
   'settings.mergeNotifications': 'Уведомления о мержах',
   'settings.coordinator': 'Координатор на этом компьютере',
   'settings.project': 'Настройки проекта',

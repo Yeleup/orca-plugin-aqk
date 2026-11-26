@@ -3,8 +3,8 @@
 import { defineCheck, hostError } from 'orca/testing'
 
 const projects = [
-  { id: 'shop-demo', name: 'shop-demo' },
-  { id: 'blog-demo', name: 'blog-demo' },
+  { id: 'shop-demo', hostId: 'local', name: 'shop-demo' },
+  { id: 'blog-demo', hostId: 'local', name: 'blog-demo' },
 ]
 
 export default defineCheck({

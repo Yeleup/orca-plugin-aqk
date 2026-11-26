@@ -1,14 +1,15 @@
 // «Настройки» (ТЗ «Экраны»): the plugin's settings on this computer (src/settings.ts) — the interface language, the
 // queue check interval, merge notifications and the coordinator of this computer — and «Настройки проекта», which opens
 // the selected project's .agent-queue.json and .agent-queue.md in Orca's editor (through the worker). A change is saved
-// at once: the screen then says «Сохранено» (after a switch, also what the switches now mean) or «Не удалось сохранить:
-// <ошибка>», and it always shows the values Orca keeps, never one a failed write did not save.
+// at once: each control shows the person's latest change while its write is on its way; when that write ends, the
+// screen says «Сохранено» (with what the switches now mean, where the frames say so) and shows the saved value, or
+// says «Не удалось сохранить: <ошибка>» and shows the previous value again — never one a failed write did not save.
 import { atom, Button, Callout, Input, plugin, read, Row, Select, set, settings, Stack, Switch, Text } from 'orca'
 import { LANGUAGES, type Language, type MessageKey } from '../i18n/catalog'
-import { PROJECT_FILES, type ProjectFile } from '../protocol'
+import { PROJECT_FILES, type Project, type ProjectFile } from '../protocol'
 import {
-  INTERVAL_MINUTES,
   isQueueCheckInterval,
+  MIN_INTERVAL_MINUTES,
   readSettings,
   SETTING_KEYS,
   type PluginSettings,
@@ -41,19 +42,30 @@ type Notice =
   | { kind: 'saveError'; error: string }
   | { kind: 'openError'; file: ProjectFile; error: string | null }
 
+/** The latest change of each setting whose write has not ended, by the number of the change (`edit`). */
+type Pending = { readonly [N in SettingName]?: { readonly edit: number; readonly value: PluginSettings[N] } }
+
 /**
- * One visit of the screen: its notice, an interval typed that is not valid (not saved), and the generation of its
- * controls — a failed save draws them anew from the saved values. A new visit (any move to another screen and back)
- * starts with none of these.
+ * One visit of the screen: its notice, the changes on their way and the interval's field as typed — shown until the
+ * write of that very text ends, and kept while it is not a valid interval (then nothing is written). A new visit (any
+ * move to another screen and back) starts with none of these.
  */
-type Visit = { route: Route; notice: Notice | null; intervalDraft: string | null; generation: number }
+type Visit = {
+  route: Route
+  notice: Notice | null
+  pending: Pending
+  field: { readonly text: string; readonly edit: number } | null
+}
 
 const visit = atom<Visit | null>(null)
+
+// Numbers the person's changes, so that only the end of the latest one decides what the screen shows.
+let edits = 0
 
 function currentVisit(): Visit {
   const here = read(route)
   const kept = read(visit)
-  return kept !== null && kept.route === here ? kept : { route: here, notice: null, intervalDraft: null, generation: 0 }
+  return kept !== null && kept.route === here ? kept : { route: here, notice: null, pending: {}, field: null }
 }
 
 /** Changes the visit `at` began; nothing once the person has left it. */
@@ -62,60 +74,78 @@ function changeVisit(at: Route, change: Partial<Omit<Visit, 'route'>>): void {
   set(visit, { ...currentVisit(), ...change })
 }
 
-/** The saved line after `name` changed: after a switch, what the switches now mean (frames «Настройки — сохранено…»). */
+/**
+ * The saved line after `name` changed. After a switch, and after a change to Русский, it says what the switches now
+ * mean (the frames «Настройки — сохранено — …» and the «Русский» transitions of the English frames); after a change to
+ * English (the English frames) and after the interval — «Сохранено.».
+ */
 function savedLine(name: SettingName, saved: PluginSettings): MessageKey {
-  if (name !== 'mergeNotifications' && name !== 'coordinator') return 'settings.saved'
+  const switched = name === 'mergeNotifications' || name === 'coordinator'
+  if (!switched && !(name === 'language' && saved.language === 'ru')) return 'settings.saved'
   if (!saved.mergeNotifications && !saved.coordinator) return 'settings.savedBothOff'
   if (!saved.mergeNotifications) return 'settings.savedNotificationsOff'
   if (!saved.coordinator) return 'settings.savedCoordinatorOff'
   return 'settings.saved'
 }
 
-// Writes go one after another, so the screen shows them in the order the person made them.
+// Writes go one after another, in the order the person made the changes.
 let writing: Promise<void> = Promise.resolve()
 
-function save<N extends SettingName>(name: N, value: PluginSettings[N]): Promise<void> {
+/** Saves the change number `edit` of `name`; the control shows `value` until this write, or a later change, ends. */
+function save<N extends SettingName>(name: N, value: PluginSettings[N], edit = ++edits): Promise<void> {
   const at = read(route)
-  const run = writing.then(() => write(at, name, value))
+  changeVisit(at, { pending: { ...currentVisit().pending, [name]: { edit, value } } })
+  const run = writing.then(() => write(at, name, value, edit))
   writing = run.catch(() => {})
   return run
 }
 
-async function write<N extends SettingName>(at: Route, name: N, value: PluginSettings[N]): Promise<void> {
+async function write<N extends SettingName>(at: Route, name: N, value: PluginSettings[N], edit: number): Promise<void> {
   try {
     await settings.set(SETTING_KEYS[name], value)
   } catch (error) {
-    changeVisit(at, {
-      notice: { kind: 'saveError', error: errorMessage(error) },
-      intervalDraft: null,
-      generation: currentVisit().generation + 1,
-    })
+    settle(at, name, edit, { kind: 'saveError', error: errorMessage(error) })
     return
   }
   const state = read(pluginSettings.state)
-  if (state.status !== 'ready') {
-    await refreshSettings()
-    return
-  }
-  const saved: PluginSettings = { ...state.data, [name]: value }
-  pluginSettings.resolve(saved)
-  if (name === 'language') set(language, saved.language)
-  changeVisit(at, { notice: { kind: 'saved', line: savedLine(name, saved) } })
+  if (state.status !== 'ready') await refreshSettings()
+  const now = read(pluginSettings.state)
+  const saved: PluginSettings | null = now.status === 'ready' ? { ...now.data, [name]: value } : null
+  if (saved !== null) pluginSettings.resolve(saved)
+  if (name === 'language') set(language, value as Language)
+  settle(at, name, edit, { kind: 'saved', line: saved === null ? 'settings.saved' : savedLine(name, saved) })
 }
 
 /**
- * A whole number of minutes in INTERVAL_MINUTES is saved at once, each one the person types (an earlier one may still
- * be on its way, so even the value on the screen is written again); anything else stays in the field with its error.
+ * The write of change `edit` of `name` ended with `notice`. If no later change of `name` is on its way, the control
+ * shows what Orca keeps now: the new value after a save, the previous one after a refusal. The interval's field lets
+ * go of its text only if this change typed it.
  */
-function changeInterval(text: string): void {
+function settle(at: Route, name: SettingName, edit: number, notice: Notice): void {
+  if (read(route) !== at) return
+  const here = currentVisit()
+  const pending: Record<string, unknown> = { ...here.pending }
+  if (here.pending[name]?.edit === edit) delete pending[name]
+  const field = here.field?.edit === edit ? null : here.field
+  set(visit, { ...here, notice, pending: pending as Pending, field })
+}
+
+/** The interval a text of the field names, or null when it is not a whole number of minutes, at least the least. */
+function intervalOf(text: string): number | null {
   const typed = text.trim()
   const minutes = /^\d+$/.test(typed) ? Number(typed) : Number.NaN
-  if (!isQueueCheckInterval(minutes)) {
-    changeVisit(read(route), { intervalDraft: text })
-    return
-  }
-  changeVisit(read(route), { intervalDraft: null })
-  void save('queueCheckInterval', minutes)
+  return isQueueCheckInterval(minutes) ? minutes : null
+}
+
+/**
+ * The field keeps the text as typed. A valid interval is saved at once, each one the person types (typing «30» saves
+ * 3, then 30); anything else stays in the field with its error and is not written.
+ */
+function changeInterval(text: string): void {
+  const edit = ++edits
+  changeVisit(read(route), { field: { text, edit } })
+  const minutes = intervalOf(text)
+  if (minutes !== null) void save('queueCheckInterval', minutes, edit)
 }
 
 const LANGUAGE_LABELS: { readonly [L in Language]: MessageKey } = {
@@ -128,11 +158,11 @@ const FILE_LABELS: { readonly [F in ProjectFile]: MessageKey } = {
   '.agent-queue.md': 'settings.rulesFile',
 }
 
-async function openFile(projectId: string, file: ProjectFile): Promise<void> {
+async function openFile(project: Project, file: ProjectFile): Promise<void> {
   const at = read(route)
   let error: string | null
   try {
-    const answer = await plugin.request('project.openFile', { projectId, file })
+    const answer = await plugin.request('project.openFile', { projectId: project.id, hostId: project.hostId, file })
     if (answer.opened) {
       if (currentVisit().notice?.kind === 'openError') changeVisit(at, { notice: null })
       return
@@ -160,40 +190,37 @@ export function SettingsScreen() {
 function SettingsForm(props: { saved: PluginSettings }) {
   const { saved } = props
   const here = currentVisit()
-  const shown = read(language) ?? saved.language
+  const { pending, field } = here
+  const interval = field?.text ?? String(pending.queueCheckInterval?.value ?? saved.queueCheckInterval)
+  const intervalInvalid = field !== null && intervalOf(field.text) === null
   return (
-    <Stack key={String(here.generation)} gap="md">
+    <Stack gap="md">
       <NoticeLine notice={here.notice} />
       <Select
         label={t('settings.language')}
         options={LANGUAGES.map((option) => ({ value: option, label: t(LANGUAGE_LABELS[option]) }))}
-        value={shown}
+        value={pending.language?.value ?? read(language) ?? saved.language}
         onChange={(value) => {
           const chosen = LANGUAGES.find((option) => option === value)
           if (chosen) void save('language', chosen)
         }}
       />
       <Stack gap="xs">
-        <Input
-          label={t('settings.interval')}
-          value={here.intervalDraft ?? String(saved.queueCheckInterval)}
-          invalid={here.intervalDraft !== null}
-          onChange={changeInterval}
-        />
-        {here.intervalDraft !== null ? (
+        <Input label={t('settings.interval')} value={interval} invalid={intervalInvalid} onChange={changeInterval} />
+        {intervalInvalid ? (
           <Text tone="danger" size="sm">
-            {t('settings.intervalInvalid', INTERVAL_MINUTES)}
+            {t('settings.intervalInvalid', { min: MIN_INTERVAL_MINUTES })}
           </Text>
         ) : null}
       </Stack>
       <Switch
         label={t('settings.mergeNotifications')}
-        checked={saved.mergeNotifications}
+        checked={pending.mergeNotifications?.value ?? saved.mergeNotifications}
         onChange={(checked) => void save('mergeNotifications', checked)}
       />
       <Switch
         label={t('settings.coordinator')}
-        checked={saved.coordinator}
+        checked={pending.coordinator?.value ?? saved.coordinator}
         onChange={(checked) => void save('coordinator', checked)}
       />
       <ProjectSettings />
@@ -238,7 +265,7 @@ function ProjectSettings() {
             tooltip={t('settings.openFile')}
             disabled={project === null}
             onPress={() => {
-              if (project) void openFile(project.id, file)
+              if (project) void openFile(project, file)
             }}
           >
             {t(FILE_LABELS[file])}

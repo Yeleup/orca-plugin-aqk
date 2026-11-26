@@ -20,7 +20,7 @@ import {
 import manifest from '../orca-plugin.json' with { type: 'json' }
 import { LANGUAGE_SETTING, type Language } from './i18n/catalog'
 import type { Project } from './protocol'
-import { DEFAULT_SETTINGS, INTERVAL_MINUTES, parseSettings, readSettings, SETTING_KEYS } from './settings'
+import { DEFAULT_SETTINGS, MIN_INTERVAL_MINUTES, parseSettings, readSettings, SETTING_KEYS } from './settings'
 import { pixelWidths, textsIn, textsNotFromCatalog } from './testing/panel-tree'
 import { withTemporaryHome } from './testing/temporary-home'
 import * as worker from './worker'
@@ -30,15 +30,35 @@ if (!declared || declared.ui !== 'components') {
   throw new Error('orca-plugin.json: no components panel agent-queue in contributes.panels')
 }
 const panelModule = (await import(`../${declared.entry}`)) as typeof import('./panel')
+const DeclaredPanel = panelModule.default
 
-// Orca's ids of the projects (project.list), which the panel keeps as the selected project.
-const SHOP: Project = { id: 'project-shop', name: 'shop-demo' }
-const BLOG: Project = { id: 'project-blog', name: 'blog-demo' }
+// Every draw of the panel lets the waiters of `nextDraw()` go on (as in src/panel.test.tsx): a test sees the panel as it
+// is drawn while a write it holds back is on its way. The panel itself is the declared module, unchanged.
+let drawWaiters: (() => void)[] = []
+function nextDraw(): Promise<void> {
+  return new Promise((resolve) => drawWaiters.push(resolve))
+}
+const observedPanel = {
+  setup: panelModule.setup,
+  default: () => {
+    for (const resolve of drawWaiters.splice(0)) resolve()
+    return <DeclaredPanel />
+  },
+}
+
+// Orca's ids and hosts of the projects (project.list); the panel keeps the id as the selected project.
+const SHOP: Project = { id: 'project-shop', hostId: 'local', name: 'shop-demo' }
+const BLOG: Project = { id: 'project-blog', hostId: 'local', name: 'blog-demo' }
 
 const RU = { [LANGUAGE_SETTING]: 'ru' }
 
 let view: TestPanel | undefined
+// Lets through every write a test held back and did not end (a failed test), so the next test's writes are not queued
+// behind it.
+let releaseHeld: (() => void) | null = null
 afterEach(async () => {
+  releaseHeld?.()
+  releaseHeld = null
   await view?.unmount()
   view = undefined
 })
@@ -61,7 +81,7 @@ function hostWith(options: {
 async function open(host: MockHost): Promise<TestPanel> {
   await view?.unmount()
   view = undefined
-  view = await mount(panelModule, { host })
+  view = await mount(observedPanel, { host })
   return view
 }
 
@@ -259,16 +279,21 @@ async function withWorker(
   })
 }
 
+// The blog project has a copy on another host with the same id and the same path, listed first by Orca.
+const REMOTE = 'ssh:build-box'
 const ORCA_PROJECTS = {
   projects: [
     { id: SHOP.id, name: 'shop-demo', kind: 'git', hostId: 'local', path: '/work/shop-demo' },
+    { id: BLOG.id, name: 'blog-demo', kind: 'git', hostId: REMOTE, path: '/work/blog-demo' },
     { id: BLOG.id, name: 'blog-demo', kind: 'git', hostId: 'local', path: '/work/blog-demo' },
   ],
   truncated: false,
 }
 const ORCA_WORKSPACES = {
   workspaces: [
-    { id: 'ws-shop-main', kind: 'worktree', name: 'main', projectId: SHOP.id, path: '/work/shop-demo', branch: 'main', hostId: 'local' },
+    // A row that records no host is one of this machine (workspace.list).
+    { id: 'ws-shop-main', kind: 'worktree', name: 'main', projectId: SHOP.id, path: '/work/shop-demo', branch: 'main', hostId: null },
+    { id: 'ws-remote-blog-main', kind: 'worktree', name: 'main', projectId: BLOG.id, path: '/work/blog-demo', branch: 'main', hostId: REMOTE },
     {
       id: 'ws-blog-issue-7',
       kind: 'worktree',
@@ -283,8 +308,18 @@ const ORCA_WORKSPACES = {
   truncated: false,
 }
 
+/** The worker's calls that show a workspace and open a file in it, in order. */
+function opening(orcaHost: MockHost): { method: string; params: unknown }[] {
+  return orcaHost.calls.filter((call) => call.method === 'workspace.open' || call.method === 'editor.open')
+}
+
 test('Настройки: «Настройки проекта» → запрос открыть .agent-queue.json и .agent-queue.md выбранного проекта в редакторе Orca', async () => {
-  const orca = { 'project.list': ORCA_PROJECTS, 'workspace.list': ORCA_WORKSPACES, 'editor.open': { opened: true } }
+  const orca = {
+    'project.list': ORCA_PROJECTS,
+    'workspace.list': ORCA_WORKSPACES,
+    'workspace.open': { opened: true },
+    'editor.open': { opened: true },
+  }
   await withWorker(orca, async (orcaHost, openFile) => {
     const panel = await open(
       hostWith({ settings: RU, projects: [SHOP, BLOG], requests: { 'project.openFile': openFile } }),
@@ -306,13 +341,16 @@ test('Настройки: «Настройки проекта» → запрос
     await panel.press({ type: 'Button', text: '.agent-queue.md' })
     const asked = panel.host.callsOf('plugin.request').filter((call) => (call as { name: string }).name !== 'projects.list')
     assert.deepEqual(asked, [
-      { name: 'project.openFile', input: { projectId: BLOG.id, file: '.agent-queue.json' } },
-      { name: 'project.openFile', input: { projectId: BLOG.id, file: '.agent-queue.md' } },
+      { name: 'project.openFile', input: { projectId: BLOG.id, hostId: 'local', file: '.agent-queue.json' } },
+      { name: 'project.openFile', input: { projectId: BLOG.id, hostId: 'local', file: '.agent-queue.md' } },
     ])
-    // The worker opens both files in the workspace of the project's main checkout, not in a task's worktree.
-    assert.deepEqual(orcaHost.callsOf('editor.open'), [
-      { workspaceId: 'ws-blog-main', path: '.agent-queue.json' },
-      { workspaceId: 'ws-blog-main', path: '.agent-queue.md' },
+    // The worker shows the workspace of the project's main checkout on the project's own host — not a task's worktree,
+    // not the copy on another host with the same id and path — and then opens the file in it.
+    assert.deepEqual(opening(orcaHost), [
+      { method: 'workspace.open', params: { workspaceId: 'ws-blog-main' } },
+      { method: 'editor.open', params: { workspaceId: 'ws-blog-main', path: '.agent-queue.json' } },
+      { method: 'workspace.open', params: { workspaceId: 'ws-blog-main' } },
+      { method: 'editor.open', params: { workspaceId: 'ws-blog-main', path: '.agent-queue.md' } },
     ])
     assert.deepEqual(callouts(panel), [])
     assertClean(panel)
@@ -322,8 +360,13 @@ test('Настройки: «Настройки проекта» → запрос
 test('Настройки: у проекта нет основного чекаута в Orca или редактор Orca отказал → «Не удалось открыть <файл>: <причина>»; файл вне «Настроек проекта» воркер не открывает', async () => {
   let editor: () => unknown = () => ({ opened: true })
   const orca = {
-    'project.list': { projects: ORCA_PROJECTS.projects.filter((project) => project.id !== BLOG.id), truncated: false },
+    // Orca has the blog project only on another host now; its main checkout there is not the selected project's.
+    'project.list': {
+      projects: ORCA_PROJECTS.projects.filter((project) => project.id !== BLOG.id || project.hostId !== 'local'),
+      truncated: false,
+    },
     'workspace.list': ORCA_WORKSPACES,
+    'workspace.open': { opened: true },
     'editor.open': () => editor(),
   }
   await withWorker(orca, async (orcaHost, openFile) => {
@@ -336,7 +379,7 @@ test('Настройки: у проекта нет основного чекау
     assert.deepEqual(callouts(panel), [
       { tone: 'danger', text: 'Не удалось открыть .agent-queue.json: в Orca нет основного чекаута этого проекта' },
     ])
-    assert.deepEqual(orcaHost.callsOf('editor.open'), [])
+    assert.deepEqual(opening(orcaHost), [], 'открыта копия проекта на другом хосте')
 
     await panel.press({ type: 'Link', text: 'Назад' })
     await panel.select({ role: 'combobox' }, SHOP.id)
@@ -361,10 +404,15 @@ test('Настройки: у проекта нет основного чекау
     ])
     assertClean(panel)
 
-    // Any other path is refused before Orca is asked.
-    for (const file of ['../.env', '.agent-queue.json/../secret', 'README.md', '']) {
+    // Any other path, or a request without the project's host, is refused before Orca is asked.
+    const refused = [
+      ...['../.env', '.agent-queue.json/../secret', 'README.md', ''].map((file) => ({ projectId: SHOP.id, hostId: 'local', file })),
+      { projectId: SHOP.id, file: '.agent-queue.json' },
+      { projectId: SHOP.id, hostId: '', file: '.agent-queue.json' },
+    ]
+    for (const input of refused) {
       await assert.rejects(
-        openFile({ projectId: SHOP.id, file } as never),
+        openFile(input as never),
         (error) => (error as { code?: string }).code === 'invalid_params',
       )
     }
@@ -422,14 +470,14 @@ test('Настройки: строка «Сохранено» после пер�
   assertClean(panel)
 })
 
-// Each change of the field that is a whole number of minutes in range is saved at once, as the person types it (typing
-// «30» saves 3, then 30); a text that is not stays in the field with its error and is not saved.
-test('Настройки: интервал проверки очереди — целое число минут от 1 до 1440 сохраняется сразу; другое значение не сохраняется, у поля ошибка', async () => {
+// Each change of the field that is a whole number of minutes, at least 1, is saved at once, as the person types it
+// (typing «30» saves 3, then 30); a text that is not stays in the field with its error and is not saved. No upper limit.
+test('Настройки: интервал проверки очереди — целое число минут не меньше 1 сохраняется сразу, без верхнего предела; другое значение не сохраняется, у поля ошибка', async () => {
   const host = hostWith({ settings: RU })
   const panel = await open(host)
   await openSettings(panel)
   const field = { label: 'Интервал проверки очереди, минут' }
-  const invalid = `Введите целое число минут от ${INTERVAL_MINUTES.min} до ${INTERVAL_MINUTES.max}`
+  const invalid = `Введите целое число минут, не меньше ${MIN_INTERVAL_MINUTES}`
   const assertRefused = (typed: string, kept: number) => {
     assert.equal(stored(host)[SETTING_KEYS.queueCheckInterval], kept, `«${typed}» сохранено`)
     assert.equal(panel.valueOf(field), typed, `«${typed}»: в поле не то, что набрано`)
@@ -447,21 +495,165 @@ test('Настройки: интервал проверки очереди — �
     await panel.type(field, typed, { replace: true })
     assertRefused(typed, 15)
   }
-  await panel.type(field, String(INTERVAL_MINUTES.max), { replace: true })
-  assert.equal(stored(host)[SETTING_KEYS.queueCheckInterval], INTERVAL_MINUTES.max)
-  assert.equal(panel.find({ type: 'Text', text: invalid }), null)
-  // One minute more than the most, and a fraction.
-  await panel.type(field, '1')
-  assertRefused(`${INTERVAL_MINUTES.max}1`, INTERVAL_MINUTES.max)
-  await panel.type(field, String(INTERVAL_MINUTES.max), { replace: true })
+  // Once in two days, and once in a year: no upper limit.
+  for (const minutes of [2880, 525600]) {
+    await panel.type(field, String(minutes), { replace: true })
+    assert.equal(stored(host)[SETTING_KEYS.queueCheckInterval], minutes)
+    assert.equal(panel.valueOf(field), String(minutes))
+    assert.equal(panel.find({ type: 'Text', text: invalid }), null)
+  }
+  // A fraction.
   await panel.type(field, '.5')
-  assertRefused(`${INTERVAL_MINUTES.max}.5`, INTERVAL_MINUTES.max)
+  assertRefused('525600.5', 525600)
+  await panel.type(field, '2880', { replace: true })
 
   await panel.press({ type: 'Link', text: 'Назад' })
   await openSettings(panel)
-  assert.equal(panel.valueOf(field), String(INTERVAL_MINUTES.max), 'на экране не сохранённый интервал')
+  assert.equal(panel.valueOf(field), '2880', 'на экране не сохранённый интервал')
   assert.equal(panel.find({ type: 'Text', text: invalid }), null, 'новый заход на экран — без прежней ошибки')
   assertClean(panel)
+})
+
+/**
+ * Plugin settings whose writes the test holds back: each lands (or is refused) only when the test says. `written(n)`
+ * resolves once n writes have reached the host (the screen sends the next write only after the one before has ended).
+ */
+function heldSettings(initial: Record<string, JsonValue>) {
+  const store: Record<string, JsonValue> = { ...initial }
+  const held: { key: string; value: JsonValue; land(): void; refuse(message: string): void }[] = []
+  let waiters: { count: number; resolve: () => void }[] = []
+  let released = false
+  releaseHeld = () => {
+    released = true
+    for (const write of held) write.land()
+  }
+  const results = {
+    'settings.get': () => ({ settings: { ...store } }),
+    'settings.set': ({ key, value }: { key: string; value: JsonValue }) =>
+      new Promise((resolve, reject) => {
+        const land = () => {
+          store[key] = value
+          resolve({ ok: true })
+        }
+        if (released) return land()
+        held.push({ key, value, land, refuse: (message) => reject(hostError('action_failed', message)) })
+        const ready = waiters.filter((waiter) => held.length >= waiter.count)
+        waiters = waiters.filter((waiter) => held.length < waiter.count)
+        for (const waiter of ready) waiter.resolve()
+      }),
+  }
+  const written = (count: number) =>
+    held.length >= count ? Promise.resolve() : new Promise<void>((resolve) => waiters.push({ count, resolve }))
+  return { store, held, results, written }
+}
+
+/**
+ * Runs `act` and resolves once the panel has drawn after it, without waiting for the writes it holds back; `.acting`
+ * ends with the act. (Wrapped: an async function's returned promise would be waited for.)
+ */
+async function drawnAfter(act: () => Promise<void>): Promise<{ acting: Promise<void> }> {
+  const drawn = nextDraw()
+  const acting = act()
+  await drawn
+  return { acting }
+}
+
+/** Ends a held write with `end` and resolves once the panel has drawn what followed. */
+async function redrawnAfter(end: () => void): Promise<void> {
+  const drawn = nextDraw()
+  end()
+  await drawn
+}
+
+test('Настройки: интервал — две цифры подряд, пока запись первой не закончилась → в поле набранное «15», сохраняется 15; отказ в записи первой цифры не откатывает вторую', async () => {
+  const field = { label: 'Интервал проверки очереди, минут' }
+  for (const firstRefused of [false, true]) {
+    const writes = heldSettings(RU)
+    const panel = await open(hostWith({ results: writes.results }))
+    await openSettings(panel)
+    assert.equal(panel.valueOf(field), '5')
+    await panel.type(field, '', { replace: true })
+
+    // «1» in place of «5»: its write is held back, and the field keeps «1».
+    const first = await drawnAfter(() => panel.type(field, '1'))
+    await writes.written(1)
+    assert.equal(panel.valueOf(field), '1', 'пока идёт запись, в поле вернулось прежнее значение')
+    // «5» after it — a separate input event while the write of «1» is on its way.
+    const second = await drawnAfter(() => panel.type(field, '5'))
+    assert.equal(panel.valueOf(field), '15')
+
+    // The write of «1» ends: the field still shows the person's latest text, and «15» goes to Orca.
+    await redrawnAfter(() => {
+      if (firstRefused) writes.held[0]?.refuse('хранилище плагина недоступно')
+      else writes.held[0]?.land()
+    })
+    await writes.written(2)
+    assert.equal(panel.valueOf(field), '15', 'конец записи «1» изменил поле, хотя «15» ещё в пути')
+    assert.deepEqual(
+      writes.held.map((write) => [write.key, write.value]),
+      [
+        [SETTING_KEYS.queueCheckInterval, 1],
+        [SETTING_KEYS.queueCheckInterval, 15],
+      ],
+    )
+    writes.held[1]?.land()
+    await first.acting
+    await second.acting
+    assert.equal(writes.store[SETTING_KEYS.queueCheckInterval], 15)
+    assert.equal(panel.valueOf(field), '15')
+    assert.deepEqual(callouts(panel), [{ tone: 'success', text: SAVED_RU }])
+    assertClean(panel)
+  }
+})
+
+test('Настройки: запись последней правки отказана, пока идёт запись → на экране снова сохранённое значение; до конца записи — то, что выбрал человек', async () => {
+  const writes = heldSettings(RU)
+  const panel = await open(hostWith({ results: writes.results }))
+  await openSettings(panel)
+  const toggling = await drawnAfter(() => panel.toggle({ label: 'Уведомления о мержах' }))
+  await writes.written(1)
+  assert.equal(panel.valueOf({ label: 'Уведомления о мержах' }), false, 'пока идёт запись, переключатель вернулся')
+  const typing = await drawnAfter(() => panel.type({ label: 'Интервал проверки очереди, минут' }, '0'))
+  assert.equal(panel.valueOf({ label: 'Интервал проверки очереди, минут' }), '50')
+
+  // The switch's write is refused: the switch shows the saved value again, the field keeps «50» on its way.
+  await redrawnAfter(() => writes.held[0]?.refuse('хранилище плагина недоступно'))
+  await writes.written(2)
+  assert.equal(panel.valueOf({ label: 'Уведомления о мержах' }), true)
+  assert.equal(panel.valueOf({ label: 'Интервал проверки очереди, минут' }), '50')
+  writes.held[1]?.refuse('хранилище плагина недоступно')
+  await toggling.acting
+  await typing.acting
+  assert.deepEqual(shown(panel, 'ru'), { language: 'ru', interval: '5', notifications: true, coordinator: true })
+  assert.deepEqual(callouts(panel), [{ tone: 'danger', text: 'Не удалось сохранить: хранилище плагина недоступно' }])
+  assert.deepEqual(writes.store, RU)
+  assertClean(panel)
+})
+
+test('Настройки: English → Русский при выключенных переключателях — строка русского кадра о них; English → «Saved.» во всех четырёх английских кадрах', async () => {
+  const cases: [boolean, boolean, string][] = [
+    [false, true, NOTIFICATIONS_OFF_RU], // nastroyki-english-uv → nastroyki-uvedomleniya-vykl
+    [true, false, COORDINATOR_OFF_RU], // nastroyki-english-ko → nastroyki-koordinator-vykl
+    [false, false, BOTH_OFF_RU], // nastroyki-english-oba → nastroyki-oba-vykl
+    [true, true, SAVED_RU], // nastroyki-english → nastroyki-sohraneno
+  ]
+  for (const [notifications, coordinator, line] of cases) {
+    const host = hostWith({
+      settings: {
+        [LANGUAGE_SETTING]: 'en',
+        [SETTING_KEYS.mergeNotifications]: notifications,
+        [SETTING_KEYS.coordinator]: coordinator,
+      },
+    })
+    const panel = await open(host)
+    await openSettings(panel, 'en')
+    await panel.select({ label: 'Interface language' }, 'ru')
+    assert.deepEqual(callouts(panel), [{ tone: 'success', text: line }], `${notifications}, ${coordinator}`)
+    assert.deepEqual(shown(panel, 'ru'), { language: 'ru', interval: '5', notifications, coordinator })
+    await panel.select({ label: 'Язык интерфейса' }, 'en')
+    assert.deepEqual(callouts(panel), [{ tone: 'success', text: 'Saved.' }], `${notifications}, ${coordinator}: English`)
+    assertClean(panel)
+  }
 })
 
 test('Настройки: настройки не заданы → English, интервал 5 минут, уведомления о мержах и координатор включены; манифест объявляет те же значения по умолчанию', async () => {
@@ -480,10 +672,10 @@ test('Настройки: настройки не заданы → English, ин
     [SETTING_KEYS.language, SETTING_KEYS.queueCheckInterval, SETTING_KEYS.mergeNotifications, SETTING_KEYS.coordinator],
   )
   assert.equal(byKey(SETTING_KEYS.language)?.default, DEFAULT_SETTINGS.language)
-  assert.deepEqual(
-    [byKey(SETTING_KEYS.queueCheckInterval)?.type, byKey(SETTING_KEYS.queueCheckInterval)?.minimum, byKey(SETTING_KEYS.queueCheckInterval)?.maximum],
-    ['integer', INTERVAL_MINUTES.min, INTERVAL_MINUTES.max],
-  )
+  // The manifest, the screen and reading the settings take the same intervals: whole minutes, at least 1, no maximum.
+  const declaredInterval = byKey(SETTING_KEYS.queueCheckInterval)
+  assert.deepEqual([declaredInterval?.type, declaredInterval?.minimum], ['integer', MIN_INTERVAL_MINUTES])
+  assert.equal(Object.hasOwn(declaredInterval ?? {}, 'maximum'), false, 'у интервала есть верхний предел')
   assert.equal(byKey(SETTING_KEYS.queueCheckInterval)?.default, DEFAULT_SETTINGS.queueCheckInterval)
   for (const name of ['mergeNotifications', 'coordinator'] as const) {
     assert.equal(byKey(SETTING_KEYS[name])?.type, 'boolean', name)
@@ -501,8 +693,11 @@ test('Настройки: настройки не заданы → English, ин
     }),
     DEFAULT_SETTINGS,
   )
-  for (const interval of [-5, 1.5, 1441, '10']) {
+  for (const interval of [-5, 0, 1.5, '10', Number.MAX_SAFE_INTEGER + 2, Number.POSITIVE_INFINITY]) {
     assert.equal(parseSettings({ [SETTING_KEYS.queueCheckInterval]: interval }).queueCheckInterval, 5, String(interval))
+  }
+  for (const interval of [1, 1441, 2880, 525600]) {
+    assert.equal(parseSettings({ [SETTING_KEYS.queueCheckInterval]: interval }).queueCheckInterval, interval)
   }
   const odd = await open(
     hostWith({

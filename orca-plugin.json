@@ -41,10 +41,9 @@
       {
         "key": "queueCheckInterval",
         "title": "Queue check interval, minutes",
-        "description": "How often the coordinator of this computer checks the queues of the connected projects: a whole number of minutes from 1 to 1440.",
+        "description": "How often the coordinator of this computer checks the queues of the connected projects: a whole number of minutes, at least 1.",
         "type": "integer",
         "minimum": 1,
-        "maximum": 1440,
         "default": 5
       },
       {
