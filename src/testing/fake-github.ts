@@ -29,8 +29,6 @@ export type FakeIssue = {
   closed_at: string | null
   // Who edited the body, in order (the last one is GitHub's `editor`); `null` — an account that no longer exists.
   edits: (string | null)[]
-  // Edits GitHub has but does not give in one read (a history longer than the read).
-  unreadEdits: number
   // Who renamed the title, in order.
   renames: string[]
 }
@@ -43,7 +41,6 @@ export type FakeComment = {
   created_at: string
   updated_at: string
   edits: (string | null)[]
-  unreadEdits: number
 }
 
 export type FakeLabel = { name: string; color: string; description: string }
@@ -94,6 +91,8 @@ export type FakeGitHubOptions = {
   // The GitHub user gh runs as; null — gh is not logged in.
   readonly login: string | null
   readonly pageSize?: number
+  // How many entries of an edit or rename history come with a list (GitHub: 100); the rest is read page by page.
+  readonly historyPage?: number
   readonly env?: Record<string, string>
 }
 
@@ -102,12 +101,14 @@ export class FakeGitHub {
   readonly host: string
   login: string | null
   readonly pageSize: number
+  readonly historyPage: number
   readonly issues: FakeIssue[] = []
   readonly comments: FakeComment[] = []
   readonly labels: FakeLabel[] = []
   readonly pulls: FakePull[] = []
   readonly machine: FakeMachine
   private readonly failures: Failure[] = []
+  private readonly hooks: { readonly match: (call: FakeGhCall) => boolean; readonly run: () => void; times: number }[] = []
   private clock = Date.UTC(2026, 0, 15, 9, 0, 0)
   private nextComment = 9_000_001
 
@@ -116,6 +117,7 @@ export class FakeGitHub {
     this.host = options.host ?? 'github.com'
     this.login = options.login
     this.pageSize = options.pageSize ?? 2
+    this.historyPage = options.historyPage ?? 100
     this.machine = fakeMachine({
       platform: 'linux',
       env: { PATH: '/usr/bin', ...(options.env ?? {}) },
@@ -134,6 +136,11 @@ export class FakeGitHub {
     this.failures.push({ match, answer, apply: options.apply ?? false, times: options.times ?? 1 })
   }
 
+  // Before the next `times` calls that `match` are handled, `run` changes GitHub (someone else acts meanwhile).
+  before(match: (call: FakeGhCall) => boolean, run: () => void, times = 1): void {
+    this.hooks.push({ match, run, times })
+  }
+
   addIssue(issue: Partial<FakeIssue> & { number: number; user: string }): FakeIssue {
     const time = this.tick()
     const full: FakeIssue = {
@@ -146,7 +153,6 @@ export class FakeGitHub {
       updated_at: time,
       closed_at: null,
       edits: [],
-      unreadEdits: 0,
       renames: [],
       ...issue,
     }
@@ -164,7 +170,6 @@ export class FakeGitHub {
       created_at: time,
       updated_at: time,
       edits: [],
-      unreadEdits: 0,
       ...more,
     }
     this.comments.push(comment)
@@ -198,6 +203,12 @@ export class FakeGitHub {
   answer(request: StartRequest): FakeAnswer {
     if (request.file !== FAKE_GH) return { code: 127, stderr: `fake: not gh: ${request.file}` }
     const call = readCall(request)
+    for (const hook of this.hooks) {
+      if (hook.times > 0 && hook.match(call)) {
+        hook.times--
+        hook.run()
+      }
+    }
     const failure = this.failures.find((one) => one.times > 0 && one.match(call))
     if (failure) {
       failure.times--
@@ -339,7 +350,7 @@ export class FakeGitHub {
         .filter((issue) => labels === null || labels.some((label) => issue.labels.includes(label)))
         .sort((a, b) => a.number - b.number)
         .map((issue) => this.issueNode(issue))
-      return this.graphPages(nodes, paginate, (connection) => ({ viewer, repository: { issues: connection } }))
+      return this.graphPages(nodes, paginate, this.pageSize, (connection) => ({ viewer, repository: { issues: connection } }))
     }
     if (call.operation === 'AqIssue') {
       const issue = this.issues.find((one) => one.number === number)
@@ -356,11 +367,43 @@ export class FakeGitHub {
       return ok({ data: { viewer, repository: { issueOrPullRequest: node } } })
     }
     if (call.operation === 'AqComments') {
-      if (!this.issues.some((one) => one.number === number)) {
-        return { code: 1, stderr: `GraphQL: Could not resolve to an Issue with the number of ${number}. (repository.issue)` }
+      const kind = this.issues.some((one) => one.number === number)
+        ? 'Issue'
+        : this.pulls.some((one) => one.number === number)
+          ? 'PullRequest'
+          : null
+      if (kind === null) {
+        return {
+          code: 1,
+          stderr: `GraphQL: Could not resolve to an issue or pull request with the number of ${number}. (repository.issueOrPullRequest)`,
+        }
       }
       const nodes = this.comments.filter((one) => one.issue === number).map((one) => this.commentNode(one))
-      return this.graphPages(nodes, paginate, (connection) => ({ viewer, repository: { issue: { comments: connection } } }))
+      return this.graphPages(nodes, paginate, this.pageSize, (connection) => ({
+        viewer,
+        repository: { issueOrPullRequest: { __typename: kind, comments: connection } },
+      }))
+    }
+    if (call.operation === 'AqEdits' || call.operation === 'AqRenames') {
+      const id = String(variables.id)
+      const issue = this.issues.find((one) => `I_${one.number}` === id)
+      const comment = this.comments.find((one) => `IC_${one.id}` === id)
+      if (!issue && !comment) return { code: 1, stderr: `GraphQL: Could not resolve to a node with the global id of '${id}'` }
+      const repository = { nameWithOwner: this.repository }
+      if (call.operation === 'AqRenames') {
+        const renames = (issue?.renames ?? []).map((login) => ({ actor: { login } }))
+        return this.graphPages(renames, paginate, this.historyPage, (connection) => ({
+          viewer,
+          repository,
+          node: { __typename: 'Issue', repository, timelineItems: connection },
+        }))
+      }
+      const history = issue ? historyOf(issue.user, issue.edits) : historyOf(comment!.user, comment!.edits)
+      return this.graphPages(history, paginate, this.historyPage, (connection) => ({
+        viewer,
+        repository,
+        node: { __typename: issue ? 'Issue' : 'IssueComment', repository, userContentEdits: connection },
+      }))
     }
     return { code: 1, stderr: `fake gh: unknown GraphQL operation ${String(call.operation)}` }
   }
@@ -369,14 +412,15 @@ export class FakeGitHub {
   private graphPages(
     nodes: readonly unknown[],
     paginate: boolean,
+    size: number,
     wrap: (connection: Record<string, unknown>) => Record<string, unknown>,
   ): FakeAnswer {
     const pages: string[] = []
-    for (let at = 0; at < nodes.length || at === 0; at += this.pageSize) {
-      const hasNextPage = at + this.pageSize < nodes.length
+    for (let at = 0; at < nodes.length || at === 0; at += size) {
+      const hasNextPage = at + size < nodes.length
       const connection = {
-        pageInfo: { hasNextPage, endCursor: hasNextPage ? `cursor-${at + this.pageSize}` : null },
-        nodes: nodes.slice(at, at + this.pageSize),
+        pageInfo: { hasNextPage, endCursor: hasNextPage ? `cursor-${at + size}` : null },
+        nodes: nodes.slice(at, at + size),
       }
       pages.push(JSON.stringify({ data: wrap(connection) }))
       if (!paginate) break
@@ -492,9 +536,13 @@ export class FakeGitHub {
       updatedAt: issue.updated_at,
       closedAt: issue.closed_at,
       url: `https://${this.host}/${this.repository}/issues/${issue.number}`,
-      ...edited(issue.user, issue.edits, issue.unreadEdits, issue.updated_at),
+      id: `I_${issue.number}`,
+      ...edited(issue.user, issue.edits, this.historyPage, issue.updated_at),
       labels: { totalCount: issue.labels.length, nodes: issue.labels.map((name) => ({ name })) },
-      timelineItems: { totalCount: issue.renames.length, nodes: issue.renames.map((login) => ({ actor: { login } })) },
+      timelineItems: {
+        totalCount: issue.renames.length,
+        nodes: issue.renames.slice(0, this.historyPage).map((login) => ({ actor: { login } })),
+      },
     }
   }
 
@@ -516,7 +564,8 @@ export class FakeGitHub {
       createdAt: comment.created_at,
       updatedAt: comment.updated_at,
       url: `https://${this.host}/${this.repository}/issues/${comment.issue}#issuecomment-${comment.id}`,
-      ...edited(comment.user, comment.edits, comment.unreadEdits, comment.updated_at),
+      id: `IC_${comment.id}`,
+      ...edited(comment.user, comment.edits, this.historyPage, comment.updated_at),
     }
   }
 
@@ -537,21 +586,23 @@ export class FakeGitHub {
   }
 }
 
-// GitHub's fields about a text's author and edits: `editor` and `lastEditedAt` of the last edit, and the edit history
-// (when edited: the creation by the author, then each edit), with `totalCount` above what is given when some are not.
-function edited(author: string, edits: readonly (string | null)[], unread: number, at: string): Record<string, unknown> {
-  const actor = (login: string | null) => (login === null ? null : { login })
+// GitHub's fields about a text's author and edits: `editor` and `lastEditedAt` of the last edit, and the first `page`
+// entries of the edit history with its `totalCount`.
+function edited(author: string, edits: readonly (string | null)[], page: number, at: string): Record<string, unknown> {
   const last = edits.length > 0 ? edits[edits.length - 1] : undefined
-  const history = edits.length > 0 ? [author, ...edits] : []
+  const history = historyOf(author, edits)
   return {
     author: { login: author },
-    editor: last === undefined ? null : actor(last),
+    editor: last === undefined ? null : last === null ? null : { login: last },
     lastEditedAt: last === undefined ? null : at,
-    userContentEdits: {
-      totalCount: history.length + unread,
-      nodes: history.map((login) => ({ editor: actor(login), deletedBy: null })),
-    },
+    userContentEdits: { totalCount: history.length, nodes: history.slice(0, page) },
   }
+}
+
+// The edit history of a text: when it was edited, the creation by its author, then each edit.
+function historyOf(author: string, edits: readonly (string | null)[]): Record<string, unknown>[] {
+  const history = edits.length > 0 ? [author, ...edits] : []
+  return history.map((login) => ({ editor: login === null ? null : { login }, deletedBy: null }))
 }
 
 // What gh would make of its arguments: the host (--hostname, else GH_HOST, else github.com; `--repo HOST/…` for gh pr),

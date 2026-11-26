@@ -99,6 +99,8 @@ test('телефон в части пути файла и номера подр�
   assert.equal(checkText([field.path('calls/2025550117.txt', 'head')], context).text, HIDDEN)
   assert.equal(checkText([field.path('calls\\2025550118.txt', 'head')], context).text, HIDDEN)
   assert.equal(checkText([field.path('logs/call_2025550119_v2.txt', 'head')], context).text, HIDDEN)
+  // After a word and a hyphen, in a path or a branch name.
+  assert.equal(compileMask([]).apply('calls/tel-2025550117.txt и support/tel-+7 701 555 01 23').text, `calls/tel-${HIDDEN}.txt и support/tel-${HIDDEN}`)
   assert.equal(checkText([field.path('src/cart.ts', 'head')], context).text, 'src/cart.ts')
   // Two numbers in a row (or a card-like run of groups): nothing of them stays.
   const mask = compileMask([])
@@ -108,6 +110,15 @@ test('телефон в части пути файла и номера подр�
   // Not phone numbers: a date before a number, a long number without groups, a run id in a link.
   assert.equal(mask.apply('звонок 2026-11-26 701 555 0123 утром').text, `звонок 2026-11-26 ${HIDDEN} утром`)
   assert.equal(mask.apply('время 1764145901123456789 нс').text, 'время 1764145901123456789 нс')
+  // Not phone numbers either: the groups of a hyphenated id, GitHub's anchors in links.
+  for (const plain of [
+    'id 123e4567-e89b-42d3-a456-426614174000',
+    'https://github.com/acme/demo-shop/issues/7#issuecomment-2025550117',
+    'https://github.com/acme/demo-shop/pull/8#pullrequestreview-2025550117',
+    'https://github.com/acme/demo-shop/issues/7#event-2025550117',
+  ]) {
+    assert.equal(mask.apply(plain).text, plain, plain)
+  }
 })
 
 test('шаблон с пустым совпадением на тексте с эмодзи и суррогатными парами не зацикливает маску', () => {

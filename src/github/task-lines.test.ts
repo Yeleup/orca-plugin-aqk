@@ -84,6 +84,13 @@ test('строка сразу после цитаты без пустой стр
   assert.deepEqual(parseTaskLines('> Пример:\n## Зависимости\nЗависит от #7').dependsOn, [7])
   const fenced = parseTaskLines('> Пример:\n```\nЗависит от #8\n```\nЗависит от #9')
   assert.deepEqual(fenced.dependsOn, [9])
+  // A list item inside a quote: a line right after its paragraph goes on it, inside the quote.
+  assert.deepEqual(parseTaskLines('> - Пример\nЗависит от #5').dependsOn, [])
+  assert.deepEqual(parseTaskLines('> 1. Пример\nЗависит от #5').dependsOn, [])
+  assert.deepEqual(parseTaskLines('> - - Пример\nЗависит от #5').dependsOn, [])
+  assert.deepEqual(parseTaskLines('> - Пример\n\nЗависит от #5').dependsOn, [5])
+  // An empty list item or a quoted fence has no paragraph to go on.
+  assert.deepEqual(parseTaskLines('> -\nЗависит от #6').dependsOn, [6])
   // Nested quotes the same.
   assert.deepEqual(parseTaskLines('>> Вложенная цитата\nЧасть #4\n\nЧасть #3'), { dependsOn: [], mvp: null, partOf: 3, problems: [] })
 })

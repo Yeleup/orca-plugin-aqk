@@ -6,7 +6,7 @@ import { FAKE_GH, FakeGitHub, type FakeGhCall, type FakeGitHubOptions } from '..
 import { fakeMachine } from '../testing/fake-machine'
 import { field, type ProjectGitHubSettings } from './check'
 import { GitHubError, parseRepository } from './gh'
-import { GitHub, Q_COMMENTS, Q_ISSUE, Q_ISSUES, Q_VIEWER } from './github'
+import { GitHub, Q_COMMENTS, Q_EDITS, Q_ISSUE, Q_ISSUES, Q_RENAMES, Q_VIEWER } from './github'
 import { PLUGIN_LABELS } from './labels'
 import { markLine, parseBody, type Finding, type Mark } from './mark'
 import { CheckError } from './mask'
@@ -109,7 +109,7 @@ test('поддельный gh отдаёт issues и комментарии дв
   assert.ok(fake.machine.starts.every((start) => start.file === FAKE_GH))
 })
 
-test('текст владельца, который изменил другой пользователь (тело, комментарий, заголовок), правщик которого неизвестен или история правок не целиком, не считается текстом владельца', async () => {
+test('текст владельца, который изменил другой пользователь (тело, комментарий, заголовок) или правщик, которого GitHub уже не знает, не считается текстом владельца', async () => {
   const { fake, github } = setup()
   const queue = { labels: ['agent-queue'] }
   fake.addIssue({ number: 1, user: OWNER, body: 'Без правок', ...queue })
@@ -118,13 +118,12 @@ test('текст владельца, который изменил другой 
   // The last edit is the owner's, but someone else's edit is in the history.
   fake.addIssue({ number: 4, user: OWNER, body: 'Другой, потом владелец', edits: [GUEST, OWNER], ...queue })
   fake.addIssue({ number: 5, user: OWNER, title: 'Заголовок сменил другой', ...queue, renames: [GUEST] })
-  // An editor whose account was deleted; a history longer than one read gives.
+  // An editor whose account was deleted.
   fake.addIssue({ number: 6, user: OWNER, body: 'Правщик удалён', edits: [null], ...queue })
-  fake.addIssue({ number: 7, user: OWNER, body: 'История не целиком', edits: [OWNER], unreadEdits: 1, ...queue })
   fake.addIssue({ number: 8, user: OWNER, title: 'Переименовал сам владелец', ...queue, renames: [OWNER] })
 
   assert.deepEqual((await github.listIssues(queue)).map((issue) => issue.number), [1, 2, 8])
-  for (const number of [3, 4, 5, 6, 7]) {
+  for (const number of [3, 4, 5, 6]) {
     assert.deepEqual(await github.getIssue(number), { found: 'other', number, state: 'open', reason: 'edited' })
   }
 
@@ -133,11 +132,66 @@ test('текст владельца, который изменил другой 
   fake.addComment(1, OWNER, '<!-- agent-queue:mark подменил другой -->', { edits: [GUEST] })
   fake.addComment(1, OWNER, 'Другой, потом владелец', { edits: [GUEST, OWNER] })
   fake.addComment(1, OWNER, 'Правщик удалён', { edits: [null] })
-  fake.addComment(1, OWNER, 'История не целиком', { edits: [OWNER], unreadEdits: 3 })
   assert.deepEqual(
     (await github.listComments(1)).map((comment) => comment.body),
     ['Комментарий без правок', 'Комментарий, правленный владельцем'],
   )
+})
+
+test('длинная история правок и переименований (больше, чем приходит со списком) дочитывается целиком: только правки владельца — его текст, чужая правка дальше первой страницы — не его, сбой дочитывания — ошибка', async () => {
+  // GitHub gives 2 entries of a history with the list here (100 in life); the rest is read page by page.
+  const { fake, github } = setup({ historyPage: 2 })
+  const queue = { labels: ['agent-queue'] }
+  fake.addIssue({ number: 1, user: OWNER, body: 'Много правок владельца', edits: [OWNER, OWNER, OWNER, OWNER, OWNER], ...queue })
+  fake.addIssue({ number: 2, user: OWNER, body: 'Чужая правка в конце истории', edits: [OWNER, OWNER, OWNER, GUEST, OWNER], ...queue })
+  fake.addIssue({ number: 3, user: OWNER, title: 'Много переименований владельца', renames: [OWNER, OWNER, OWNER, OWNER], ...queue })
+  fake.addIssue({ number: 4, user: OWNER, title: 'Чужое переименование в конце', renames: [OWNER, OWNER, OWNER, GUEST], ...queue })
+  fake.addIssue({ number: 5, user: OWNER, body: 'Удалённый правщик в конце', edits: [OWNER, OWNER, null, OWNER], ...queue })
+  assert.deepEqual((await github.listIssues(queue)).map((issue) => issue.number), [1, 3])
+  // Each history was read on by its own query, naming the repository and the text; whole, in pages.
+  const readOn = fake.calls.filter((call) => call.operation === 'AqEdits' || call.operation === 'AqRenames')
+  assert.deepEqual(
+    readOn.map((call) => [call.operation, call.variables.id]),
+    [
+      ['AqEdits', 'I_1'],
+      ['AqEdits', 'I_2'],
+      ['AqRenames', 'I_3'],
+      ['AqRenames', 'I_4'],
+      ['AqEdits', 'I_5'],
+    ],
+  )
+  assert.deepEqual(readOn[0]?.args, graphql(Q_EDITS, true, '-f', 'id=I_1'))
+  assert.deepEqual(readOn[2]?.args, graphql(Q_RENAMES, true, '-f', 'id=I_3'))
+  assert.deepEqual(await github.getIssue(2), { found: 'other', number: 2, state: 'open', reason: 'edited' })
+  // Comments the same.
+  fake.addComment(1, OWNER, 'Комментарий, правленный владельцем много раз', { edits: [OWNER, OWNER, OWNER, OWNER] })
+  fake.addComment(1, OWNER, 'Чужая правка в конце', { edits: [OWNER, OWNER, GUEST] })
+  assert.deepEqual((await github.listComments(1)).map((comment) => comment.body), ['Комментарий, правленный владельцем много раз'])
+
+  // A history that cannot be read on is an error, never a drop of the owner's task.
+  const isEdits = (call: FakeGhCall) => call.operation === 'AqEdits'
+  fake.fail(isEdits, { code: 1, stderr: 'HTTP 502: Bad Gateway' })
+  await assert.rejects(github.listIssues(queue), isGitHubError('gh_failed', /HTTP 502/))
+  // Its pages that do not follow each other, a text of another repository, another user of gh: errors too.
+  const historyPage = (login: string, repository: string, next: boolean, nodes: unknown[]) =>
+    JSON.stringify({
+      data: {
+        viewer: { login },
+        repository: { nameWithOwner: REPO },
+        node: {
+          __typename: 'Issue',
+          repository: { nameWithOwner: repository },
+          userContentEdits: { pageInfo: { hasNextPage: next, endCursor: next ? 'c' : null }, nodes },
+        },
+      },
+    })
+  const own = { editor: { login: OWNER }, deletedBy: null }
+  fake.fail(isEdits, { code: 0, stdout: historyPage(OWNER, REPO, true, [own]) })
+  await assert.rejects(github.listIssues(queue), isGitHubError('bad_answer', /not whole/))
+  fake.fail(isEdits, { code: 0, stdout: historyPage(OWNER, 'someone-else/other-repo', false, [own]) })
+  await assert.rejects(github.listIssues(queue), isGitHubError('bad_answer', /is not one of github\.com\/acme\/demo-shop/))
+  fake.fail(isEdits, { code: 0, stdout: historyPage('drew-second', REPO, false, [own]) })
+  await assert.rejects(github.listIssues(queue), isGitHubError('owner_unknown', /changed while the texts were read/))
 })
 
 test('пользователь gh неизвестен → ошибка с текстом gh, а не тексты всех пользователей', async () => {
@@ -202,10 +256,15 @@ test('gh падает → ошибка с текстом gh, а не пусто�
   await assert.rejects(github.listLabels(), isGitHubError('gh_failed', /error connecting to api\.github\.com/))
   fake.fail((call) => call.path.endsWith('/pulls'), { code: 1, stderr: 'gh: Not Found (HTTP 404)' })
   await assert.rejects(github.listPullRequests(), isGitHubError('gh_failed', /Not Found \(HTTP 404\)/))
-  await assert.rejects(github.listComments(99), isGitHubError('gh_failed', /Could not resolve to an Issue/))
+  await assert.rejects(github.listComments(99), isGitHubError('gh_failed', /Could not resolve to an issue or pull request/))
   // An answer that is not JSON, GraphQL errors in an answer, a run that took too long.
   fake.fail((call) => call.operation === 'AqIssue', { code: 0, stdout: '<html>rate limited</html>' })
-  await assert.rejects(github.getIssue(1), isGitHubError('bad_answer', /not JSON.*rate limited/))
+  await assert.rejects(github.getIssue(1), (error) => {
+    isGitHubError('bad_answer', /not JSON \(\d+ characters\)/)(error)
+    // gh's stdout is not quoted in the error.
+    assert.ok(!JSON.stringify({ ...(error as object), message: (error as Error).message }).includes('rate limited'))
+    return true
+  })
   fake.fail((call) => call.operation === 'AqIssue', { code: 0, stdout: '{"data":null,"errors":[{"message":"Something went wrong"}]}' })
   await assert.rejects(github.getIssue(1), isGitHubError('bad_answer', /Something went wrong/))
   fake.fail((call) => call.path.endsWith('/labels'), { code: null, timedOut: true, stderr: '' })
@@ -690,4 +749,167 @@ test('адрес репозитория: owner/name — на github.com, host/ow
   for (const wrong of ['demo-shop', 'https://github.com/acme/demo-shop', 'acme/demo shop', 'a/b/c/d', '-x/demo', 'acme/..', 'bad host/acme/x']) {
     assert.throws(() => parseRepository(wrong), /not a GitHub repository/)
   }
+})
+
+test('gh упал после целой первой страницы с чужим текстом → в ошибке нет ни строки этой страницы', async () => {
+  const { fake, github } = setup()
+  const secret = 'Чужой текст: позвонить в пятницу'
+  const guest = fake.addIssue({ number: 1, user: GUEST, body: secret, labels: ['agent-queue'] })
+  const own = fake.addIssue({ number: 2, user: OWNER, body: 'Текст владельца', labels: ['agent-queue'] })
+  const page = issuesPage(OWNER, [fake.issueNode(guest), fake.issueNode(own)], true)
+  const leaks = (error: unknown) => {
+    assert.ok(error instanceof GitHubError, String(error))
+    const all = JSON.stringify({ ...error, message: error.message, stack: error.stack })
+    assert.ok(!all.includes(secret) && !all.includes('Текст владельца'), all)
+    return true
+  }
+  // Without stderr, with stderr, cut in memory, a page that is not whole.
+  for (const answer of [
+    { code: 1, stdout: page, stderr: '' },
+    { code: 1, stdout: page, stderr: 'HTTP 502: Bad Gateway (page 2)' },
+    { code: 0, stdout: page, truncated: true },
+    { code: 0, stdout: `${page}{"data":{"viewer":{"login":"avery-dev"},"body":"${secret}` },
+    { code: 0, stdout: `${page.slice(0, -2)}x}}` },
+  ]) {
+    fake.fail((call) => call.operation === 'AqIssues', answer)
+    await assert.rejects(github.listIssues(), leaks)
+  }
+  // GitHub's refusal of a REST call is still read: its message and codes, nothing else.
+  fake.fail((call) => call.method === 'DELETE', {
+    code: 1,
+    stdout: JSON.stringify({ message: 'Label does not exist', documentation_url: 'https://docs.github.com/rest' }),
+    stderr: 'gh: Label does not exist (HTTP 404)',
+  })
+  await github.removeLabel(2, 'agent-queue:working')
+  assert.equal(fake.calls.at(-1)?.method, 'DELETE')
+})
+
+test('список GraphQL, где последняя страница говорит «дальше есть» или страницы не идут одна за другой, — ошибка, а не короткий список', async () => {
+  const { fake, github } = setup()
+  const first = fake.addIssue({ number: 1, user: OWNER, labels: ['agent-queue'] })
+  const second = fake.addIssue({ number: 2, user: OWNER, labels: ['agent-queue'] })
+  const isList = (call: FakeGhCall) => call.operation === 'AqIssues'
+  // gh exits 0 after a page whose cursor it could not follow.
+  fake.fail(isList, { code: 0, stdout: issuesPage(OWNER, [fake.issueNode(first)], true) })
+  await assert.rejects(github.listIssues(), isGitHubError('bad_answer', /last page says more pages follow/))
+  // A page in the middle that says it is the last, or has no cursor.
+  fake.fail(isList, {
+    code: 0,
+    stdout: issuesPage(OWNER, [fake.issueNode(first)], false) + issuesPage(OWNER, [fake.issueNode(second)], false),
+  })
+  await assert.rejects(github.listIssues(), isGitHubError('bad_answer', /pages do not follow each other/))
+  const noCursor = JSON.stringify({
+    data: { viewer: { login: OWNER }, repository: { issues: { pageInfo: { hasNextPage: true, endCursor: null }, nodes: [] } } },
+  })
+  fake.fail(isList, { code: 0, stdout: noCursor + issuesPage(OWNER, [fake.issueNode(second)], false) })
+  await assert.rejects(github.listIssues(), isGitHubError('bad_answer', /pages do not follow each other/))
+  // Comments the same: a list cut short is no answer for commentOnce either.
+  fake.addComment(1, OWNER, 'Первый комментарий')
+  fake.fail((call) => call.operation === 'AqComments', {
+    code: 0,
+    stdout: JSON.stringify({
+      data: {
+        viewer: { login: OWNER },
+        repository: { issueOrPullRequest: { __typename: 'Issue', comments: { pageInfo: { hasNextPage: true, endCursor: 'c' }, nodes: [] } } },
+      },
+    }),
+  })
+  const operation: Mark = { kind: 'operation-start', coordinator: COORDINATOR, operation: '9b8c7d6e-1a2b-4c3d-9e8f-7a6b5c4d3e2f' }
+  await assert.rejects(github.commentOnce(1, { mark: operation, text: ['Начало'] }), isGitHubError('bad_answer', /not whole/))
+  assert.equal(fake.calls.filter(isWrite).length, 0)
+  // Whole pages: the whole list.
+  assert.deepEqual((await github.listIssues()).map((issue) => issue.number), [1, 2])
+})
+
+test('изменение задачи отдаёт её состояние, а не тексты: правка другого пользователя между проверкой и записью не возвращается', async () => {
+  const { fake, github } = setup()
+  const issue = fake.addIssue({ number: 4, user: OWNER, title: 'Своя', body: 'Своя задача', labels: ['agent-queue'] })
+  // Someone with write access edits the body after the plugin checked the issue, before its PATCH is answered.
+  fake.before(
+    (call) => call.method === 'PATCH',
+    () => {
+      issue.body = 'Подменил другой пользователь'
+      issue.edits.push(GUEST)
+    },
+  )
+  const changed = await github.updateIssue(4, { state: 'closed', stateReason: 'completed' })
+  assert.deepEqual(Object.keys(changed.result).sort(), ['closedAt', 'labels', 'number', 'state', 'stateReason', 'updatedAt', 'url'])
+  assert.equal(changed.result.state, 'closed')
+  assert.ok(!JSON.stringify(changed).includes('Подменил'))
+  // And from now on it is not the owner's.
+  assert.deepEqual(await github.getIssue(4), { found: 'other', number: 4, state: 'closed', reason: 'edited' })
+})
+
+test('повтор операции после потерянного ответа, а её комментарий тем временем правил другой пользователь → «состояние не подтвердить», второго комментария нет', async () => {
+  const { fake, github } = setup()
+  fake.addIssue({ number: 7, user: OWNER, labels: ['agent-queue:blocked'] })
+  const operation = '9b8c7d6e-1a2b-4c3d-9e8f-7a6b5c4d3e2f'
+  const answer: Mark = { kind: 'operation-start', coordinator: COORDINATOR, claim: 1, operation }
+  const isPost = (call: FakeGhCall) => call.method === 'POST' && call.path.endsWith('/issues/7/comments')
+  fake.fail(isPost, { code: 1, stderr: 'net/http: request canceled' }, { apply: true })
+  await assert.rejects(github.commentOnce(7, { mark: answer, text: ['Ответ владельца: да'] }), /request canceled/)
+  // Someone else edits the visible text and keeps the mark line.
+  const written = fake.comments.at(-1)!
+  written.body = written.body.replace('Ответ владельца: да', 'Ответ владельца: нет')
+  written.edits.push(GUEST)
+  await assert.rejects(github.commentOnce(7, { mark: answer, text: ['Ответ владельца: да'] }), (error) => {
+    isGitHubError('unconfirmed', /cannot be confirmed/)(error)
+    assert.ok(!(error as Error).message.includes('Ответ владельца'))
+    return true
+  })
+  // Or strips the mark line altogether: still not confirmed.
+  written.body = 'Ответ владельца: нет'
+  await assert.rejects(github.commentOnce(7, { mark: answer, text: ['Ответ владельца: да'] }), isGitHubError('unconfirmed', /cannot be confirmed/))
+  assert.equal(fake.calls.filter(isPost).length, 1)
+  assert.equal(fake.comments.length, 1)
+  // A changed comment with the mark of another operation does not stand in the way of this one.
+  written.body = `${markLine({ ...answer, operation: '0a1b2c3d-4e5f-4a6b-8c7d-8e9f0a1b2c3d' })}\nДругая операция`
+  const next = await github.commentOnce(7, { mark: answer, text: ['Ответ владельца: да'] })
+  assert.equal(next.existed, false)
+  assert.equal(fake.calls.filter(isPost).length, 2)
+})
+
+test('комментарии PR читаются как комментарии задачи: только владельца, и повтор операции на PR после потерянного ответа второго не пишет', async () => {
+  const { fake, github } = setup()
+  fake.addPull({ number: 8, head: 'agent-queue/issue-7', base: 'master', user: OWNER })
+  fake.addComment(8, OWNER, 'Комментарий владельца в PR')
+  fake.addComment(8, GUEST, 'Чужой комментарий в PR')
+  assert.deepEqual((await github.listComments(8)).map((comment) => comment.body), ['Комментарий владельца в PR'])
+  assert.deepEqual(fake.calls.at(-1)?.args, graphql(Q_COMMENTS, true, '-F', 'number=8'))
+  const mark: Mark = { kind: 'operation-start', coordinator: COORDINATOR, operation: '9b8c7d6e-1a2b-4c3d-9e8f-7a6b5c4d3e2f' }
+  const isPost = (call: FakeGhCall) => call.method === 'POST' && call.path.endsWith('/issues/8/comments')
+  fake.fail(isPost, { code: 1, stderr: 'net/http: request canceled' }, { apply: true })
+  await assert.rejects(github.commentOnce(8, { mark, text: ['Попытка мержа'] }), /request canceled/)
+  const repeat = await github.commentOnce(8, { mark, text: ['Попытка мержа'] })
+  assert.equal(repeat.existed, true)
+  assert.equal(fake.calls.filter(isPost).length, 1)
+  assert.deepEqual((await github.listComments(8)).map((comment) => parseBody(comment.body).mark?.operation ?? null), [null, mark.operation])
+})
+
+test('телефон после дефиса в части пути или имени ветки скрыт: путь в отправленном тексте — «[скрыто]», база PR с ним — отказ до записи', async () => {
+  const { fake, github } = setup()
+  fake.addIssue({ number: 7, user: OWNER })
+  fake.addPull({ number: 8, head: 'agent-queue/issue-7', base: 'master', user: OWNER })
+  const diff = { base: [], head: ['calls/tel-2025550117.txt', 'src/cart.ts'] }
+  await github.comment(7, {
+    text: ['Файлы: ', field.path('calls/tel-2025550117.txt', 'head'), ', ', field.path('src/cart.ts', 'head')],
+    diff,
+  })
+  assert.deepEqual(fake.calls.at(-1)?.input, { body: 'Файлы: [скрыто], src/cart.ts' })
+  const pr = { title: ['PR'], text: ['Closes ', field.issue(7)], draft: true }
+  await assert.rejects(github.createPullRequest({ issue: 7, base: 'support/tel-2025550117', ...pr }), isRefusal('masked_value'))
+  await assert.rejects(github.updatePullRequest(8, { base: 'calls-2025550117' }), isRefusal('masked_value'))
+  assert.equal(fake.calls.filter(isWrite).length, 1)
+})
+
+test('шаблон для целого пути скрывает путь и тогда, когда путь стоит внутри текста', async () => {
+  const { fake, github } = setup({}, { language: 'ru', forbiddenPatterns: ['^src/private\\.ts$'] })
+  fake.addIssue({ number: 7, user: OWNER })
+  const diff = { base: [], head: ['src/private.ts', 'src/cart.ts'] }
+  const written = await github.comment(7, {
+    text: ['Файл ', field.path('src/private.ts', 'head'), ':', field.line(4), ', файл ', field.path('src/cart.ts', 'head'), ':', field.line(9)],
+    diff,
+  })
+  assert.deepEqual(fake.calls.at(-1)?.input, { body: 'Файл [скрыто]:4, файл src/cart.ts:9' })
+  assert.deepEqual(written.rules, ['pattern:1'])
 })

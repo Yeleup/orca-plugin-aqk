@@ -77,6 +77,20 @@ const QUOTE = /^ {0,3}>/
 // break, a list item that may interrupt a paragraph, an HTML block.
 const BLOCK_START = /^ {0,3}(?:`{3,}|~{3,}|#{1,6}(?:\s|$)|(?:[-*_] *){3,}$|[-+*]\s|1[.)]\s|<)/
 
+const LIST_ITEM = /^ {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$)/
+// A block inside a quote that is not a paragraph: a fence, an ATX heading, a thematic break, an HTML block.
+const NOT_PARAGRAPH = /^ {0,3}(?:`{3,}|~{3,}|#{1,6}(?:\s|$)|(?:[-*_] *){3,}$|<)/
+
+// Whether the content of a quoted line (after its `>`) is a paragraph — also the paragraph of a list item in the quote
+// (`> - text`) — which a next line without `>` may go on.
+function quotedParagraph(content: string): boolean {
+  let rest = content
+  for (let item = LIST_ITEM.exec(rest); item !== null && item[0] !== ''; item = LIST_ITEM.exec(rest)) {
+    rest = rest.slice(item[0].length)
+  }
+  return rest.trim() !== '' && !NOT_PARAGRAPH.test(rest)
+}
+
 // The lines of the text as GitHub shows them as text: trimmed, with their number (from 1); without fenced code blocks,
 // quotes and HTML comments.
 function visibleLines(body: string): { line: string; number: number }[] {
@@ -100,8 +114,7 @@ function visibleLines(body: string): { line: string; number: number }[] {
       return
     }
     if (QUOTE.test(raw)) {
-      const content = raw.replace(/^(?: {0,3}> ?)+/, '')
-      quoted = content.trim() !== '' && !BLOCK_START.test(content)
+      quoted = quotedParagraph(raw.replace(/^(?: {0,3}> ?)+/, ''))
       return
     }
     if (line === '') {

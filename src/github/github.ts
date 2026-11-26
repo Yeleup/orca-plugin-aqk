@@ -5,10 +5,10 @@
 //   that reads the texts — so a switch of gh's account (`gh auth switch`) counts from the next read on, and an account
 //   that changes within one paginated read is an error. A text counts only when the owner wrote it and nobody else
 //   changed it: its author is the owner, its last editor (if it was edited) is the owner, every entry of its edit
-//   history is the owner's, and an issue's title was renamed only by the owner. A text with an edit by someone else,
-//   or an edit of unknown origin (a deleted account, a history longer than GitHub gives in one read), does not count.
-//   Issues and comments that do not count are never returned — so they never reach an agent's task; such an issue
-//   looked up by its number gives only its number, state and why. Not knowing the owner is an error, never «all users».
+//   history is the owner's (read whole, page by page), and an issue's title was renamed only by the owner. A text with
+//   an edit by someone else, or by an editor GitHub no longer knows (a deleted account), does not count. Issues and
+//   comments that do not count are never returned — so they never reach an agent's task; such an issue looked up by its
+//   number gives only its number, state and why. Not knowing the owner is an error, never «all users».
 // - Every write runs the check before it (check.ts, mark.ts) at this boundary: the project's patterns are compiled
 //   first (an invalid one refuses every write, labels included), texts come as GitHubText (segments) and service
 //   marks, never as a ready body, and every other field is checked by its form. Each write answers with what it wrote
@@ -34,14 +34,14 @@ import {
   ghList,
   ghPages,
   isObject,
-  refusalOf,
   repositoryPath,
   repositoryRef,
+  repositorySlug,
   runGh,
   type Repository,
 } from './gh'
 import { LABEL_LOOK, PLUGIN_LABELS, type PluginLabel } from './labels'
-import { checkMark, composeBody, findByOperation, type Mark } from './mark'
+import { checkMark, composeBody, findByOperation, parseBody, type Mark } from './mark'
 import { CheckError } from './mask'
 
 export type IssueState = 'open' | 'closed'
@@ -57,6 +57,17 @@ export type Issue = {
   readonly labels: readonly string[]
   readonly author: string
   readonly createdAt: string
+  readonly updatedAt: string
+  readonly closedAt: string | null
+  readonly url: string
+}
+
+// What a change of an issue gives back: its state, never its texts (they may have changed since they were checked).
+export type IssueChange = {
+  readonly number: number
+  readonly state: IssueState
+  readonly stateReason: string | null
+  readonly labels: readonly string[]
   readonly updatedAt: string
   readonly closedAt: string | null
   readonly url: string
@@ -171,16 +182,18 @@ export type PullRequestFilter = {
 
 // ── GraphQL reads ───────────────────────────────────────────────────────────────────────────────────────────────────
 // `viewer` is in every query: the owner is the user of the very call that reads the texts. The connection a read pages
-// through has its `pageInfo` before its nodes (gh --paginate follows the first pageInfo it meets); nested lists are
-// read with `totalCount`, and one longer than what came counts as not whole.
+// through has its `pageInfo` before its nodes (gh --paginate follows the first pageInfo it meets), and every page must
+// say how it goes on: a cursor and `hasNextPage: true` on all but the last, `hasNextPage: false` on the last. Nested
+// lists come with `totalCount`: an edit or rename history longer than the first 100 is read on by its own query
+// (AqEdits, AqRenames) of that issue or comment — which names the repository and is checked to belong to it.
 
-const EDITS =
-  'author { login } editor { login } lastEditedAt ' +
-  'userContentEdits(first: 100) { totalCount nodes { editor { login } deletedBy { login } } }'
+const EDIT_NODES = 'nodes { editor { login } deletedBy { login } }'
+const RENAME_NODES = 'nodes { ... on RenamedTitleEvent { actor { login } } }'
+const EDITS = `id author { login } editor { login } lastEditedAt userContentEdits(first: 100) { totalCount ${EDIT_NODES} }`
 const ISSUE_FIELDS =
   `number title body state stateReason createdAt updatedAt closedAt url ${EDITS} ` +
   'labels(first: 100) { totalCount nodes { name } } ' +
-  'timelineItems(itemTypes: [RENAMED_TITLE_EVENT], first: 100) { totalCount nodes { ... on RenamedTitleEvent { actor { login } } } }'
+  `timelineItems(itemTypes: [RENAMED_TITLE_EVENT], first: 100) { totalCount ${RENAME_NODES} }`
 // A comment's REST id is read from its URL (…#issuecomment-<id>): GraphQL's `databaseId` is a 32-bit Int, which ids of
 // comments outgrow.
 const COMMENT_FIELDS = `body createdAt updatedAt url ${EDITS}`
@@ -195,14 +208,29 @@ export const Q_ISSUES =
 export const Q_ISSUE =
   'query AqIssue($owner: String!, $name: String!, $number: Int!) { viewer { login } repository(owner: $owner, name: $name) ' +
   `{ issueOrPullRequest(number: $number) { __typename ... on Issue { ${ISSUE_FIELDS} } ... on PullRequest { number state } } } }`
+// The comments of an issue or of a pull request (GitHub keeps both as IssueComment).
+const COMMENTS = `comments(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { ${COMMENT_FIELDS} } }`
 export const Q_COMMENTS =
   'query AqComments($owner: String!, $name: String!, $number: Int!, $endCursor: String) { viewer { login } ' +
-  'repository(owner: $owner, name: $name) { issue(number: $number) { comments(first: 100, after: $endCursor) ' +
-  `{ pageInfo { hasNextPage endCursor } nodes { ${COMMENT_FIELDS} } } } } }`
+  'repository(owner: $owner, name: $name) { issueOrPullRequest(number: $number) { __typename ' +
+  `... on Issue { ${COMMENTS} } ... on PullRequest { ${COMMENTS} } } } }`
+const PAGED_EDITS = `userContentEdits(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } ${EDIT_NODES} }`
+export const Q_EDITS =
+  'query AqEdits($owner: String!, $name: String!, $id: ID!, $endCursor: String) { viewer { login } ' +
+  'repository(owner: $owner, name: $name) { nameWithOwner } node(id: $id) { __typename ' +
+  `... on Issue { repository { nameWithOwner } ${PAGED_EDITS} } ... on IssueComment { repository { nameWithOwner } ${PAGED_EDITS} } } }`
+export const Q_RENAMES =
+  'query AqRenames($owner: String!, $name: String!, $id: ID!, $endCursor: String) { viewer { login } ' +
+  'repository(owner: $owner, name: $name) { nameWithOwner } node(id: $id) { __typename ... on Issue { repository { nameWithOwner } ' +
+  `timelineItems(itemTypes: [RENAMED_TITLE_EVENT], first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } ${RENAME_NODES} } } } }`
 
 type Variables = Record<string, string | number | readonly string[]>
 
-type Read = { readonly owner: string; readonly repositories: Record<string, unknown>[]; readonly args: readonly string[] }
+// A GraphQL read: the user gh ran as, the `data` of every page (each with its `repository`), the arguments.
+type Read = { readonly owner: string; readonly pages: Record<string, unknown>[]; readonly args: readonly string[] }
+
+// A comment written by the owner and whether its text is still the owner's alone.
+type OwnComment = { readonly comment: Comment; readonly origin: 'owner' | NotOwner }
 
 export class GitHub {
   readonly machine: Machine
@@ -228,7 +256,7 @@ export class GitHub {
         code: error.code,
         ghText: error.ghText,
         what: `the GitHub user gh runs as is unknown, so no texts can be told apart: ${error.ghText || error.message}`,
-        answer: error.answer,
+        refusal: error.refusal,
       })
     }
   }
@@ -242,42 +270,43 @@ export class GitHub {
     const variables: Record<string, readonly string[]> = {}
     if (state !== 'all') variables.states = [state.toUpperCase()]
     if (labels.length > 0) variables.labels = labels
-    const { owner, repositories, args } = await this.read(Q_ISSUES, variables, true)
+    const read = await this.read(Q_ISSUES, variables, true)
     const issues: Issue[] = []
-    for (const repository of repositories) {
-      for (const node of this.nodes(repository.issues, args)) {
-        if (this.originOf(node, owner, true, args) !== 'owner') continue
-        const issue = this.issueFromNode(node, args)
-        // GitHub's label filter takes any of the labels: only issues with all of them are kept.
-        if (labels.every((label) => issue.labels.some((one) => one.toLowerCase() === label.toLowerCase()))) {
-          issues.push(issue)
-        }
+    for (const node of this.pagedNodes(read, (data) => field(data.repository, 'issues'))) {
+      if ((await this.originOf(node, read, true)) !== 'owner') continue
+      const issue = this.issueFromNode(node, read.args)
+      // GitHub's label filter takes any of the labels: only issues with all of them are kept.
+      if (labels.every((label) => issue.labels.some((one) => one.toLowerCase() === label.toLowerCase()))) {
+        issues.push(issue)
       }
     }
     return issues
   }
 
   async getIssue(number: number): Promise<IssueLookup> {
-    const { owner, repositories, args } = await this.read(Q_ISSUE, { number: positive(number) }, false)
-    const node = repositories[0]?.issueOrPullRequest
-    if (!isObject(node)) throw shapeError(args, `no issue or pull request #${number}`)
-    const state = this.shape(args, () => graphState(node.state))
+    const read = await this.read(Q_ISSUE, { number: positive(number) }, false)
+    const node = field(read.pages[0]?.repository, 'issueOrPullRequest')
+    if (!isObject(node)) throw shapeError(read.args, `no issue or pull request #${number}`)
+    const state = this.shape(read.args, () => graphState(node.state))
     if (node.__typename === 'PullRequest') return { found: 'other', number, state, reason: 'pull-request' }
-    const origin = this.originOf(node, owner, true, args)
+    const origin = await this.originOf(node, read, true)
     if (origin !== 'owner') return { found: 'other', number, state, reason: origin }
-    return { found: 'owner', issue: this.issueFromNode(node, args) }
+    return { found: 'owner', issue: this.issueFromNode(node, read.args) }
   }
 
-  // The owner's comments of an issue, in their order, read whole.
+  // The owner's comments of an issue or a pull request, in their order, read whole.
   async listComments(issue: number): Promise<Comment[]> {
-    const { owner, repositories, args } = await this.read(Q_COMMENTS, { number: positive(issue) }, true)
-    const comments: Comment[] = []
-    for (const repository of repositories) {
-      const found = repository.issue
-      if (!isObject(found)) throw shapeError(args, `no issue #${issue}`)
-      for (const node of this.nodes(found.comments, args)) {
-        if (this.originOf(node, owner, false, args) === 'owner') comments.push(this.commentFromNode(node, issue, args))
-      }
+    return (await this.ownComments(issue)).filter((one) => one.origin === 'owner').map((one) => one.comment)
+  }
+
+  // The comments the owner wrote, each with whether its text is still the owner's alone.
+  private async ownComments(issue: number): Promise<OwnComment[]> {
+    const read = await this.read(Q_COMMENTS, { number: positive(issue) }, true)
+    const comments: OwnComment[] = []
+    const nodes = this.pagedNodes(read, (data) => field(field(data.repository, 'issueOrPullRequest'), 'comments'))
+    for (const node of nodes) {
+      const origin = await this.originOf(node, read, false)
+      if (origin !== 'author') comments.push({ comment: this.commentFromNode(node, issue, read.args), origin })
     }
     return comments
   }
@@ -332,7 +361,7 @@ export class GitHub {
         await this.send('POST', 'labels', { name: label, color: look.color, description })
         created.push(label)
       } catch (error) {
-        if (error instanceof GitHubError && error.status === 422 && refusalOf(error).codes.includes('already_exists')) {
+        if (error instanceof GitHubError && error.status === 422 && error.refusal.codes.includes('already_exists')) {
           present.push(label)
           continue
         }
@@ -353,14 +382,31 @@ export class GitHub {
   }
 
   // A comment that belongs to an operation (its mark has `operation`): written only when the owner's comments of the
-  // issue have none with this operation and kind yet. A repeat after a lost GitHub answer finds the comment written
-  // the first time and writes no second one (`existed: true`).
+  // issue or PR have none with this operation and kind yet. A repeat after a lost GitHub answer finds the comment
+  // written the first time and writes no second one (`existed: true`). When a comment of the owner that may be that
+  // one was changed by someone else — its mark names this operation, or it has no readable mark any more — the state
+  // of the operation cannot be confirmed: GitHubError `unconfirmed`, and nothing is written.
   async commentOnce(issue: number, content: BodyContent): Promise<Written<Comment> & { readonly existed: boolean }> {
     const checked = bodyOf(content, this.boundary(content.diff))
     const mark = content.mark
     if (!mark?.operation) throw new CheckError('bad_field', 'commentOnce needs a mark with an operation id')
-    const found = findByOperation(await this.listComments(issue), { operation: mark.operation, kind: mark.kind })
+    const own = await this.ownComments(issue)
+    const confirmed = own.filter((one) => one.origin === 'owner').map((one) => one.comment)
+    const found = findByOperation(confirmed, { operation: mark.operation, kind: mark.kind })
     if (found !== null) return { result: found, hidden: checked.hidden, rules: checked.rules, existed: true }
+    const doubtful = own.find((one) => {
+      if (one.origin === 'owner') return false
+      const read = parseBody(one.comment.body).mark
+      return read === null || read.operation === mark.operation
+    })
+    if (doubtful !== undefined) {
+      throw new GitHubError('unconfirmed', ['api', 'graphql', 'AqComments'], {
+        ghText: '',
+        what:
+          `the state of operation ${mark.operation} cannot be confirmed: comment ${doubtful.comment.url} of the owner ` +
+          'was changed by someone else; nothing was written',
+      })
+    }
     const answer = await this.send('POST', `issues/${positive(issue)}/comments`, { body: checked.body })
     return { result: this.commentOf(answer, issue), hidden: checked.hidden, rules: checked.rules, existed: false }
   }
@@ -379,7 +425,8 @@ export class GitHub {
 
   // Changes an issue of the owner (its texts the owner's alone): its title, its whole body (mark and text), its state.
   // Anything else — someone else's issue, one edited by someone else, a pull request — is refused before the write
-  // (CheckError `not_owner`), so no text of it comes back either.
+  // (CheckError `not_owner`). The answer gives the issue's state, never its texts: someone may have changed them
+  // between the check and the write.
   async updateIssue(
     number: number,
     change: {
@@ -388,7 +435,7 @@ export class GitHub {
       readonly state?: IssueState
       readonly stateReason?: 'completed' | 'not_planned' | 'reopened'
     },
-  ): Promise<Written<Issue>> {
+  ): Promise<Written<IssueChange>> {
     const context = this.boundary(change.body?.diff)
     const title = change.title === undefined ? null : titleOf(change.title, context)
     const body = change.body === undefined ? null : bodyOf(change.body, context)
@@ -405,7 +452,17 @@ export class GitHub {
       throw new CheckError('not_owner', `issue #${number} is not changed: ${what}; nothing was written`)
     }
     const answer = await this.send('PATCH', `issues/${positive(number)}`, payload)
-    return { result: this.issueOf(answer), ...sum(title, body) }
+    const args = ['api', 'issues']
+    const result = this.shape(args, () => ({
+      number: integer(answer.number),
+      state: restState(answer.state),
+      stateReason: typeof answer.state_reason === 'string' ? answer.state_reason : null,
+      labels: labelNames(answer.labels),
+      updatedAt: text(answer.updated_at),
+      closedAt: typeof answer.closed_at === 'string' ? answer.closed_at : null,
+      url: text(answer.html_url),
+    }))
+    return { result, ...sum(title, body) }
   }
 
   // Adds plugin labels to an issue (one it already has stays); answers with the issue's labels after it.
@@ -427,7 +484,7 @@ export class GitHub {
     try {
       await runGh({ machine: this.machine, args: [...apiArgs(this.repository), '--method', 'DELETE', path] })
     } catch (error) {
-      if (error instanceof GitHubError && error.status === 404 && refusalOf(error).message === 'Label does not exist') return
+      if (error instanceof GitHubError && error.status === 404 && error.refusal.message === 'Label does not exist') return
       if (!unanswered(error)) throw error
       const args = [...apiArgs(this.repository), repositoryPath(this.repository, `issues/${issue}`)]
       const item = await ghJson({ machine: this.machine, args }).catch(() => null)
@@ -510,7 +567,7 @@ export class GitHub {
       ? await ghPages({ machine: this.machine, args }, 'object')
       : [await ghJson({ machine: this.machine, args })]
     let owner: string | null = null
-    const repositories: Record<string, unknown>[] = []
+    const datas: Record<string, unknown>[] = []
     for (const page of pages as Record<string, unknown>[]) {
       if (Array.isArray(page.errors) && page.errors.length > 0) {
         const said = page.errors
@@ -533,58 +590,98 @@ export class GitHub {
         })
       }
       owner = viewer
-      const repository = isObject(data) ? data.repository : undefined
-      if (!isObject(repository)) throw shapeError(args, `no repository ${repositoryRef(this.repository)}`)
-      repositories.push(repository)
+      if (!isObject(data) || !isObject(data.repository)) throw shapeError(args, `no repository ${repositoryRef(this.repository)}`)
+      datas.push(data)
     }
     if (owner === null) throw shapeError(args, 'no page')
-    return { owner, repositories, args }
+    return { owner, pages: datas, args }
   }
 
-  // The nodes of a connection.
-  private nodes(connection: unknown, args: readonly string[]): Record<string, unknown>[] {
-    return this.shape(args, () => {
-      if (!isObject(connection) || !Array.isArray(connection.nodes)) throw new Error('not a list of nodes')
-      return connection.nodes.map((node) => {
-        if (!isObject(node)) throw new Error('a node is not an object')
-        return node
+  // The nodes of the connection a paginated read went through, from all its pages. The pages must follow each other:
+  // a cursor and `hasNextPage: true` on every page but the last, `hasNextPage: false` on the last — otherwise gh stopped
+  // before the end, and the list is not whole.
+  private pagedNodes(read: Read, pick: (data: Record<string, unknown>) => unknown): Record<string, unknown>[] {
+    return this.shape(read.args, () => {
+      const nodes: Record<string, unknown>[] = []
+      read.pages.forEach((data, index) => {
+        const connection = pick(data)
+        if (!isObject(connection) || !Array.isArray(connection.nodes) || !isObject(connection.pageInfo)) {
+          throw new Error('not a list of nodes with its pageInfo')
+        }
+        const { hasNextPage, endCursor } = connection.pageInfo
+        const last = index === read.pages.length - 1
+        if (last && hasNextPage !== false) {
+          throw new Error('the list is not whole: its last page says more pages follow (gh stopped before the end)')
+        }
+        if (!last && (hasNextPage !== true || typeof endCursor !== 'string' || endCursor === '')) {
+          throw new Error('the list is not whole: its pages do not follow each other')
+        }
+        for (const node of connection.nodes) {
+          if (!isObject(node)) throw new Error('a node is not an object')
+          nodes.push(node)
+        }
       })
+      return nodes
     })
   }
 
-  // Whether a text counts as the owner's (see the header): `owner`, or why not.
-  private originOf(node: Record<string, unknown>, owner: string, issue: boolean, args: readonly string[]): 'owner' | NotOwner {
-    return this.shape(args, () => {
+  // The whole edit history (`edits`) or title renames (`renames`) of an issue or comment, read on by its own query
+  // after the first 100 came with the list. The query names the repository; the node must belong to it, and gh must
+  // still run as the same user.
+  private async history(id: unknown, what: 'edits' | 'renames', list: Read): Promise<Record<string, unknown>[]> {
+    if (typeof id !== 'string' || id === '') throw shapeError(list.args, 'a text without its id')
+    const read = await this.read(what === 'edits' ? Q_EDITS : Q_RENAMES, { id }, true)
+    if (read.owner.toLowerCase() !== list.owner.toLowerCase()) {
+      throw new GitHubError('owner_unknown', read.args, {
+        ghText: '',
+        what: 'the GitHub user of gh changed while the texts were read (gh auth switch?): nothing of them is used',
+      })
+    }
+    const slug = repositorySlug(this.repository).toLowerCase()
+    for (const data of read.pages) {
+      const repository = field(data.node, 'repository')
+      if (!isObject(repository) || typeof repository.nameWithOwner !== 'string' || repository.nameWithOwner.toLowerCase() !== slug) {
+        throw shapeError(read.args, `the text ${id} is not one of ${repositoryRef(this.repository)}`)
+      }
+    }
+    return this.pagedNodes(read, (data) => field(data.node, what === 'edits' ? 'userContentEdits' : 'timelineItems'))
+  }
+
+  // Whether a text counts as the owner's (see the header): `owner`, or why not. An edit history or rename history
+  // longer than came with the list is read on whole before the answer — an incomplete history decides nothing.
+  private async originOf(node: Record<string, unknown>, read: Read, issue: boolean): Promise<'owner' | NotOwner> {
+    const { owner, args } = read
+    const first = this.shape(args, () => {
       for (const key of ['author', 'editor', 'lastEditedAt', 'userContentEdits']) {
         if (!(key in node)) throw new Error(`no ${key}`)
       }
-      if (!sameLogin(node.author, owner)) return 'author'
-      if ((node.lastEditedAt !== null || node.editor !== null) && !sameLogin(node.editor, owner)) return 'edited'
-      const edits = whole(node.userContentEdits, 'userContentEdits')
-      if (edits === null) return 'edited'
-      for (const edit of edits) {
-        if (!sameLogin(edit.editor, owner)) return 'edited'
-        if (edit.deletedBy !== null && edit.deletedBy !== undefined && !sameLogin(edit.deletedBy, owner)) return 'edited'
-      }
-      if (issue) {
-        const renames = whole(node.timelineItems, 'timelineItems')
-        if (renames === null || renames.some((rename) => !sameLogin(rename.actor, owner))) return 'edited'
-      }
-      return 'owner'
+      if (!sameLogin(node.author, owner)) return 'author' as const
+      if ((node.lastEditedAt !== null || node.editor !== null) && !sameLogin(node.editor, owner)) return 'edited' as const
+      const edits = listed(node.userContentEdits, 'userContentEdits')
+      const renames = issue ? listed(node.timelineItems, 'timelineItems') : { nodes: [], more: false }
+      if (edits.nodes.some((edit) => !ownEdit(edit, owner))) return 'edited' as const
+      if (renames.nodes.some((rename) => !sameLogin(rename.actor, owner))) return 'edited' as const
+      return { edits: edits.more, renames: renames.more }
     })
+    if (typeof first === 'string') return first
+    if (first.edits && (await this.history(node.id, 'edits', read)).some((edit) => !ownEdit(edit, owner))) return 'edited'
+    if (first.renames && (await this.history(node.id, 'renames', read)).some((rename) => !sameLogin(rename.actor, owner))) {
+      return 'edited'
+    }
+    return 'owner'
   }
 
   private issueFromNode(node: Record<string, unknown>, args: readonly string[]): Issue {
     return this.shape(args, () => {
-      const labels = whole(node.labels, 'labels')
-      if (labels === null) throw new Error('more labels than one read gives: the list is not whole')
+      const labels = listed(node.labels, 'labels')
+      if (labels.more) throw new Error('more labels than one read gives: the list is not whole')
       return {
         number: integer(node.number),
         title: text(node.title),
         body: typeof node.body === 'string' ? node.body : '',
         state: graphState(node.state),
         stateReason: typeof node.stateReason === 'string' ? node.stateReason.toLowerCase() : null,
-        labels: labels.map((label) => text(label.name)),
+        labels: labels.nodes.map((label) => text(label.name)),
         author: login(node.author),
         createdAt: text(node.createdAt),
         updatedAt: text(node.updatedAt),
@@ -616,7 +713,7 @@ export class GitHub {
     }
   }
 
-  // An issue from the REST answer of a write (createIssue, updateIssue).
+  // An issue from the REST answer of its creation (the text is the one just written).
   private issueOf(item: Record<string, unknown>): Issue {
     return this.shape(['api', 'issues'], () => ({
       number: integer(item.number),
@@ -702,8 +799,8 @@ function shapeError(args: readonly string[], what: string): GitHubError {
   return new GitHubError('bad_answer', args, { ghText: '', what: `gh answered JSON of another shape: ${what}` })
 }
 
-// The items of a nested list read with totalCount, or null when GitHub gave fewer than it has.
-function whole(connection: unknown, name: string): Record<string, unknown>[] | null {
+// The items of a nested list read with totalCount, and whether GitHub has more than it gave.
+function listed(connection: unknown, name: string): { readonly nodes: Record<string, unknown>[]; readonly more: boolean } {
   if (!isObject(connection) || !Array.isArray(connection.nodes) || typeof connection.totalCount !== 'number') {
     throw new Error(`no ${name}`)
   }
@@ -711,7 +808,17 @@ function whole(connection: unknown, name: string): Record<string, unknown>[] | n
     if (!isObject(node)) throw new Error(`an item of ${name} is not an object`)
     return node
   })
-  return connection.totalCount > nodes.length ? null : nodes
+  return { nodes, more: connection.totalCount > nodes.length }
+}
+
+// An entry of an edit history made (and, if a revision was deleted, deleted) by the owner.
+function ownEdit(edit: Record<string, unknown>, owner: string): boolean {
+  return sameLogin(edit.editor, owner) && (edit.deletedBy === null || edit.deletedBy === undefined || sameLogin(edit.deletedBy, owner))
+}
+
+// A field of a JSON object, or undefined.
+function field(value: unknown, key: string): unknown {
+  return isObject(value) ? value[key] : undefined
 }
 
 function sameLogin(actor: unknown, owner: string): boolean {

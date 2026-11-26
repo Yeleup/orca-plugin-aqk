@@ -92,8 +92,17 @@ export type GitHubErrorKind =
   | 'bad_answer'
   // The GitHub user gh runs as is unknown, or changed within one read: no texts can be told apart.
   | 'owner_unknown'
+  // What GitHub has cannot confirm a state the plugin needs (an operation's comment changed by someone else).
+  | 'unconfirmed'
 
-// A failure of a GitHub call. `message` carries gh's own text (its stderr, or why it did not run).
+// GitHub's own words in a refusal (the error body of a REST call that gh prints): its `message` and the `code`s of its
+// `errors` — nothing else of gh's output.
+export type Refusal = { readonly message: string | null; readonly codes: readonly string[] }
+
+const NO_REFUSAL: Refusal = { message: null, codes: [] }
+
+// A failure of a GitHub call. `message` carries gh's own text: its stderr, or why it did not run. What gh printed on
+// stdout is never kept — after a failed page it may hold texts of any author — only GitHub's refusal read from it.
 export class GitHubError extends Error {
   readonly kind: GitHubErrorKind
   // The arguments gh got (no bodies: those go on stdin).
@@ -103,13 +112,12 @@ export class GitHubError extends Error {
   readonly status: number | null
   // gh's own text: its stderr, or the reason it did not run.
   readonly ghText: string
-  // What gh printed on stdout: GitHub's answer, also of a refusal (its `message`, its `errors`).
-  readonly answer: string
+  readonly refusal: Refusal
 
   constructor(
     kind: GitHubErrorKind,
     args: readonly string[],
-    detail: { readonly code?: number | null; readonly ghText: string; readonly what?: string; readonly answer?: string },
+    detail: { readonly code?: number | null; readonly ghText: string; readonly what?: string; readonly refusal?: Refusal },
   ) {
     const exit = detail.code === undefined || detail.code === null ? '' : ` (exit ${detail.code})`
     super(`gh ${args.join(' ')}${exit}: ${detail.what ?? detail.ghText}`)
@@ -118,7 +126,7 @@ export class GitHubError extends Error {
     this.args = args
     this.code = detail.code ?? null
     this.ghText = detail.ghText
-    this.answer = detail.answer ?? ''
+    this.refusal = detail.refusal ?? NO_REFUSAL
     const status = /\(HTTP (\d{3})\)/.exec(detail.ghText)
     this.status = status ? Number(status[1]) : null
   }
@@ -147,25 +155,34 @@ export async function runGh(call: GhCall): Promise<RunResult> {
   }
   if (result.error !== null) {
     const kind = result.error.kind === 'timed_out' ? 'gh_timed_out' : 'gh_not_started'
-    const said = ghSaid(result)
-    throw new GitHubError(kind, args, {
-      ghText: said ? `${result.error.reason}; ${said}` : result.error.reason,
-      answer: result.stdout,
-    })
+    const said = result.stderr.trim()
+    throw new GitHubError(kind, args, { ghText: said ? `${result.error.reason}; ${said}` : result.error.reason })
   }
   if (result.code !== 0) {
+    const refusal = refusalIn(result.stdout)
     throw new GitHubError('gh_failed', args, {
       code: result.code,
-      ghText: ghSaid(result) || `no output${result.signal ? `, ended by ${result.signal}` : ''}`,
-      answer: result.stdout,
+      ghText: result.stderr.trim() || refusal.message || `no output${result.signal ? `, ended by ${result.signal}` : ''}`,
+      refusal,
     })
   }
   return result
 }
 
-// gh's own text about a run: its stderr, otherwise its stdout (gh api prints GitHub's error body there).
-function ghSaid(result: RunResult): string {
-  return result.stderr.trim() || result.stdout.trim()
+// GitHub's refusal in gh's stdout: one JSON object with a `message` (a REST error body). A GraphQL page (`data`) or
+// anything else gives none.
+function refusalIn(stdout: string): Refusal {
+  let answer: unknown
+  try {
+    answer = JSON.parse(stdout)
+  } catch {
+    return NO_REFUSAL
+  }
+  if (!isObject(answer) || 'data' in answer || typeof answer.message !== 'string') return NO_REFUSAL
+  const codes = Array.isArray(answer.errors)
+    ? answer.errors.flatMap((one) => (isObject(one) && typeof one.code === 'string' && /^[a-z_]{1,40}$/.test(one.code) ? [one.code] : []))
+    : []
+  return { message: answer.message.slice(0, 200), codes }
 }
 
 // One JSON answer of `gh api` (an object).
@@ -218,23 +235,23 @@ export async function ghList(call: GhCall): Promise<Record<string, unknown>[]> {
   return items
 }
 
+// The answer as JSON. The parser's own message is not kept: it quotes a piece of the answer.
 function parseAnswer(args: readonly string[], result: RunResult): unknown {
   if (result.truncated) throw badAnswer(args, 'the answer was cut in memory', result)
   try {
     return JSON.parse(result.stdout)
-  } catch (error) {
-    throw badAnswer(args, `not JSON (${errorMessage(error)})`, result)
+  } catch {
+    throw badAnswer(args, `not JSON (${result.stdout.length} characters)`, result)
   }
 }
 
+// An answer of another kind than expected: gh's stderr only, never its stdout.
 function badAnswer(args: readonly string[], what: string, result: RunResult): GitHubError {
-  const said = ghSaid(result)
-  const head = said.length > 300 ? `${said.slice(0, 300)}…` : said
+  const said = result.stderr.trim()
   return new GitHubError('bad_answer', args, {
     code: result.code,
     ghText: said,
-    what: `gh answered ${what}${head ? `: ${head}` : ''}`,
-    answer: result.stdout,
+    what: `gh answered ${what}${said ? `: ${said.slice(0, 300)}` : ''}`,
   })
 }
 
@@ -270,23 +287,12 @@ export function jsonValues(text: string): unknown[] {
       }
     }
     if (depth !== 0 || inString) throw new Error(`the value at ${start} is not whole`)
-    values.push(JSON.parse(text.slice(start, at)))
+    try {
+      values.push(JSON.parse(text.slice(start, at)))
+    } catch {
+      throw new Error(`the value at ${start} is not valid JSON`)
+    }
   }
-}
-
-// GitHub's own words in a refusal: the `message` of its answer and the `code`s of its `errors`.
-export function refusalOf(error: GitHubError): { readonly message: string | null; readonly codes: readonly string[] } {
-  let answer: unknown
-  try {
-    answer = JSON.parse(error.answer)
-  } catch {
-    return { message: null, codes: [] }
-  }
-  if (!isObject(answer)) return { message: null, codes: [] }
-  const codes = Array.isArray(answer.errors)
-    ? answer.errors.flatMap((one) => (isObject(one) && typeof one.code === 'string' ? [one.code] : []))
-    : []
-  return { message: typeof answer.message === 'string' ? answer.message : null, codes }
 }
 
 export function isObject(value: unknown): value is Record<string, unknown> {

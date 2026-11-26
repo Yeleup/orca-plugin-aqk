@@ -222,11 +222,14 @@ export function checkText(text: GitHubText, context: CheckContext): CheckedText 
       continue
     }
     if (typeof segment !== 'string') {
-      if (touching.length === 0) out += segment.value
+      // A path is hidden whole when a match of the whole text touches it — or the mask matches the path on its own (a
+      // pattern for a whole path, `^src/private\.ts$`, does not match it inside a text).
+      const own = context.mask.find(segment.value)
+      if (touching.length === 0 && own.length === 0) out += segment.value
       else {
         out += HIDDEN
         hidden++
-        for (const match of touching) for (const rule of match.rules) rules.add(rule)
+        for (const match of [...touching, ...own]) for (const rule of match.rules) rules.add(rule)
       }
       continue
     }

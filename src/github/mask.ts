@@ -70,13 +70,15 @@ const EMAIL: Rule = {
 }
 
 // Phone numbers: 10 to 15 digits (8 to 15 after a leading +), in groups divided by single blanks or hyphens, one group
-// may be in parentheses — also as a part of a file path (`calls/<number>.txt`). Digits that continue a word, a hex
-// string, a hyphenated id, an issue reference (#…), a time (…:mm) or a decimal (….5) are not a phone number, nor is a
-// date (YYYY-MM-DD …). A run of such groups with more than 15 digits — several numbers in a row, or a card number — is
-// hidden whole.
+// may be in parentheses — also as a part of a file path or branch name, after `/`, `\`, `_` or a word and a hyphen
+// (`calls/tel-<number>.txt`). Digits that continue a word or a hex string, go on a hyphenated number (`…7-<digits>`: a
+// date, the groups of a numeric id), follow GitHub's anchors (`issuecomment-…`, `pullrequestreview-…`, `event-…`) or an
+// issue reference (#…), or start a time (…:mm) or a decimal (….5) are not a phone number, nor is a date (YYYY-MM-DD …).
+// A run of such groups with more than 15 digits — several numbers in a row, or a card number — is hidden whole.
 const PHONE: Rule = {
   name: 'phone',
-  pattern: /(?<![\p{L}\p{N}+\-#])(?<!\d[.,])\+?(?:\(\d{1,5}\)|\d)(?:[ -]?(?:\(\d{1,5}\)|\d)){6,}(?![\p{L}\p{N}]|[.:]\d)/gu,
+  pattern:
+    /(?<![\p{L}\p{N}+#])(?<!\p{N}-)(?<!(?:issuecomment|pullrequestreview|event)-)(?<!\d[.,])\+?(?:\(\d{1,5}\)|\d)(?:[ -]?(?:\(\d{1,5}\)|\d)){6,}(?![\p{L}\p{N}]|[.:]\d)/gu,
   accept: (found) => {
     if (/^\d{4}-\d{2}-\d{2}(?!\d)/.test(found)) return false
     const digits = found.replace(/\D/g, '').length
