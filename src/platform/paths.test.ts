@@ -3,7 +3,8 @@
 // path keeps to the separator of that system.
 import { assert, mountWorker, test } from 'orca/testing'
 import { startWorker } from '../worker'
-import { fakeMachine, type FakeMachine } from '../testing/fake-machine'
+import { fakeMachine, orcaWorkerEnv, type FakeMachine } from '../testing/fake-machine'
+import { LOCAL_APP_DATA_SCRIPT } from './folders'
 import { dataDirectory, dataPath, nativePath, worktreeFile } from './paths'
 
 // The worker started on `machine`: its log and the files it created.
@@ -21,7 +22,7 @@ test('К14.1: подделка Windows (win32) — каталог данных �
     env: { LocalAppData: 'C:\\Users\\Avery\\AppData\\Local', Path: 'C:\\Windows\\System32' },
   })
   const dataDir = 'C:\\Users\\Avery\\AppData\\Local\\orca-agent-queue'
-  assert.equal(dataDirectory(machine), dataDir)
+  assert.equal(await dataDirectory(machine), dataDir)
 
   const { logs, created } = await startOn(machine)
   assert.deepEqual(created, [`${dataDir}\\coordinator-id`])
@@ -41,16 +42,49 @@ test('К14.1: подделка Windows (win32) — каталог данных �
   }
 })
 
-test('К14.1: подделка Windows без LOCALAPPDATA — каталог данных в <домашний каталог>\\AppData\\Local', () => {
-  const machine = fakeMachine({ platform: 'win32', homedir: 'C:\\Users\\Avery', env: { LOCALAPPDATA: 'relative\\dir' } })
-  assert.equal(dataDirectory(machine), 'C:\\Users\\Avery\\AppData\\Local\\orca-agent-queue')
+test('К14.1: подделка Windows с окружением воркера Orca (без LOCALAPPDATA) — Local AppData, которую называет Windows', async () => {
+  // Orca runs with LOCALAPPDATA moved to another drive; its worker gets only the variables Orca lets through.
+  const full = {
+    USERPROFILE: 'C:\\Users\\Avery',
+    LOCALAPPDATA: 'D:\\Profiles\\Avery\\Local',
+    Path: 'C:\\Windows\\System32',
+    SystemRoot: 'C:\\Windows',
+    SystemDrive: 'C:',
+  }
+  const env = orcaWorkerEnv(full, 'win32')
+  assert.equal(env.LOCALAPPDATA, undefined)
+  const machine = fakeMachine({
+    platform: 'win32',
+    env,
+    answer: (request) => (request.file.endsWith('powershell.exe') ? { code: 0, stdout: 'D:\\Profiles\\Avery\\Local' } : {}),
+  })
+  const dataDir = 'D:\\Profiles\\Avery\\Local\\orca-agent-queue'
+  const { created } = await startOn(machine)
+  assert.deepEqual(created, [`${dataDir}\\coordinator-id`])
+  assert.equal(await dataDirectory(machine), dataDir)
+  // Windows was asked once, by its own PowerShell, for FOLDERID_LocalAppData.
+  assert.deepEqual(
+    machine.starts.map(({ file, args }) => ({ file, args })),
+    [
+      {
+        file: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+        args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', LOCAL_APP_DATA_SCRIPT],
+      },
+    ],
+  )
+
+  // Windows does not answer (or a relative LOCALAPPDATA): the folder's default under the user's profile.
+  const silent = fakeMachine({ platform: 'win32', env, answer: () => ({ code: 1, stderr: 'not available' }) })
+  assert.equal(await dataDirectory(silent), 'C:\\Users\\Avery\\AppData\\Local\\orca-agent-queue')
+  const relative = fakeMachine({ platform: 'win32', homedir: 'C:\\Users\\Avery', env: { LOCALAPPDATA: 'relative\\dir' } })
+  assert.equal(await dataDirectory(relative), 'C:\\Users\\Avery\\AppData\\Local\\orca-agent-queue')
 })
 
 test('К14.1: подделка macOS (darwin) — каталог данных в ~/Library/Application Support, пути worktree и файлов только с /', async () => {
   // XDG variables are Linux's rule, not macOS's.
   const machine = fakeMachine({ platform: 'darwin', homedir: '/Users/avery', env: { XDG_DATA_HOME: '/Users/avery/.xdg' } })
   const dataDir = '/Users/avery/Library/Application Support/orca-agent-queue'
-  assert.equal(dataDirectory(machine), dataDir)
+  assert.equal(await dataDirectory(machine), dataDir)
 
   const { created } = await startOn(machine)
   assert.deepEqual(created, [`${dataDir}/coordinator-id`])
@@ -64,17 +98,17 @@ test('К14.1: подделка macOS (darwin) — каталог данных в
   }
 })
 
-test('каталог данных на Linux: $XDG_DATA_HOME, без него или с относительным — ~/.local/share', () => {
+test('каталог данных на Linux: $XDG_DATA_HOME, без него или с относительным — ~/.local/share', async () => {
   const linux = (env: Record<string, string>) => fakeMachine({ platform: 'linux', homedir: '/home/avery', env })
-  assert.equal(dataDirectory(linux({ XDG_DATA_HOME: '/data/avery' })), '/data/avery/orca-agent-queue')
-  assert.equal(dataDirectory(linux({})), '/home/avery/.local/share/orca-agent-queue')
-  assert.equal(dataDirectory(linux({ XDG_DATA_HOME: 'relative/share' })), '/home/avery/.local/share/orca-agent-queue')
+  assert.equal(await dataDirectory(linux({ XDG_DATA_HOME: '/data/avery' })), '/data/avery/orca-agent-queue')
+  assert.equal(await dataDirectory(linux({})), '/home/avery/.local/share/orca-agent-queue')
+  assert.equal(await dataDirectory(linux({ XDG_DATA_HOME: 'relative/share' })), '/home/avery/.local/share/orca-agent-queue')
 })
 
-test('пути: имя в каталоге данных и путь в worktree не выходят за их пределы', () => {
+test('пути: имя в каталоге данных и путь в worktree не выходят за их пределы', async () => {
   for (const platform of ['linux', 'darwin', 'win32'] as const) {
     const machine = fakeMachine({ platform })
-    const dataDir = dataDirectory(machine)
+    const dataDir = await dataDirectory(machine)
     for (const name of ['..', '', 'a/b', 'a\\b']) {
       assert.throws(() => dataPath(machine, dataDir, name), /not a plain name/)
     }

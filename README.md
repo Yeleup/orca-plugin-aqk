@@ -14,6 +14,11 @@
 
 ## На компьютере пользователя
 
+Воркер плагина получает от Orca урезанное окружение: только `PATH`, `HOME`, `USERPROFILE`, язык и часовой пояс,
+временные каталоги, `XDG_RUNTIME_DIR`, адреса D-Bus и ssh-agent и системные переменные Windows (`SYSTEMROOT`,
+`SYSTEMDRIVE`, `WINDIR`, `COMSPEC`, `PATHEXT` …). Переменных вроде `LOCALAPPDATA`, `XDG_DATA_HOME`, `ProgramFiles` и
+`ORCA_CLI_COMMAND` в нём нет, поэтому то, что они называют, плагин узнаёт у системы сам.
+
 **Каталог данных.** Своё состояние на компьютере плагин держит вне репозиториев, в месте для данных приложений этой
 системы:
 
@@ -21,7 +26,7 @@
 |---|---|
 | Linux | `$XDG_DATA_HOME/orca-agent-queue`, без `XDG_DATA_HOME` — `~/.local/share/orca-agent-queue` |
 | macOS | `~/Library/Application Support/orca-agent-queue` |
-| Windows | `%LOCALAPPDATA%\orca-agent-queue` (локальный профиль, не перемещаемый) |
+| Windows | `<Local AppData>\orca-agent-queue`: папка Local AppData, как её называет Windows (по умолчанию `%USERPROFILE%\AppData\Local`; локальный профиль, не перемещаемый) |
 
 В нём файл `coordinator-id` — id координатора этого компьютера: случайный UUID, без имени компьютера и пользователя.
 Воркер создаёт его при первом запуске и дальше только читает; не удаляйте и не копируйте его на другой компьютер: у
@@ -30,26 +35,30 @@
 путь от git (`C:/…`) и от Orca (`C:\…`) — один и тот же путь.
 
 **Команды.** git, `gh` и CLI Orca плагин ищет в PATH так же, как оболочка системы (на Windows — с расширениями из
-`PATHEXT`, файлы `.cmd` и `.bat` идут через `cmd.exe`), и у каждого запуска знает код выхода, вывод, время начала и
-длительность. Команда тестов проекта идёт оболочкой системы: `/bin/sh -c` на macOS и Linux, `cmd.exe /d /s /c` на
-Windows; на Windows — команда для Windows из настроек проекта, если она задана, иначе основная. Команда, которой нет,
-— ошибка с причиной, а не успешный запуск.
+`PATHEXT`, файлы `.cmd` и `.bat` идут через `cmd.exe`), относительные пути — от рабочего каталога запуска. У каждого
+запуска плагин знает код выхода, вывод, время начала и длительность; весь вывод можно писать в файл, а в памяти от
+большого вывода остаются начало и конец. Вывод не в UTF-8 на Windows читается в кодовой странице консоли. Команда
+тестов проекта идёт оболочкой системы: `/bin/sh -c` на macOS и Linux, `cmd.exe /d /s /c` на Windows; на Windows —
+команда для Windows из настроек проекта, если она задана, иначе основная. Команда, которой нет, — ошибка с причиной, а
+не успешный запуск. `cmd.exe` не работает в сетевом каталоге (`\\сервер\ресурс\…`): такой запуск — ошибка с причиной.
+Запуск, который не уложился в отведённое время, останавливается вместе со всеми процессами, которые он запустил.
 
-**CLI Orca.** Окружение воркера Orca отфильтровано, и плагин ищет CLI Orca сам, по порядку:
+**CLI Orca.** `ORCA_CLI_COMMAND` до воркера не доходит, и плагин ищет CLI Orca сам, по порядку:
 
-1. `ORCA_CLI_COMMAND`, если задана (её задают терминалы Orca);
+1. `ORCA_CLI_COMMAND`, если она всё же задана;
 2. по имени в PATH: `orca-ide` на Linux, `orca` на macOS и Windows. Голый `orca` на Linux плагин не запускает никогда —
    вне терминалов Orca это экранный диктор GNOME;
-3. известные пути CLI в установке Orca:
+3. известные пути CLI в установке Orca: сначала CLI той Orca, в которой работает воркер (в ресурсах рядом с её
+   программой — где бы Orca ни стояла), потом обычные места установки:
 
 | Система | Известные пути (по порядку) |
 |---|---|
-| Linux | `~/.local/bin/orca-ide`; `$XDG_CACHE_HOME/orca/appimage/launcher/orca-ide` (без `XDG_CACHE_HOME` — `~/.cache/…`, AppImage); `/opt/Orca/resources/bin/orca-ide` (системный пакет) |
-| macOS | `/usr/local/bin/orca`; `~/.local/bin/orca`; `Orca.app/Contents/Resources/bin/orca` в `/Applications` и в `~/Applications` |
-| Windows | `%LOCALAPPDATA%\Programs\Orca\resources\bin\orca.exe`; `%ProgramFiles%\Orca\resources\bin\orca.exe` |
+| Linux | `<каталог Orca>/resources/bin/orca-ide`; `~/.local/bin/orca-ide`; `~/.cache/orca/appimage/launcher/orca-ide` (AppImage); `/usr/bin/orca-ide` (пакеты deb и rpm); `/opt/Orca`, `/opt/orca-ide`, `/opt/orca` — `resources/bin/orca-ide` |
+| macOS | `<Orca>.app/Contents/Resources/bin/orca` запущенной Orca; `/usr/local/bin/orca`; `~/.local/bin/orca`; `Orca.app/Contents/Resources/bin/orca` в `/Applications` и в `~/Applications` |
+| Windows | `<каталог Orca>\resources\bin\orca.exe`; `<Local AppData>\Programs\Orca\resources\bin\orca.exe`; `<системный диск>\Program Files\Orca\resources\bin\orca.exe` |
 
-Найденный CLI должен ответить на `status --json` (`"ok": true`), иначе плагин берёт следующий. Не нашёлся ни один —
-результат «CLI Orca не найден» с причиной: что и где искали.
+Найденный CLI должен ответить на `status --json` (`"ok": true`) за 20 секунд, иначе плагин берёт следующий. Не нашёлся
+ни один — результат «CLI Orca не найден» с причиной: что и где искали.
 
 ## Установка
 
@@ -85,9 +94,10 @@ Orca ставит новейший тег версии `vX.Y.Z` (без тего
   каталог данных и id координатора. Orca сама транспилирует TypeScript панели и воркера при загрузке: сборки нет,
   зависимостей во время работы нет.
 - `src/platform/` — общий слой трёх систем: `machine.ts` — компьютер, на котором работает воркер (система, окружение,
-  часы, файлы, запуск процессов; тесты подставляют поддельный), `paths.ts` — каталог данных и пути worktree и файлов,
-  `coordinator-id.ts` — id координатора, `run.ts` — запуск команд и команды тестов проекта (её настройки задача
-  `project-config` берёт из `.agent-queue.json`), `orca-cli.ts` — поиск CLI Orca.
+  часы, файлы, запуск процессов; тесты подставляют поддельный), `files.ts` и `process.ts` — файлы и запуск процессов
+  настоящего компьютера, `folders.ts` — папки системы, которых нет в окружении воркера, `paths.ts` — каталог данных и
+  пути worktree и файлов, `coordinator-id.ts` — id координатора, `run.ts` — запуск команд и команды тестов проекта (её
+  настройки задача `project-config` берёт из `.agent-queue.json`), `orca-cli.ts` — поиск CLI Orca.
 - `src/node.d.ts` — типы встроенных модулей Node.js, которыми пользуется плагин: пакета `@types/node` нет.
 - `src/testing/` — поддельный компьютер для тестов: любая из трёх систем, файлы в памяти, записанные запуски, часы;
   временный домашний каталог, в котором тесты запускают настоящий воркер.

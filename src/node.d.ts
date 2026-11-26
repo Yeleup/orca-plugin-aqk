@@ -1,7 +1,8 @@
 // Types of the Node.js built-in modules the plugin uses. The worker is a `trusted-worker`: its own Node.js process, so
 // it imports Node's modules; Node's typings (@types/node) are not installed (the plugin adds no packages), and
 // tsconfig.json has only Orca's. So this file declares the exports the plugin and its tests use, and only those, with
-// Node's own signatures (narrowed where the plugin always passes the same option, e.g. the 'utf8' encoding).
+// Node's own signatures (narrowed where the plugin always passes the same option, e.g. the 'utf8' encoding; a Buffer
+// is typed as the Uint8Array it extends).
 
 declare module 'node:path' {
   export interface PlatformPath {
@@ -32,18 +33,26 @@ declare module 'node:fs' {
   }
   export const constants: { readonly F_OK: number; readonly X_OK: number }
   export function statSync(path: string): Stats
+  export function lstatSync(path: string): Stats
   export function accessSync(path: string, mode?: number): void
   export function existsSync(path: string): boolean
   export function mkdirSync(path: string, options?: { recursive?: boolean }): string | undefined
   export function mkdtempSync(prefix: string): string
   export function readFileSync(path: string, encoding: 'utf8'): string
+  export function readFileSync(path: string): Uint8Array
   export function readdirSync(path: string): string[]
   export function writeFileSync(
     path: string,
-    data: string,
+    data: string | Uint8Array,
     options?: { encoding?: 'utf8'; flag?: string; mode?: number },
   ): void
   export function linkSync(existingPath: string, newPath: string): void
+  export function renameSync(oldPath: string, newPath: string): void
+  export function rmdirSync(path: string): void
+  export function utimesSync(path: string, atime: number, mtime: number): void
+  export function openSync(path: string, flags: 'w' | 'a'): number
+  export function writeSync(fd: number, data: Uint8Array): number
+  export function closeSync(fd: number): void
   export function unlinkSync(path: string): void
   export function chmodSync(path: string, mode: number): void
   export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void
@@ -63,29 +72,34 @@ declare module 'node:crypto' {
 declare module 'node:process' {
   export const platform: string
   export const env: Record<string, string | undefined>
+  export const execPath: string
   export function cwd(): string
+  export function kill(pid: number, signal?: 'SIGKILL' | 'SIGTERM' | 0): true
 }
 
 declare module 'node:child_process' {
   export interface SpawnOptions {
     cwd?: string
     env?: Record<string, string | undefined>
-    stdio?: ['ignore' | 'pipe', 'ignore' | 'pipe', 'ignore' | 'pipe']
+    stdio?: ['ignore' | 'pipe', 'ignore' | 'pipe', 'ignore' | 'pipe'] | 'ignore'
+    detached?: boolean
     windowsHide?: boolean
     windowsVerbatimArguments?: boolean
   }
-  // A child's stdout or stderr after setEncoding('utf8'): its chunks are strings.
-  export interface ReadableText {
-    setEncoding(encoding: 'utf8'): this
-    on(event: 'data', listener: (chunk: string) => void): this
+  // A child's stdout or stderr without an encoding: its chunks are Buffers.
+  export interface ReadableBytes {
+    on(event: 'data', listener: (chunk: Uint8Array) => void): this
+    destroy(): this
   }
   export interface ChildProcess {
-    readonly stdout: ReadableText | null
-    readonly stderr: ReadableText | null
+    readonly pid?: number
+    readonly stdout: ReadableBytes | null
+    readonly stderr: ReadableBytes | null
     kill(signal?: 'SIGTERM' | 'SIGKILL'): boolean
+    unref(): void
     on(event: 'spawn', listener: () => void): this
     on(event: 'error', listener: (error: Error & { code?: string }) => void): this
-    on(event: 'close', listener: (code: number | null, signal: string | null) => void): this
+    on(event: 'exit' | 'close', listener: (code: number | null, signal: string | null) => void): this
   }
   export function spawn(command: string, args: readonly string[], options?: SpawnOptions): ChildProcess
 }

@@ -28,9 +28,9 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
 }
 
 export async function startWorker(orca: Pick<OrcaWorkerApi, 'log'>, machine: Machine): Promise<WorkerContext> {
-  const dataDir = dataDirectory(machine)
+  const dataDir = await dataDirectory(machine)
   try {
-    const coordinatorId = ensureCoordinatorId(machine, dataDir)
+    const coordinatorId = await ensureCoordinatorId(machine, dataDir)
     orca.log(`agent-queue: worker started, coordinator ${coordinatorId}`)
     return { machine, dataDir, coordinatorId }
   } catch (error) {

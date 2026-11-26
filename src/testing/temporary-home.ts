@@ -1,6 +1,7 @@
-// Runs a test body with the worker's home directory in a new temporary directory and no data-directory variables, then
-// puts the environment back: the real worker module (src/worker.ts) then keeps its data directory and coordinator id
-// there, never in the real data directory of this computer.
+// Runs a test body with the worker's home directory and the data variables of each system (XDG_DATA_HOME, LOCALAPPDATA)
+// in a new temporary directory, then puts the environment back: the real worker module (src/worker.ts) then keeps its
+// data directory and coordinator id there, never in the real data directory of this computer, and looks up no system
+// folder.
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -13,8 +14,8 @@ export async function withTemporaryHome(body: (home: string) => Promise<void>): 
   try {
     env.HOME = home
     env.USERPROFILE = home
-    delete env.XDG_DATA_HOME
-    delete env.LOCALAPPDATA
+    env.XDG_DATA_HOME = join(home, 'data')
+    env.LOCALAPPDATA = join(home, 'local')
     await body(home)
   } finally {
     for (const [name, value] of saved) {

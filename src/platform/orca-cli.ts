@@ -7,7 +7,8 @@
 // answer `status --json` with `ok: true`; one that does not is passed over for the next. None at all — the result
 // «CLI Orca не найден» (code `orca_cli_not_found`) with the reason; the row of «Проверка проекта» about it and the
 // refusal to create a worktree come with the tasks `doctor` and `worktree`.
-import { envValue, pathsOf, type Machine } from './machine'
+import { localAppData, xdgHome } from './folders'
+import { absoluteEnvPath, envValue, pathsOf, type Machine } from './machine'
 import { resolveCommand, runProgram } from './run'
 
 export const ORCA_CLI_NOT_FOUND = 'orca_cli_not_found'
@@ -58,44 +59,63 @@ export function isScreenReader(machine: Pick<Machine, 'platform'>, command: stri
 }
 
 // Where Orca's installation puts its CLI on each system, in the order they are tried. From the code of Orca 1.4.274
-// (out/main of its app.asar: the CLI installer and the bundled CLI of each system):
-// - Linux: ~/.local/bin/orca-ide — the command Orca registers; $XDG_CACHE_HOME/orca/appimage/launcher/orca-ide (by
-//   default ~/.cache/…) — the stable launcher of the AppImage, where ~/.local/bin/orca-ide points;
-//   /opt/Orca/resources/bin/orca-ide — the CLI inside the system package (/opt/Orca).
+// (out/main of its app.asar: the CLI installer, the bundled CLI of each system, the deb/rpm after-install script):
+// - First, on every system, the CLI of the very Orca that runs the worker: the worker is forked from Orca's main
+//   process, so `execPath` is Orca's executable and its resources hold the CLI — <dir>/resources/bin/orca-ide on Linux,
+//   <dir>\resources\bin\orca.exe on Windows (any install directory, e.g. NSIS /D), <App>.app/Contents/Resources/bin/orca
+//   on macOS.
+// - Linux: ~/.local/bin/orca-ide — the command Orca registers; <XDG cache>/orca/appimage/launcher/orca-ide (by default
+//   ~/.cache/…) — the stable launcher of the AppImage; /usr/bin/orca-ide — the link the deb and rpm packages make; the
+//   CLI inside those packages in /opt/Orca, /opt/orca-ide or /opt/orca.
 // - macOS: /usr/local/bin/orca, or ~/.local/bin/orca where /usr/local/bin is missing — the command Orca registers;
-//   <Resources>/bin/orca inside Orca.app in /Applications or ~/Applications.
-// - Windows: <Resources>\bin\orca.exe inside the installation — %LOCALAPPDATA%\Programs\Orca (per user) or
-//   %ProgramFiles%\Orca (all users).
-export function knownOrcaCliPaths(machine: Pick<Machine, 'platform' | 'env' | 'homedir'>): string[] {
+//   Orca.app in /Applications or ~/Applications.
+// - Windows: Orca in <Local AppData>\Programs\Orca (per user; Local AppData as Windows names it, folders.ts) or in
+//   <Program Files>\Orca (all users; ProgramFiles is not in the worker's environment, so <SYSTEMDRIVE>\Program Files).
+export async function knownOrcaCliPaths(
+  machine: Pick<Machine, 'platform' | 'env' | 'homedir' | 'execPath' | 'start'>,
+): Promise<string[]> {
   const paths = pathsOf(machine)
   const home = machine.homedir
-  const absolute = (name: string) => {
-    const value = envValue(machine, name)?.trim()
-    return value && paths.isAbsolute(value) ? value : undefined
-  }
+  const own = runningOrcaCli(machine)
+  const known: string[] = own === null ? [] : [own]
   if (machine.platform === 'linux') {
-    const cache = absolute('XDG_CACHE_HOME') ?? paths.join(home, '.cache')
-    return [
+    const cache = (await xdgHome(machine, 'XDG_CACHE_HOME')) ?? paths.join(home, '.cache')
+    known.push(
       paths.join(home, '.local', 'bin', 'orca-ide'),
       paths.join(cache, 'orca', 'appimage', 'launcher', 'orca-ide'),
-      '/opt/Orca/resources/bin/orca-ide',
-    ]
-  }
-  if (machine.platform === 'darwin') {
+      '/usr/bin/orca-ide',
+      ...['/opt/Orca', '/opt/orca-ide', '/opt/orca'].map((dir) => paths.join(dir, 'resources', 'bin', 'orca-ide')),
+    )
+  } else if (machine.platform === 'darwin') {
     const bundled = paths.join('Orca.app', 'Contents', 'Resources', 'bin', 'orca')
-    return [
+    known.push(
       '/usr/local/bin/orca',
       paths.join(home, '.local', 'bin', 'orca'),
       paths.join('/Applications', bundled),
       paths.join(home, 'Applications', bundled),
-    ]
+    )
+  } else {
+    const bundled = paths.join('resources', 'bin', 'orca.exe')
+    const drive = (envValue(machine, 'SYSTEMDRIVE')?.trim() || 'C:').replace(/[\\/]+$/, '')
+    const programFiles = absoluteEnvPath(machine, 'ProgramFiles') ?? `${drive}\\Program Files`
+    known.push(
+      paths.join(await localAppData(machine), 'Programs', 'Orca', bundled),
+      paths.join(programFiles, 'Orca', bundled),
+    )
   }
-  const bundled = paths.join('resources', 'bin', 'orca.exe')
-  const programFiles = absolute('ProgramFiles')
-  return [
-    paths.join(absolute('LOCALAPPDATA') ?? paths.join(home, 'AppData', 'Local'), 'Programs', 'Orca', bundled),
-    ...(programFiles ? [paths.join(programFiles, 'Orca', bundled)] : []),
-  ]
+  return [...new Set(known.map((path) => paths.normalize(path)))]
+}
+
+// The CLI in the resources of the Orca whose executable is `execPath`, or null when `execPath` is not an app's.
+function runningOrcaCli(machine: Pick<Machine, 'platform' | 'execPath'>): string | null {
+  const paths = pathsOf(machine)
+  if (!paths.isAbsolute(machine.execPath)) return null
+  const dir = paths.dirname(machine.execPath)
+  if (machine.platform === 'darwin') {
+    if (paths.basename(dir) !== 'MacOS' || paths.basename(paths.dirname(dir)) !== 'Contents') return null
+    return paths.join(paths.dirname(dir), 'Resources', 'bin', 'orca')
+  }
+  return paths.join(dir, 'resources', 'bin', machine.platform === 'win32' ? 'orca.exe' : 'orca-ide')
 }
 
 export async function findOrcaCli(machine: Machine, options: { timeoutMs?: number } = {}): Promise<OrcaCliSearch> {
@@ -140,7 +160,7 @@ export async function findOrcaCli(machine: Machine, options: { timeoutMs?: numbe
   const inPath = await attempt('PATH', name, resolveCommand(machine, name))
   if (inPath) return inPath
 
-  for (const path of knownOrcaCliPaths(machine)) {
+  for (const path of await knownOrcaCliPaths(machine)) {
     const found = await attempt('known path', path, machine.isRunnableFile(path) ? path : null)
     if (found) return found
   }

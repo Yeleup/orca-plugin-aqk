@@ -16,17 +16,17 @@ export function isCoordinatorId(value: string): boolean {
 // The id kept in `dataDir`, created there first if the directory has none. Two workers starting at once agree on one
 // id: the file is created only if absent, and whoever loses reads the winner's. A file that holds anything else than an
 // id is never replaced (the id must stay): it is an error with the file's path.
-export function ensureCoordinatorId(
+export async function ensureCoordinatorId(
   machine: Pick<Machine, 'platform' | 'readText' | 'createText'>,
   dataDir: string,
   newId: () => string = randomUUID,
-): string {
+): Promise<string> {
   const file = dataPath(machine, dataDir, COORDINATOR_ID_FILE)
   const stored = machine.readText(file)
   if (stored === null) {
     const id = newId()
     if (!isCoordinatorId(id)) throw new Error(`not a coordinator id: ${id}`)
-    if (machine.createText(file, `${id}\n`)) return id
+    if (await machine.createText(file, `${id}\n`)) return id
   }
   const kept = (stored ?? machine.readText(file) ?? '').trim()
   if (!isCoordinatorId(kept)) throw new Error(`${file} holds no coordinator id; it is kept as it is`)

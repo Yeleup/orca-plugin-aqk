@@ -24,6 +24,8 @@ export type FakeMachineOptions = {
   readonly env?: Env
   readonly homedir?: string
   readonly cwd?: string
+  // The worker's program; by default a Node.js outside any Orca installation.
+  readonly execPath?: string
   // Paths of files the system can run.
   readonly executables?: readonly string[]
   readonly files?: Readonly<Record<string, string>>
@@ -31,6 +33,53 @@ export type FakeMachineOptions = {
   readonly clock?: FakeClock
   // Thrown by createText instead of creating the file.
   readonly createError?: Error
+}
+
+// A Node.js of each system, outside any Orca installation.
+export const FAKE_NODE: Record<Platform, string> = {
+  linux: '/usr/bin/node',
+  darwin: '/usr/local/bin/node',
+  win32: 'C:\\Program Files\\nodejs\\node.exe',
+}
+
+// The variables Orca passes to a trusted-worker (Orca 1.4.274, out/main/index.js of its app.asar: the worker is forked
+// with only these, on Windows under upper-case names with SystemRoot as such, plus GIT_TERMINAL_PROMPT and
+// ELECTRON_RUN_AS_NODE).
+export const ORCA_WORKER_VARIABLES = [
+  'PATH',
+  'HOME',
+  'USERPROFILE',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'TZ',
+  'TMPDIR',
+  'TEMP',
+  'TMP',
+  'XDG_RUNTIME_DIR',
+  'DBUS_SESSION_BUS_ADDRESS',
+  'SSH_AUTH_SOCK',
+  'SYSTEMROOT',
+  'SYSTEMDRIVE',
+  'WINDIR',
+  'COMSPEC',
+  'PATHEXT',
+  'PROCESSOR_ARCHITECTURE',
+  'NUMBER_OF_PROCESSORS',
+]
+
+// The environment a trusted-worker gets from Orca when Orca itself runs with `full`.
+export function orcaWorkerEnv(full: Env, platform: Platform): Env {
+  const byName = new Map<string, string>()
+  for (const [name, value] of Object.entries(full)) {
+    if (value !== undefined) byName.set(platform === 'win32' ? name.toUpperCase() : name, value)
+  }
+  const env: Record<string, string> = {}
+  for (const name of ORCA_WORKER_VARIABLES) {
+    const value = byName.get(name)
+    if (value !== undefined) env[name === 'SYSTEMROOT' && platform === 'win32' ? 'SystemRoot' : name] = value
+  }
+  return { ...env, GIT_TERMINAL_PROMPT: '0', ELECTRON_RUN_AS_NODE: '1' }
 }
 
 // An invented user's home on each system.
@@ -64,13 +113,14 @@ export function fakeMachine(options: FakeMachineOptions): FakeMachine {
     env: options.env ?? {},
     homedir: options.homedir ?? FAKE_HOME[options.platform],
     cwd: options.cwd ?? options.homedir ?? FAKE_HOME[options.platform],
+    execPath: options.execPath ?? FAKE_NODE[options.platform],
     now: () => clock.now(),
     isRunnableFile: (path) => executables.some((file) => same(file, path)),
     readText: (path) => {
       const key = find(path)
       return key === undefined ? null : (files.get(key) ?? null)
     },
-    createText: (path, text) => {
+    createText: async (path, text) => {
       if (options.createError) throw options.createError
       if (find(path) !== undefined) return false
       files.set(path, text)

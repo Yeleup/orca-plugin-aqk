@@ -1,27 +1,24 @@
 // Paths by the rules of the machine's system: the plugin's data directory outside every repository, files in it, and
 // files in a worktree. Every path these functions return uses only the system's separator (`\` on Windows, `/`
 // elsewhere): on Windows a path from git (`C:/Users/…`) and the same path from Orca (`C:\Users\…`) come out alike.
-import { envValue, pathsOf, type Machine } from './machine'
+import { localAppData, xdgHome } from './folders'
+import { pathsOf, type Machine } from './machine'
 
 // The name of the plugin's directory inside the system's place for per-user application data.
 export const DATA_DIRECTORY_NAME = 'orca-agent-queue'
 
 // The plugin's data directory on this computer (TZ «Данные», «Состояние на компьютере»), by the rules of the system:
-// - Windows: %LOCALAPPDATA%\orca-agent-queue (without LOCALAPPDATA: <home>\AppData\Local\…). Local, not Roaming: a
-//   roaming profile would carry the coordinator id of this computer to another one.
+// - Windows: <Local AppData>\orca-agent-queue — the user's Local AppData as Windows names it (folders.ts), by default
+//   <home>\AppData\Local. Local, not Roaming: a roaming profile would carry the coordinator id to another computer.
 // - macOS: ~/Library/Application Support/orca-agent-queue.
 // - Linux: $XDG_DATA_HOME/orca-agent-queue, by default ~/.local/share/orca-agent-queue (XDG Base Directory: a relative
 //   XDG_DATA_HOME is ignored).
-export function dataDirectory(machine: Pick<Machine, 'platform' | 'env' | 'homedir'>): string {
+export async function dataDirectory(machine: Pick<Machine, 'platform' | 'env' | 'homedir' | 'start'>): Promise<string> {
   const paths = pathsOf(machine)
-  const absolute = (name: string) => {
-    const value = envValue(machine, name)?.trim()
-    return value && paths.isAbsolute(value) ? value : undefined
-  }
   let base: string
-  if (machine.platform === 'win32') base = absolute('LOCALAPPDATA') ?? paths.join(machine.homedir, 'AppData', 'Local')
+  if (machine.platform === 'win32') base = await localAppData(machine)
   else if (machine.platform === 'darwin') base = paths.join(machine.homedir, 'Library', 'Application Support')
-  else base = absolute('XDG_DATA_HOME') ?? paths.join(machine.homedir, '.local', 'share')
+  else base = (await xdgHome(machine, 'XDG_DATA_HOME')) ?? paths.join(machine.homedir, '.local', 'share')
   return nativePath(machine, paths.join(base, DATA_DIRECTORY_NAME))
 }
 

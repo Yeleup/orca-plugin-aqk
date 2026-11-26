@@ -2,12 +2,17 @@
 // worker's environment, the home directory, the clock, the few file operations the plugin needs and the start of a
 // process. The worker uses realMachine(); tests put a fake system, environment, clock, files or process start in its
 // place (src/testing/fake-machine.ts), so the rules of every system are checked on any of them.
-import { spawn, type ChildProcess } from 'node:child_process'
-import { accessSync, constants, linkSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+//
+// The environment is the worker's own, and Orca filters it: Orca 1.4.273+ forks a trusted-worker with only PATH, HOME,
+// USERPROFILE, LANG, LC_ALL, LC_CTYPE, TZ, TMPDIR, TEMP, TMP, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, SSH_AUTH_SOCK,
+// SYSTEMROOT, SYSTEMDRIVE, WINDIR, COMSPEC, PATHEXT, PROCESSOR_ARCHITECTURE and NUMBER_OF_PROCESSORS (on Windows with
+// upper-case names, SystemRoot as such), plus GIT_TERMINAL_PROMPT=0 and ELECTRON_RUN_AS_NODE=1. Nothing here may count
+// on another variable being set.
 import { homedir } from 'node:os'
-import { dirname, posix, win32, type PlatformPath } from 'node:path'
-import { cwd, env, platform } from 'node:process'
-import { randomUUID } from 'node:crypto'
+import { posix, win32, type PlatformPath } from 'node:path'
+import { cwd, env, execPath, platform } from 'node:process'
+import { createText, isRunnableFile, readText } from './files'
+import { startProcess } from './process'
 
 export type Platform = 'linux' | 'darwin' | 'win32'
 
@@ -21,8 +26,12 @@ export type StartRequest = {
   readonly env: Env
   // Windows: the arguments go to the process as written (cmd.exe /d /s /c "…"), without Node's quoting.
   readonly windowsVerbatimArguments?: boolean
-  // Stops the process after this many milliseconds; `timedOut` says it was stopped.
+  // Stops the process and the processes it started after this many milliseconds; `timedOut` says it was stopped.
   readonly timeoutMs?: number
+  // A file that gets all the output, both streams in the order they come, as raw bytes.
+  readonly outputFile?: string
+  // How many bytes of each stream the result keeps (its beginning and its end); by default 16 MiB.
+  readonly maxOutput?: number
 }
 
 export type StartOutcome = {
@@ -31,7 +40,7 @@ export type StartOutcome = {
   readonly signal: string | null
   readonly stdout: string
   readonly stderr: string
-  // Each stream keeps its last MAX_OUTPUT characters; true when an earlier part was dropped.
+  // True when the middle of a stream was left out of `stdout` or `stderr` (`outputFile` has it all).
   readonly truncated: boolean
   readonly timedOut: boolean
   // Set when the process could not be started (e.g. ENOENT): Node's code and message.
@@ -42,8 +51,10 @@ export type Machine = {
   readonly platform: Platform
   readonly env: Env
   readonly homedir: string
-  // The worker's working directory: a relative command path counts from here.
+  // The worker's working directory: a relative path without a run's own `cwd` counts from here.
   readonly cwd: string
+  // The program the worker runs in: Orca's own executable (the worker is forked from Orca's main process).
+  readonly execPath: string
   // Milliseconds since the epoch.
   now(): number
   // A regular file this system can run: on Windows any file, elsewhere one with the execute permission.
@@ -52,11 +63,9 @@ export type Machine = {
   readText(path: string): string | null
   // Creates the file with exactly this text unless the file exists, creating its directory first. True when this call
   // created it, false when it was already there; a reader never sees it half written. Throws on any other failure.
-  createText(path: string, text: string): boolean
+  createText(path: string, text: string): Promise<boolean>
   start(request: StartRequest): Promise<StartOutcome>
 }
-
-export const MAX_OUTPUT = 16 * 1024 * 1024
 
 // The rules of this system. Orca runs on macOS, Windows and Linux; any other POSIX system follows Linux's rules.
 export function realPlatform(name: string = platform): Platform {
@@ -70,10 +79,11 @@ export function realMachine(overrides: Partial<Machine> = {}): Machine {
     env: { ...env },
     homedir: homedir(),
     cwd: cwd(),
+    execPath,
     now: () => Date.now(),
     isRunnableFile: (path) => isRunnableFile(path, system),
     readText,
-    createText,
+    createText: (path, text) => createText(path, text),
     start: startProcess,
     ...overrides,
   }
@@ -94,6 +104,12 @@ export function envValue(machine: Pick<Machine, 'platform' | 'env'>, name: strin
   return key === undefined ? undefined : machine.env[key]
 }
 
+// An absolute path from the environment, or undefined (a relative one does not count).
+export function absoluteEnvPath(machine: Pick<Machine, 'platform' | 'env'>, name: string): string | undefined {
+  const value = envValue(machine, name)?.trim()
+  return value && pathsOf(machine).isAbsolute(value) ? value : undefined
+}
+
 // The machine's environment with `extra` on top; on Windows a variable of `extra` replaces the one of any case.
 export function mergeEnv(machine: Pick<Machine, 'platform' | 'env'>, extra: Env = {}): Env {
   const merged: Record<string, string | undefined> = { ...machine.env }
@@ -106,114 +122,4 @@ export function mergeEnv(machine: Pick<Machine, 'platform' | 'env'>, extra: Env 
   return merged
 }
 
-function isRunnableFile(path: string, system: Platform): boolean {
-  try {
-    if (!statSync(path).isFile()) return false
-    if (system !== 'win32') accessSync(path, constants.X_OK)
-    return true
-  } catch {
-    return false
-  }
-}
-
-function readText(path: string): string | null {
-  try {
-    return readFileSync(path, 'utf8')
-  } catch (error) {
-    if (errorCode(error) === 'ENOENT') return null
-    throw error
-  }
-}
-
-// The text goes to a temporary file beside the target first; a hard link then gives it the target's name only if that
-// name is free (the link fails with EEXIST otherwise), so a reader sees the whole text or no file. Where the file
-// system has no hard links, an exclusive create (flag wx) takes the name instead.
-function createText(path: string, text: string): boolean {
-  mkdirSync(dirname(path), { recursive: true })
-  const temporary = `${path}.${randomUUID()}.tmp`
-  writeFileSync(temporary, text, { encoding: 'utf8', flag: 'wx' })
-  try {
-    linkSync(temporary, path)
-    return true
-  } catch (error) {
-    const code = errorCode(error)
-    if (code === 'EEXIST') return false
-    if (code !== 'EPERM' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP' && code !== 'ENOSYS') throw error
-    try {
-      writeFileSync(path, text, { encoding: 'utf8', flag: 'wx' })
-      return true
-    } catch (fallbackError) {
-      if (errorCode(fallbackError) === 'EEXIST') return false
-      throw fallbackError
-    }
-  } finally {
-    try {
-      unlinkSync(temporary)
-    } catch {
-      // Already gone; nothing else uses the temporary name.
-    }
-  }
-}
-
-function startProcess(request: StartRequest): Promise<StartOutcome> {
-  return new Promise((resolve) => {
-    let stdout = ''
-    let stderr = ''
-    let truncated = false
-    let timedOut = false
-    let spawned = false
-    let settled = false
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const keep = (text: string, chunk: string) => {
-      const joined = text + chunk
-      if (joined.length <= MAX_OUTPUT) return joined
-      truncated = true
-      return joined.slice(joined.length - MAX_OUTPUT)
-    }
-    const finish = (outcome: Pick<StartOutcome, 'code' | 'signal' | 'startError'>) => {
-      if (settled) return
-      settled = true
-      if (timer !== undefined) clearTimeout(timer)
-      resolve({ ...outcome, stdout, stderr, truncated, timedOut })
-    }
-    let child: ChildProcess
-    try {
-      child = spawn(request.file, request.args, {
-        cwd: request.cwd,
-        env: { ...request.env },
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true,
-        windowsVerbatimArguments: request.windowsVerbatimArguments === true,
-      })
-    } catch (error) {
-      finish({ code: null, signal: null, startError: { code: errorCode(error), message: errorMessage(error) } })
-      return
-    }
-    child.stdout?.setEncoding('utf8').on('data', (chunk) => (stdout = keep(stdout, chunk)))
-    child.stderr?.setEncoding('utf8').on('data', (chunk) => (stderr = keep(stderr, chunk)))
-    child.on('spawn', () => {
-      spawned = true
-      if (request.timeoutMs !== undefined) {
-        timer = setTimeout(() => {
-          timedOut = true
-          child.kill('SIGKILL')
-        }, request.timeoutMs)
-      }
-    })
-    child.on('error', (error) => {
-      if (spawned) return
-      finish({ code: null, signal: null, startError: { code: error.code ?? null, message: error.message } })
-    })
-    child.on('close', (code, signal) => finish({ code, signal, startError: null }))
-  })
-}
-
-export function errorCode(error: unknown): string | null {
-  return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
-    ? error.code
-    : null
-}
-
-export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
+export { errorCode, errorMessage } from './errors'
