@@ -101,6 +101,15 @@ export type Comment = {
 
 export type Label = { readonly name: string; readonly color: string; readonly description: string }
 
+// A label set on or taken off an issue, as the issue's timeline keeps it: GitHub's time and the login that did it
+// (null when GitHub no longer knows the account). Not a text: who wrote what is not asked.
+export type LabelEvent = {
+  readonly kind: 'labeled' | 'unlabeled'
+  readonly label: string
+  readonly at: string
+  readonly actor: string | null
+}
+
 // A pull request: its state and branches, no texts.
 export type PullRequest = {
   readonly number: number
@@ -225,6 +234,14 @@ export const Q_RENAMES =
   'repository(owner: $owner, name: $name) { nameWithOwner } node(id: $id) { __typename ... on Issue { repository { nameWithOwner } ' +
   `timelineItems(itemTypes: [RENAMED_TITLE_EVENT], first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } ${RENAME_NODES} } } } }`
 
+// The label events of an issue's timeline, oldest first, page by page.
+const LABEL_EVENT_FIELDS = 'createdAt actor { login } label { name }'
+export const Q_LABEL_EVENTS =
+  'query AqLabelEvents($owner: String!, $name: String!, $number: Int!, $endCursor: String) { viewer { login } ' +
+  'repository(owner: $owner, name: $name) { issueOrPullRequest(number: $number) { __typename ... on Issue { ' +
+  'timelineItems(itemTypes: [LABELED_EVENT, UNLABELED_EVENT], first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } ' +
+  `nodes { __typename ... on LabeledEvent { ${LABEL_EVENT_FIELDS} } ... on UnlabeledEvent { ${LABEL_EVENT_FIELDS} } } } } } } }`
+
 type Variables = Record<string, string | number | readonly string[]>
 
 // A GraphQL read: the user gh ran as, the `data` of every page (each with its `repository`), the arguments.
@@ -310,6 +327,22 @@ export class GitHub {
       if (origin !== 'author') comments.push({ comment: this.commentFromNode(node, issue, read.args), origin })
     }
     return comments
+  }
+
+  // The events of `label` on issue #issue — set on, taken off — oldest first, read whole, with the GitHub user gh runs
+  // as (the queue owner) asked in the same read. Labels are compared without case, as GitHub does.
+  async labelEvents(issue: number, label: string): Promise<{ readonly owner: string; readonly events: LabelEvent[] }> {
+    const read = await this.read(Q_LABEL_EVENTS, { number: positive(issue) }, true)
+    const nodes = this.pagedNodes(read, (data) => field(field(data.repository, 'issueOrPullRequest'), 'timelineItems'))
+    const events = this.shape(read.args, () =>
+      nodes.map((node): LabelEvent => {
+        const kind = node.__typename === 'LabeledEvent' ? 'labeled' : node.__typename === 'UnlabeledEvent' ? 'unlabeled' : null
+        if (kind === null) throw new Error(`not a label event: ${JSON.stringify(node.__typename)}`)
+        const actor = isObject(node.actor) && typeof node.actor.login === 'string' ? node.actor.login : null
+        return { kind, label: text(field(node.label, 'name')), at: text(node.createdAt), actor }
+      }),
+    )
+    return { owner: read.owner, events: events.filter((event) => event.label.toLowerCase() === label.toLowerCase()) }
   }
 
   async listLabels(): Promise<Label[]> {

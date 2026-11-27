@@ -15,7 +15,7 @@
 //   decided by the claims alone.
 import type { Stage } from '../github/check'
 import { GH_TIMEOUT_MS } from '../github/gh'
-import type { Comment, Issue } from '../github/github'
+import type { Comment, Issue, LabelEvent } from '../github/github'
 import type { PluginLabel } from '../github/labels'
 import { parseBody, type Mark, type MarkKind } from '../github/mark'
 
@@ -43,10 +43,10 @@ export const RIGHT_VALID_MS = 30_000
 export const UNSETTLED_MS = 10 * 60_000
 // A deferral (Ф10, «Отложено до <время + 1 ч>») holds this long from its comment.
 export const DEFERRAL_MS = 60 * 60_000
-// How long after a claim a write of a former leader may still land: one admitted by a check made before the claim is
-// sent within RIGHT_VALID_MS and ends with its gh call (GH_TIMEOUT_MS at most), with a minute to spare. Until then a
-// label that disappears may be that write; after it, only a person changes the labels.
-export const LATE_WRITE_MS = RIGHT_VALID_MS + GH_TIMEOUT_MS + 60_000
+// How long after the claim of a count (GitHub's times) a removal of `working` may still be a former leader's write
+// admitted before the claim: the check holds RIGHT_VALID_MS, its gh call GH_TIMEOUT_MS at most, and 30 seconds to spare
+// — 3 minutes (decision «Решение по #15: вопрос»).
+export const LATE_WRITE_MS = RIGHT_VALID_MS + GH_TIMEOUT_MS + 30_000
 
 // A comment of the owner with a service mark, in GitHub's order.
 export type MarkedComment = {
@@ -201,6 +201,50 @@ export function stageOf(claims: Claims, count: number, leader: string): Stage | 
     }
   }
   return stage
+}
+
+// Who took `working` off a task whose count `count` this coordinator leads and had the label on for (TZ Ф4: the
+// owner's removal releases the count; a late write of a former leader is set right by the new leader). GitHub does not
+// say who removed a label — the owner and every coordinator write as one login — so the origin is decided by GitHub's
+// data alone, the same at any check, after the wait of a claim and after a restart (decision «Решение по #15: вопрос»):
+// the comments of the task and the events of the label (`read`; null — they could not be read). A late write of a
+// former leader only when all of these hold — T is GitHub's time of the claim of the count:
+// - the count is not the first, and the leader of the count before it released it with a release comment before the
+//   claim of this count in GitHub's order (a plugin takes `working` off only after its own release);
+// - the last event of the label is its removal, and that removal is the first event of the label at T or later (the
+//   label was on at the claim, left from the released count, and nobody set it since);
+// - the removal is at most LATE_WRITE_MS after T, by the login of the queue owner.
+// Any other removal is the owner's (`manual`). `unknown` — the events were not read, or the last one is not a removal:
+// nothing is decided now.
+export type RemovalOrigin = 'late-write' | 'manual' | 'unknown'
+
+export function removalOrigin(
+  claims: Claims,
+  count: number,
+  read: { readonly owner: string; readonly events: readonly LabelEvent[] } | null,
+): RemovalOrigin {
+  if (read === null) return 'unknown'
+  const removal = read.events.at(-1)
+  if (removal === undefined || removal.kind !== 'unlabeled') return 'unknown'
+  const claim = claimsOfCount(claims.marked, count)[0]
+  if (claim === undefined || count <= 1) return 'manual'
+  const previous = claimsOfCount(claims.marked, count - 1)[0]
+  const released =
+    previous !== undefined &&
+    claims.marked.some(
+      (one) =>
+        one.mark.claim === count - 1 &&
+        one.mark.coordinator === previous.mark.coordinator &&
+        isReleaseKind(one.mark.kind) &&
+        one.index > previous.index &&
+        one.index < claim.index,
+    )
+  if (!released) return 'manual'
+  const since = read.events.filter((event) => Date.parse(event.at) >= claim.at)
+  if (since[0] !== removal) return 'manual'
+  if (Date.parse(removal.at) > claim.at + LATE_WRITE_MS) return 'manual'
+  if (removal.actor === null || removal.actor.toLowerCase() !== read.owner.toLowerCase()) return 'manual'
+  return 'late-write'
 }
 
 // The plugin's labels of a claimed target while its count is active: `on` — set (the first of them right after the

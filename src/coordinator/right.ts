@@ -3,7 +3,8 @@
 // the claims. A check holds RIGHT_VALID_MS, and it admits one write: a write whose check is older than that (a sleep of
 // the computer, a long call), whose check already admitted a write, or after whose check another write on the task went
 // out, re-reads first. Not the leader of its count — the action writes nothing, and no later action of that count
-// writes anything either: the count is lost for good once a newer one exists.
+// writes anything either: the count is lost for good once a newer one exists. A coordinator switched off writes nothing
+// either: the switch is asked right before every write.
 //
 // On one coordinator the checks and writes of one task go one at a time (TaskGate), whichever `Right` they come
 // through: two actions started together cannot both pass a check made before a takeover. GitHub gives no conditional
@@ -26,7 +27,9 @@ export type RightCheck = {
 // The action did not write: this coordinator does not lead the count (any more). `leader` and `last` — who leads the
 // last count of the task now, and its number.
 export type Refused = { readonly ok: false; readonly leader: string | null; readonly last: number }
-export type Acted<T> = { readonly ok: true; readonly value: T } | Refused
+// The action did not write: the coordinator of this computer is off.
+export type SwitchedOff = { readonly ok: false; readonly off: true }
+export type Acted<T> = { readonly ok: true; readonly value: T } | Refused | SwitchedOff
 
 export type WriteOptions = {
   // Allow the write on the count this coordinator released itself — the label writes that finish its own release (a
@@ -68,6 +71,8 @@ export class Right {
       readonly now: () => number
       // The task's gate of this coordinator: shared by every Right of the task.
       readonly gate: TaskGate
+      // Whether the coordinator of this computer is still on: asked right before every write; off — nothing written.
+      readonly enabled?: () => Promise<boolean>
     },
   ) {}
 
@@ -101,6 +106,14 @@ export class Right {
     return this.options.gate.run(async () => this.admitted(await this.freshCheck(), write, options))
   }
 
+  private async isOn(): Promise<boolean> {
+    try {
+      return (await this.options.enabled?.()) ?? true
+    } catch {
+      return false
+    }
+  }
+
   private async freshCheck(): Promise<RightCheck | Refused> {
     const lost = this.options.gate.lost.get(this.options.count)
     return lost ?? this.check()
@@ -127,6 +140,7 @@ export class Right {
       }
       return refused
     }
+    if (!(await this.isOn())) return { ok: false, off: true }
     const record = this.made.get(current)
     if (record) record.used = true
     gate.writes++

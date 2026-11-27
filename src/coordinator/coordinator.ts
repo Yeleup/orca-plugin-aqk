@@ -4,21 +4,24 @@
 //
 // 1. reads the project's settings from origin/<base branch> and the owner's open tasks (label `agent-queue`) with
 //    their comments; a failure of either ends the check of this project — it never counts as an empty queue;
-// 2. checks its own claims and counts — also when the project's queue is stopped (Ф9): a claim not complete yet is
-//    completed (the label, the wait, the re-read, the labels of its stage, the start); a claim that lost its count gets
-//    the notice of its leader, once; a count it leads gets the labels of its stage and is released when the owner took
-//    `working` off; a count it led and lost (or released) gets its local handling (the hook `lost`) until that is done;
+// 2. checks its own claims and counts, task by task — also when the project's queue is stopped (Ф9): a claim of the
+//    queue not complete yet is completed (the label, the wait, the re-read, the labels of its stage, the start); a
+//    claim that lost its count gets the notice of its leader, once; a count it leads gets the labels of its stage and
+//    is released when the owner took `working` off (removalOrigin decides who did); a count it led and lost (or
+//    released) gets its local handling (the hook `lost`) until that is done;
 // 3. unless the queue is stopped or the coordinator was switched off meanwhile, takes the oldest task it may take: the
-//    choice on the reading of step 1, then `claimTask` on a fresh reading of the task, which admits it again (its
-//    labels, claims, dependencies and the rules of the choice) — refused, the choice goes on with the next one.
+//    choice on the reading of step 1, then the claim on a fresh reading of the task, which admits it again (its
+//    labels, claims, dependencies and the rules of the choice) — refused, the choice goes on with the next one, and a
+//    task the fresh reading showed taken counts in work.
 //
-// The protocol of counts (`claimTask`) is the same for every target: the claim with the next count; the first label of
-// the target's stage while the count is the last, active one and this coordinator one of its claimants; the re-read
-// REREAD_AFTER_MS after the label was on; the leader — the author of the first claim of the highest count in GitHub's
-// order — brings the labels to its stage and only then starts; the others write the notice «Задачу ведёт <id>» once and
-// nothing more. What may be claimed is the caller's: the strict rules of the queue by default, the caller's own check on
-// the fresh reading otherwise (a closed task with a merge attempt, the «MVP» issue — the tasks `watchdog`, `merge`,
-// `mvp-lead`).
+// The protocol of counts (`claimTask`) is the same for every target: how the claim goes on (who completes it after a
+// failure, the labels of its stage) is kept before it; the claim with the next count; the first label of the target's
+// stage while the count is the last, active one and this coordinator one of its claimants; the re-read REREAD_AFTER_MS
+// after the label was on; the leader — the author of the first claim of the highest count in GitHub's order — brings
+// the labels to its stage and only then starts, once per count; the others write the notice «Задачу ведёт <id>» once
+// and nothing more. What may be claimed is the caller's: the strict rules of the queue by default, the caller's own
+// check on the fresh reading otherwise (a closed task with a merge attempt, the «MVP» issue — the tasks `watchdog`,
+// `merge`, `mvp-lead`). A switched-off coordinator writes nothing new: the switch is asked before every action.
 //
 // The agents of the task are not this module's: the hooks (`started`, `leading`, `lost`) are where the next tasks of
 // the plan start and continue them (`executor`, `watchdog`) and stop them and save their work (`saved-work`).
@@ -26,6 +29,7 @@ import type { ProjectRef } from '../agents/agents'
 import { field, type ProjectGitHubSettings, type Stage } from '../github/check'
 import { repositoryRef, type Repository } from '../github/gh'
 import { GitHub, type Comment, type Issue } from '../github/github'
+import { isPluginLabel } from '../github/labels'
 import { parseTaskLines } from '../github/task-lines'
 import { githubSegments } from '../github-texts/catalog'
 import { errorMessage, type Machine } from '../platform/machine'
@@ -41,10 +45,11 @@ import {
   hasLabel,
   isClaimKind,
   isReleaseKind,
-  LATE_WRITE_MS,
   QUEUED,
   readClaims,
+  removalOrigin,
   REREAD_AFTER_MS,
+  RIGHT_VALID_MS,
   SPLIT,
   stageOf,
   WORKING,
@@ -53,6 +58,7 @@ import {
   type Claims,
   type Expectation,
   type MarkedComment,
+  type RemovalOrigin,
   type StageLabels,
 } from './claims'
 import { ClaimJournal, type JournalRecord } from './journal'
@@ -151,9 +157,13 @@ export type ClaimOptions = {
   readonly admit?: (target: ClaimTarget) => string | null | Promise<string | null>
   // The labels of the target's stage (the first of `on` is set right after the claim); the queue's by default.
   readonly labels?: StageLabels
-  // Whether the coordinator of this computer is still on: asked right before the claim is written and before the
-  // agents start.
+  // Whether the coordinator of this computer is still on: asked right before the claim is written and before every
+  // later write of its completion and the start of its agents.
   readonly enabled?: () => Promise<boolean>
+  // Who completes and leads the claim after a failure or a restart: `queue` (by default) — the check of the queue, for
+  // a task of its list; `caller` — the code that claimed it, by calling claimTask again for the same target (a closed
+  // task, the «MVP» issue): the check of the queue then leaves that count alone. Kept with the claim, with `labels`.
+  readonly recovery?: 'queue' | 'caller'
 }
 
 export type ClaimOutcome =
@@ -170,6 +180,8 @@ export type ClaimOutcome =
     }
   // The count ended or a newer one was opened before this claim was complete: nothing more written.
   | { readonly kind: 'yielded'; readonly issue: number; readonly count: number; readonly leader: string | null }
+  // The owner took `working` off before the claim was complete: the count is released, no agents started.
+  | { readonly kind: 'released'; readonly issue: number; readonly count: number }
   // The claim is written, but not complete (its label or its re-read failed): the next check of the queue completes it.
   | { readonly kind: 'incomplete'; readonly issue: number; readonly count: number; readonly error: string }
   // The claim is not seen in the reading (yet): the next check decides by GitHub.
@@ -198,9 +210,10 @@ export type ProjectCheck = {
 }
 
 export type CheckOptions = {
-  // Whether the coordinator of this computer is still on: asked before each project, before each new claim and before
-  // the agents of a completed claim start. Off — the check ends there; a write already sent may finish, and a claim
-  // written already is completed (and its agents start) once the coordinator is on again.
+  // Whether the coordinator of this computer is still on: asked before each project and each task, before each new
+  // claim and right before every new action on a task (a label, a release, a notice, the start of agents, the next
+  // step of a stage). Off — the check ends there; a write already sent may finish, and a claim written already is
+  // completed (and its agents start) once the coordinator is on again.
   readonly enabled?: () => Promise<boolean>
 }
 
@@ -238,6 +251,8 @@ export class Coordinator {
   private readonly options: CoordinatorOptions
   // The checks and writes of each task, one at a time on this coordinator (right.ts).
   private readonly gates = new Map<string, TaskGate>()
+  // The completions of claims under way, by task and count: one at a time.
+  private readonly completions = new Map<string, Promise<ClaimOutcome>>()
 
   constructor(options: CoordinatorOptions) {
     this.options = options
@@ -274,10 +289,17 @@ export class Coordinator {
       return failed(errorMessage(error))
     }
     const touched = new Set<number>()
+    // The active counts this check released (the owner took `working` off): no longer in work.
     const released = new Set<number>()
     const led: number[] = []
+    let off = false
     await this.checkOutside(pass, tasks)
     for (const task of tasks) {
+      // Switched off meanwhile: the check ends between two tasks.
+      if (!(await this.isOn(pass.enabled))) {
+        off = true
+        break
+      }
       try {
         const own = await this.checkOwn(pass, task, touched)
         if (own === 'leads') led.push(task.issue.number)
@@ -287,22 +309,33 @@ export class Coordinator {
         this.log(`${project.name} #${task.issue.number}: ${errorMessage(error)}`)
       }
     }
-    // In work: the tasks with an active claim, by any coordinator — but a count this check released.
-    const inWork = tasks
-      .filter((task) => task.claims.active && !released.has(task.issue.number))
-      .map((task) => task.issue.number)
+    // In work: the tasks with an active claim, by any coordinator — but an active count this check released.
+    const occupied = new Set(
+      tasks.filter((task) => task.claims.active && !released.has(task.issue.number)).map((task) => task.issue.number),
+    )
     const result = (claimed: ClaimOutcome | null, skipped: { issue: number; reason: string }[]): ProjectCheck => ({
       project,
       error: null,
-      inWork,
+      inWork: [...occupied],
       led,
       claimed,
       skipped,
     })
+    if (off) {
+      this.log(`${project.name}: switched off: the check ends here`)
+      return result(null, [])
+    }
     if (await this.queueStopped(project)) return result(null, [])
     const skipped: { issue: number; reason: string }[] = []
-    const now = this.machine.now()
-    const context: ChoiceContext = { project, settings: pass.settings, tasks, inWork, now, phase: 'choice' }
+    const max = pass.settings.maxInProgress
+    const context: ChoiceContext = {
+      project,
+      settings: pass.settings,
+      tasks,
+      inWork: [...occupied],
+      now: this.machine.now(),
+      phase: 'choice',
+    }
     const candidates: TaskView[] = []
     const dependencies = new Map<number, string | null>()
     for (const task of tasks) {
@@ -313,11 +346,23 @@ export class Coordinator {
       else skipped.push({ issue: task.issue.number, reason })
     }
     for (const task of candidates) {
+      const number = task.issue.number
+      // The limit again: a fresh reading of an earlier candidate may have shown it taken meanwhile.
+      const others = [...occupied].filter((one) => one !== number).length
+      if (others >= max) {
+        skipped.push({ issue: number, reason: `limit: ${others} of ${max} in work` })
+        continue
+      }
       // The claim on a fresh reading of the task: admitted again there, or the choice goes on with the next one.
+      const fresh: { claims: Claims | null } = { claims: null }
       const expect = expectationOf(task.claims)
-      const claimed = await this.runClaim(pass, task.issue.number, { kind: 'claim', expect }, context)
+      const claimed = await this.runClaim(pass, number, { kind: 'claim', expect }, context, (claims) => {
+        fresh.claims = claims
+      })
       if (claimed.kind === 'not-free' || claimed.kind === 'changed') {
-        skipped.push({ issue: task.issue.number, reason: claimed.reason })
+        skipped.push({ issue: number, reason: claimed.reason })
+        // A count the fresh reading showed active is in work from now on.
+        if (fresh.claims?.active) occupied.add(number)
         if (claimed.reason === SWITCHED_OFF) break
         continue
       }
@@ -327,9 +372,10 @@ export class Coordinator {
     return result(null, skipped)
   }
 
-  // A claim of task #number by the protocol of counts (see the header): `options.kind`, `expect`, `admit`, `labels`.
-  // When this coordinator already leads the target's last count, nothing new is written: a claim of its not complete
-  // yet is completed, a complete one answers `leads`.
+  // A claim of task #number by the protocol of counts (see the header): `options.kind`, `expect`, `admit`, `labels`,
+  // `recovery`. When this coordinator already leads the target's last count, nothing new is written: a claim of its not
+  // complete yet is completed — with the labels kept with that claim —, a complete one answers `leads`. So the caller
+  // that owns the recovery of its claim (`recovery: 'caller'`) completes it after a failure or a restart by asking again.
   async claimTask(project: QueueProject, number: number, options: ClaimOptions = {}): Promise<ClaimOutcome> {
     let pass: Pass
     try {
@@ -350,11 +396,18 @@ export class Coordinator {
 
   // ── The protocol of counts ────────────────────────────────────────────────────────────────────────────────────────
 
-  private async runClaim(pass: Pass, number: number, options: ClaimOptions, context: ChoiceContext): Promise<ClaimOutcome> {
+  // `seen` — every fresh reading of the target's claims, for the choice (a count found active is in work).
+  private async runClaim(
+    pass: Pass,
+    number: number,
+    options: ClaimOptions,
+    context: ChoiceContext,
+    seen?: (claims: Claims) => void,
+  ): Promise<ClaimOutcome> {
     const { github, project, settings } = pass
     const ref = projectRef(project)
     const kind = options.kind ?? 'claim'
-    const profile = options.labels ?? ACTIVE_LABELS
+    const requested = options.labels ?? ACTIVE_LABELS
     const gate = this.gate(pass, number)
     let step: Step<number>
     try {
@@ -362,7 +415,8 @@ export class Coordinator {
       step = await gate.run(async (): Promise<Step<number>> => {
         const target = await this.read(pass, number)
         if ('refused' in target) return { done: { kind: 'not-free', issue: number, reason: target.refused } }
-        const { claims } = target
+        seen?.(target.claims)
+        let claims = target.claims
         // This coordinator leads the last count already: nothing new is written; a claim not complete yet is completed.
         if (claims.active && claims.leader === this.id) {
           if (!this.has(ref, number, claims.last, 'led')) return { next: claims.last }
@@ -377,7 +431,24 @@ export class Coordinator {
           : await this.queueAdmission(pass, target, kind, { ...context, phase: 'claim', now: target.now })
         if (reason !== null) return { done: { kind: 'not-free', issue: number, reason } }
         if (!(await this.isOn(pass.enabled))) return { done: { kind: 'not-free', issue: number, reason: SWITCHED_OFF } }
+        // The admission took longer than a check holds: the claims are read again, and the claim goes on only when they
+        // are as the admission read them.
+        if (this.machine.now() - target.now > RIGHT_VALID_MS) {
+          const again = readClaims(await github.listComments(number))
+          seen?.(again)
+          const changed = changedSince(expectationOf(claims), again)
+          if (changed !== null) {
+            return { done: { kind: 'changed', issue: number, reason: `changed during the admission: ${changed}` } }
+          }
+          claims = again
+        }
         const count = claims.last + 1
+        // How the claim goes on is kept before the claim: who completes it, the labels of its stage.
+        await this.journal.writeProfile(ref, number, count, {
+          recovery: options.recovery ?? 'queue',
+          on: requested.on,
+          off: requested.off,
+        })
         gate.writes++
         await github.comment(number, {
           mark: { kind, coordinator: this.id, claim: count },
@@ -396,17 +467,41 @@ export class Coordinator {
       return { kind: 'failed', issue: number, error: errorMessage(error) }
     }
     if ('done' in step) return step.done
-    return this.completeClaim(pass, number, step.next, profile)
+    return this.completeClaim(pass, number, step.next, requested)
   }
 
-  // The completion of a claim of this coordinator — right after it, and at a later check when it was not complete (a
-  // failed label, a failed re-read, a restart of the worker): the first label of the target's stage while the count is
-  // the last, active one and this coordinator one of its claimants; the wait REREAD_AFTER_MS after the label was on
-  // (`labelled`); the re-read; the leader brings the labels to its stage and starts; another claimant writes the notice.
-  private async completeClaim(pass: Pass, number: number, count: number, profile: StageLabels): Promise<ClaimOutcome> {
+  // The completion of a claim of this coordinator — right after it, and later when it was not complete (a failed label,
+  // a failed re-read, a restart of the worker). One completion of a count at a time on this coordinator: a second one
+  // asked while it runs gets its outcome.
+  private completeClaim(pass: Pass, number: number, count: number, requested: StageLabels): Promise<ClaimOutcome> {
+    const key = `${this.gateKey(pass, number)}:${count}`
+    const running = this.completions.get(key)
+    if (running !== undefined) return running
+    const completion = this.runCompletion(pass, number, count, requested).finally(() => {
+      this.completions.delete(key)
+    })
+    this.completions.set(key, completion)
+    return completion
+  }
+
+  // The completion: with the labels kept with the claim (`profile`; `requested` when none is kept) —
+  // 1. on a fresh reading, while the count is the last, active one and this coordinator one of its claimants, the first
+  //    label of its stage when it was never on for this count (`labelled`); on, but gone since — left for step 3;
+  // 2. the wait REREAD_AFTER_MS after the label was on;
+  // 3. the re-read: another claimant leads — the notice; this coordinator leads — `working` gone meanwhile is decided by
+  //    removalOrigin: the owner's — the count is released, no agents; a former leader's late write — set again; not
+  //    known — the next check decides;
+  // 4. the labels of its stage, then `led` — only the one that creates it — and the start.
+  private async runCompletion(
+    pass: Pass,
+    number: number,
+    count: number,
+    requested: StageLabels,
+  ): Promise<ClaimOutcome> {
     const { github, project } = pass
     const ref = projectRef(project)
     const gate = this.gate(pass, number)
+    const profile = this.keptStage(ref, number, count) ?? requested
     const label = profile.on[0] ?? null
     let first: Step<null>
     try {
@@ -415,12 +510,17 @@ export class Coordinator {
         if ('refused' in target) return { done: { kind: 'not-free', issue: number, reason: target.refused } }
         const ended = this.ended(target.claims, number, count)
         if (ended !== null) return { done: ended }
-        if (label !== null && !hasLabel(target.issue.labels, label)) {
+        if (label === null || hasLabel(target.issue.labels, label)) {
+          await this.record(ref, number, count, 'labelled')
+        } else if (!this.has(ref, number, count, 'labelled')) {
+          if (!(await this.isOn(pass.enabled))) {
+            return { done: this.incomplete(project, number, count, SWITCHED_OFF) }
+          }
           gate.writes++
           await github.addLabels(number, [label])
+          await this.record(ref, number, count, 'labelled')
           this.log(`${project.name} #${number}: ${label} set for the claim of count ${count}`)
         }
-        await this.record(ref, number, count, 'labelled')
         return { next: null }
       })
     } catch (error) {
@@ -447,21 +547,34 @@ export class Coordinator {
       this.log(`${project.name} #${number}: count ${count} is led by ${leader}`)
       return { kind: 'lost', issue: number, count, leader, noticed }
     }
-    // The leader: the labels of its stage on the fresh reading, then the start.
     const right = this.right(pass, number, count)
     let issue = target.issue
     try {
+      if (label === WORKING && !hasLabel(issue.labels, WORKING)) {
+        // Gone while it waited (or since a restart).
+        const origin = await this.removedBy(pass, claims, number, count)
+        if (origin === 'unknown') return this.incomplete(project, number, count, 'who took working off is not known yet')
+        if (origin === 'manual') {
+          if (await this.release(pass, issue, count, right, false)) return { kind: 'released', issue: number, count }
+          return this.incomplete(project, number, count, 'the release was not written')
+        }
+        this.log(`${project.name} #${number}: ${WORKING} was taken off by a late write of a former leader; set again`)
+      }
       const brought = await this.bringLabels(pass, right, issue, profile)
-      if (brought === null) return { kind: 'yielded', issue: number, count, leader: null }
+      if (brought === 'off') return this.incomplete(project, number, count, SWITCHED_OFF)
+      if (brought === 'refused') return { kind: 'yielded', issue: number, count, leader: null }
       issue = brought
     } catch (error) {
       return this.incomplete(project, number, count, `the labels of the stage were not set: ${errorMessage(error)}`)
     }
     // Switched off meanwhile: no agents start; the claim is completed when the coordinator is on again.
     if (!(await this.isOn(pass.enabled))) return this.incomplete(project, number, count, SWITCHED_OFF)
-    if (!(await this.record(ref, number, count, 'led'))) {
+    const lead = await this.recordFirst(ref, number, count, 'led')
+    if (lead === 'failed') {
       return this.incomplete(project, number, count, 'the journal did not take the record of the lead')
     }
+    // Another completion of this count recorded the lead first: it starts the agents, not this one.
+    if (lead === 'exists') return { kind: 'leads', issue: number, count }
     this.log(`${project.name} #${number}: leads count ${count}`)
     const led = this.ledTask(pass, issue, claims, count, right)
     await this.callHook('started', project, number, () => this.hooks.started?.(led))
@@ -482,22 +595,23 @@ export class Coordinator {
   // The notice of a claimant that lost count `count`: «Задачу ведёт <leader>» with the mark `yield` of this coordinator
   // and that count — written once: a notice already on GitHub (also one whose answer was lost) is not written again,
   // and none is needed when the count is no longer the last, active one of that leader. True when no notice is
-  // missing; false when its write failed (the next check writes it).
+  // missing; false when it was not written (a failure, or the coordinator is off: the next check writes it).
   private async noticeLeader(pass: Pass, number: number, count: number, leader: string): Promise<boolean> {
     const { github, settings, project } = pass
     const gate = this.gate(pass, number)
     try {
-      await gate.run(async () => {
+      return await gate.run(async () => {
         const claims = readClaims(await github.listComments(number))
-        if (hasNotice(claims, count, this.id)) return
-        if (claims.last !== count || !claims.active || claims.leader !== leader) return
+        if (hasNotice(claims, count, this.id)) return true
+        if (claims.last !== count || !claims.active || claims.leader !== leader) return true
+        if (!(await this.isOn(pass.enabled))) return false
         gate.writes++
         await github.comment(number, {
           mark: { kind: 'yield', coordinator: this.id, claim: count },
           text: githubSegments(settings.language, 'claim.ledBy', { coordinator: field.coordinator(leader) }),
         })
+        return true
       })
-      return true
     } catch (error) {
       this.log(`${project.name} #${number}: the notice «led by ${leader}» was not written: ${errorMessage(error)}`)
       return false
@@ -505,38 +619,54 @@ export class Coordinator {
   }
 
   // The labels of the stage of the count `right` stands for, each write through the right; the issue as it is after
-  // them, or null when the right refused (another coordinator leads).
-  private async bringLabels(pass: Pass, right: Right, issue: Issue, profile: StageLabels): Promise<Issue | null> {
+  // them — `refused` when another coordinator leads, `off` when the coordinator was switched off.
+  private async bringLabels(
+    pass: Pass,
+    right: Right,
+    issue: Issue,
+    profile: StageLabels,
+  ): Promise<Issue | 'refused' | 'off'> {
     const { github, project } = pass
     let labels = [...issue.labels]
     for (const label of profile.on) {
       if (hasLabel(labels, label)) continue
       const set = await right.act(() => github.addLabels(issue.number, [label]))
-      if (!set.ok) return null
+      if (!set.ok) return 'off' in set ? 'off' : 'refused'
       labels = set.value
       this.log(`${project.name} #${issue.number}: ${label} set: the labels of count ${right.count}`)
     }
     for (const label of profile.off) {
       if (!hasLabel(labels, label)) continue
       const removed = await right.act(() => github.removeLabel(issue.number, label))
-      if (!removed.ok) return null
+      if (!removed.ok) return 'off' in removed ? 'off' : 'refused'
       labels = labels.filter((one) => one.toLowerCase() !== label.toLowerCase())
       this.log(`${project.name} #${issue.number}: ${label} taken off: count ${right.count} is in work`)
     }
     return { ...issue, labels }
   }
 
+  // Who took `working` off (claims.ts, removalOrigin), on the events of the label read now; `unknown` when they could
+  // not be read. A release decided already (`releasing`) is written to the end.
+  private async removedBy(pass: Pass, claims: Claims, number: number, count: number): Promise<RemovalOrigin> {
+    if (this.has(projectRef(pass.project), number, count, 'releasing')) return 'manual'
+    try {
+      return removalOrigin(claims, count, await pass.github.labelEvents(number, WORKING))
+    } catch (error) {
+      this.log(`${pass.project.name} #${number}: the events of ${WORKING} were not read: ${errorMessage(error)}`)
+      return 'unknown'
+    }
+  }
+
   // ── Its own claims and counts ─────────────────────────────────────────────────────────────────────────────────────
 
   // Checks `task` for this coordinator (step 2 of the header). `leads` when it leads the task after it, `released` when
-  // it released its count.
+  // it released the task's active count in this check.
   private async checkOwn(pass: Pass, task: TaskView, touched: Set<number>): Promise<'leads' | 'released' | 'none'> {
     const { project, github } = pass
     const ref = projectRef(project)
     const { claims } = task
     const number = task.issue.number
-    let outcome: 'leads' | 'released' | 'none' = 'none'
-    if (await this.handleLost(pass, task, touched)) outcome = 'released'
+    await this.handleLost(pass, task, touched)
     // A claim of its that lost the last count: the notice of the leader, once.
     if (claims.active && claims.leader !== this.id && claimOf(claims, claims.last, this.id) !== undefined) {
       touched.add(number)
@@ -544,72 +674,77 @@ export class Coordinator {
         await this.noticeLeader(pass, number, claims.last, claims.leader as string)
       }
     }
-    if (!claims.active || claims.leader !== this.id) return outcome
+    if (!claims.active || claims.leader !== this.id) return 'none'
     touched.add(number)
     const count = claims.last
+    const kept = this.journal.profile(ref, number, count)
+    // A claim whose caller completes and leads it (recovery `caller`) is not the queue's: the caller asks again.
+    if (kept?.recovery === 'caller') return this.has(ref, number, count, 'led') ? 'leads' : 'none'
     // A claim of its not complete yet: the same completion as right after a claim.
     if (!this.has(ref, number, count, 'led')) {
       const completed = await this.completeClaim(pass, number, count, ACTIVE_LABELS)
-      return completed.kind === 'leads' ? 'leads' : 'none'
+      return completed.kind === 'leads' ? 'leads' : completed.kind === 'released' ? 'released' : 'none'
     }
+    const profile = this.keptStage(ref, number, count) ?? ACTIVE_LABELS
     const right = this.right(pass, number, count)
     let issue = task.issue
-    let readAt = task.readAt
-    if (!hasLabel(issue.labels, WORKING)) {
-      // The labels read with the list may be older: the task is read again before deciding.
-      readAt = this.machine.now()
-      const lookup = await github.getIssue(number)
-      if (lookup.found !== 'owner') return 'none'
-      issue = lookup.issue
+    if (profile.on.includes(WORKING)) {
+      if (!hasLabel(issue.labels, WORKING)) {
+        // The labels read with the list may be older: the task is read again before deciding.
+        const lookup = await github.getIssue(number)
+        if (lookup.found !== 'owner') return 'none'
+        issue = lookup.issue
+      }
+      if (hasLabel(issue.labels, WORKING)) {
+        await this.record(ref, number, count, 'labelled')
+      } else if (!this.has(ref, number, count, 'labelled')) {
+        // Never on for this count (the write after the claim failed): it is set now.
+        const set = await right.act(() => github.addLabels(number, [WORKING]))
+        if (!set.ok) return 'none'
+        await this.record(ref, number, count, 'labelled')
+        issue = { ...issue, labels: set.value }
+      } else {
+        const origin = await this.removedBy(pass, claims, number, count)
+        // Not known now: nothing is done on the task in this check — the next one decides.
+        if (origin === 'unknown') return 'none'
+        if (origin === 'manual') {
+          return (await this.release(pass, issue, count, right, true)) ? 'released' : 'none'
+        }
+        // A former leader's late write: the label of its stage is set again, no comment.
+        const set = await right.act(() => github.addLabels(number, [WORKING]))
+        if (!set.ok) return 'none'
+        issue = { ...issue, labels: set.value }
+        this.log(`${project.name} #${number}: ${WORKING} was taken off by a late write of a former leader; set again`)
+      }
     }
-    const settled = readAt >= (claims.claimAt ?? 0) + LATE_WRITE_MS
-    if (hasLabel(issue.labels, WORKING)) {
-      await this.record(ref, number, count, 'labelled')
-      if (settled) await this.record(ref, number, count, 'confirmed')
-    } else if (
-      this.has(ref, number, count, 'releasing') ||
-      this.has(ref, number, count, 'confirmed') ||
-      claims.last === 1
-    ) {
-      // Taken off by a person: the label was on after every write of a former leader had landed, or the task has no
-      // former leader. The count is released.
-      return (await this.release(pass, issue, count, right)) ? 'released' : 'none'
-    } else {
-      // Gone before the label was confirmed on a task with an earlier count: a late write of a former leader may have
-      // taken it off. The label of its stage is set again; a later removal is the owner's.
-      const set = await right.act(() => github.addLabels(number, [WORKING]))
-      if (!set.ok) return outcome
-      issue = { ...issue, labels: set.value }
-      if (this.machine.now() >= (claims.claimAt ?? 0) + LATE_WRITE_MS) await this.record(ref, number, count, 'confirmed')
-      this.log(`${project.name} #${number}: ${WORKING} was gone before it was confirmed; set again for count ${count}`)
-    }
-    const brought = await this.bringLabels(pass, right, issue, ACTIVE_LABELS)
-    if (brought === null) return outcome
+    const brought = await this.bringLabels(pass, right, issue, profile)
+    if (typeof brought === 'string') return brought === 'off' ? 'leads' : 'none'
+    // The stage goes on only while the coordinator is on.
+    if (!(await this.isOn(pass.enabled))) return 'leads'
     const led = this.ledTask(pass, brought, claims, count, right)
     await this.callHook('leading', project, number, () => this.hooks.leading?.(led))
     return 'leads'
   }
 
-  // Counts it led that are lost or released: their local handling, until it has ended. True when one of them is its
-  // release after the owner took `working` off.
-  private async handleLost(pass: Pass, task: TaskView, touched: Set<number>): Promise<boolean> {
+  // Counts it led that are lost or released: their local handling, until it has ended. A count it ended itself by a
+  // block or a deferral needs none (their tasks handle its agents): it is marked handled at once.
+  private async handleLost(pass: Pass, task: TaskView, touched: Set<number>): Promise<void> {
     const ref = projectRef(pass.project)
     const { claims } = task
     const number = task.issue.number
-    let released = false
     for (const count of this.journal.counts(ref, number)) {
       if (!this.has(ref, number, count, 'led') || this.has(ref, number, count, 'handled')) continue
       if (claims.last === count && claims.leader === this.id && claims.active) continue
       const end = ownEnd(claims, count, this.id)
       const releasedByOwner = end?.mark.kind === 'release' && this.has(ref, number, count, 'releasing')
-      // A count it ended itself by a block or a deferral (their tasks handle its agents) is not lost.
-      if (end !== undefined && !releasedByOwner) continue
+      if (end !== undefined && !releasedByOwner) {
+        await this.record(ref, number, count, 'handled')
+        continue
+      }
       touched.add(number)
-      if (releasedByOwner) released = true
-      else await this.record(ref, number, count, 'yielded')
+      if (!releasedByOwner) await this.record(ref, number, count, 'yielded')
       await this.handleLoss(pass, task.issue, count, releasedByOwner ? 'released-by-owner' : 'newer-count', claims.leader)
     }
-    return released
   }
 
   // The pending local handling of counts of tasks no longer among the open tasks of the queue (closed, or taken out
@@ -635,8 +770,8 @@ export class Coordinator {
 
   // The release of count `count` after the owner took `working` off: the decision is kept (`releasing`) before the
   // release is written, so a write whose answer was lost is found at the next check — the release there — or written
-  // again; then the local handling of the count. True when the release is on GitHub.
-  private async release(pass: Pass, issue: Issue, count: number, right: Right): Promise<boolean> {
+  // again; then, for a count it led (`hook`), the local handling of the count. True when the release is on GitHub.
+  private async release(pass: Pass, issue: Issue, count: number, right: Right, hook: boolean): Promise<boolean> {
     const { github, settings, project } = pass
     const ref = projectRef(project)
     if (!(await this.record(ref, issue.number, count, 'releasing'))) return false
@@ -650,8 +785,8 @@ export class Coordinator {
       }),
     )
     if (!released.ok) return false
-    this.log(`${project.name} #${issue.number}: ${WORKING} was taken off; count ${count} released`)
-    await this.handleLoss(pass, issue, count, 'released-by-owner', this.id)
+    this.log(`${project.name} #${issue.number}: ${WORKING} was taken off by the owner; count ${count} released`)
+    if (hook) await this.handleLoss(pass, issue, count, 'released-by-owner', this.id)
     return true
   }
 
@@ -791,8 +926,12 @@ export class Coordinator {
     return { issue: lookup.issue, comments, claims: readClaims(comments), now: this.machine.now() }
   }
 
+  private gateKey(pass: Pass, issue: number): string {
+    return `${repositoryRef(pass.project.repository).toLowerCase()}#${issue}`
+  }
+
   private gate(pass: Pass, issue: number): TaskGate {
-    const key = `${repositoryRef(pass.project.repository).toLowerCase()}#${issue}`
+    const key = this.gateKey(pass, issue)
     let gate = this.gates.get(key)
     if (gate === undefined) {
       gate = new TaskGate()
@@ -809,7 +948,15 @@ export class Coordinator {
       coordinatorId: this.id,
       now: () => this.machine.now(),
       gate: this.gate(pass, issue),
+      ...(pass.enabled ? { enabled: pass.enabled } : {}),
     })
+  }
+
+  // The labels of the stage kept with the claim of the count, or null when none are kept.
+  private keptStage(project: ProjectRef, issue: number, count: number): StageLabels | null {
+    const kept = this.journal.profile(project, issue, count)
+    if (kept === null) return null
+    return { on: kept.on.filter(isPluginLabel), off: kept.off.filter(isPluginLabel) }
   }
 
   private ledTask(pass: Pass, issue: Issue, claims: Claims, count: number, right: Right): LedTask {
@@ -837,6 +984,21 @@ export class Coordinator {
     } catch (error) {
       this.log(`#${issue}: the journal record ${record} of count ${count} was not written: ${errorMessage(error)}`)
       return false
+    }
+  }
+
+  // A record that only one may create: `created` for the one that did, `exists` for any other.
+  private async recordFirst(
+    project: ProjectRef,
+    issue: number,
+    count: number,
+    record: JournalRecord,
+  ): Promise<'created' | 'exists' | 'failed'> {
+    try {
+      return (await this.journal.write(project, issue, count, record)) ? 'created' : 'exists'
+    } catch (error) {
+      this.log(`#${issue}: the journal record ${record} of count ${count} was not written: ${errorMessage(error)}`)
+      return 'failed'
     }
   }
 

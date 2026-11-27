@@ -3,7 +3,8 @@
 // arguments and standard input, and this fake answers it the way `gh` answers:
 //
 // - `gh api [--hostname H] <REST endpoint>` of one repository and `gh api [--hostname H] graphql` with the plugin's
-//   queries (AqViewer, AqIssues, AqIssue, AqComments) — JSON on stdout, an error text on stderr and a non-zero exit;
+//   queries (AqViewer, AqIssues, AqIssue, AqComments, AqLabelEvents) — JSON on stdout, an error text on stderr and a
+//   non-zero exit;
 // - `gh pr ready N --repo [HOST/]OWNER/REPO [--undo]`.
 //
 // The host is the one gh would use: `--hostname`, else GH_HOST of the environment, else github.com; a call for another
@@ -56,6 +57,15 @@ export type FakeComment = {
 }
 
 export type FakeLabel = { name: string; color: string; description: string }
+
+// A label set on or taken off an issue: GitHub's time and the login that did it.
+export type FakeLabelEvent = {
+  issue: number
+  kind: 'labeled' | 'unlabeled'
+  label: string
+  actor: string | null
+  created_at: string
+}
 
 export type FakePull = {
   number: number
@@ -121,6 +131,8 @@ export class FakeGitHub {
   readonly comments: FakeComment[] = []
   readonly labels: FakeLabel[] = []
   readonly pulls: FakePull[] = []
+  // The label events of every issue, in the order GitHub made them (the API's writes, and `setLabel` of a test).
+  readonly labelEvents: FakeLabelEvent[] = []
   readonly machine: FakeMachine
   private readonly failures: Failure[] = []
   private readonly hooks: { readonly match: (call: FakeGhCall) => boolean; readonly run: () => void; times: number }[] = []
@@ -205,6 +217,17 @@ export class FakeGitHub {
 
   addLabel(name: string, color = 'ededed', description = ''): void {
     this.labels.push({ name, color, description })
+  }
+
+  // A person (`actor`, by default the login gh runs as) sets a label on an issue or takes it off on GitHub: the label
+  // and its event of the timeline.
+  setLabel(issue: number, label: string, on: boolean, actor: string | null = this.login): void {
+    const found = this.issues.find((one) => one.number === issue)
+    if (!found) throw new Error(`no issue #${issue}`)
+    const has = found.labels.includes(label)
+    if (on === has) return
+    found.labels = on ? [...found.labels, label] : found.labels.filter((one) => one !== label)
+    this.labelEvents.push({ issue, kind: on ? 'labeled' : 'unlabeled', label, actor, created_at: this.tick() })
   }
 
   addPull(pull: Partial<FakePull> & { number: number; head: string; base: string; user: string }): FakePull {
@@ -292,7 +315,7 @@ export class FakeGitHub {
         if (!Array.isArray(labels)) return invalid('labels')
         for (const label of labels) {
           if (!this.labels.some((one) => one.name.toLowerCase() === String(label).toLowerCase())) return invalid('labels')
-          if (!issue.labels.includes(String(label))) issue.labels.push(String(label))
+          this.setLabel(issue.number, String(label), true)
         }
         return ok(issue.labels.map((label) => ({ name: label })))
       }
@@ -305,7 +328,7 @@ export class FakeGitHub {
             stderr: 'gh: Label does not exist (HTTP 404)',
           }
         }
-        issue.labels = issue.labels.filter((one) => one !== label)
+        this.setLabel(issue.number, label, false)
         return ok(issue.labels.map((one) => ({ name: one })))
       }
     }
@@ -419,6 +442,26 @@ export class FakeGitHub {
       return this.graphPages(nodes, paginate, this.pageSize, (connection) => ({
         viewer,
         repository: { issueOrPullRequest: { __typename: kind, comments: connection } },
+      }))
+    }
+    if (call.operation === 'AqLabelEvents') {
+      if (!this.issues.some((one) => one.number === number)) {
+        return {
+          code: 1,
+          stderr: `GraphQL: Could not resolve to an issue or pull request with the number of ${number}. (repository.issueOrPullRequest)`,
+        }
+      }
+      const nodes = this.labelEvents
+        .filter((event) => event.issue === number)
+        .map((event) => ({
+          __typename: event.kind === 'labeled' ? 'LabeledEvent' : 'UnlabeledEvent',
+          createdAt: event.created_at,
+          actor: event.actor === null ? null : { login: event.actor },
+          label: { name: event.label },
+        }))
+      return this.graphPages(nodes, paginate, this.pageSize, (connection) => ({
+        viewer,
+        repository: { issueOrPullRequest: { __typename: 'Issue', timelineItems: connection } },
       }))
     }
     if (call.operation === 'AqEdits' || call.operation === 'AqRenames') {
