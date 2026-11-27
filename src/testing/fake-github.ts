@@ -11,8 +11,20 @@
 // memory, with their authors, editors, edit histories and title renames, and changes them on writes. Lists come in
 // pages of `pageSize`, printed one after another like `gh api --paginate` does. A test can make a call fail — with
 // the change made anyway, as when GitHub's answer is lost — or answer what it likes.
+//
+// Several computers can work on one fake GitHub (`computer`): each its own fake machine — its own files, its own data
+// directory, its own record of gh calls — whose gh reaches this GitHub, all on one clock (`clock`). Comments keep the
+// order in which GitHub got them, as GitHub's own order: two coordinators writing at once are ordered by which write
+// came first.
 import type { StartRequest } from '../platform/machine'
-import { fakeMachine, type FakeAnswer, type FakeMachine } from './fake-machine'
+import {
+  fakeClock,
+  fakeMachine,
+  type FakeAnswer,
+  type FakeClock,
+  type FakeMachine,
+  type FakeMachineOptions,
+} from './fake-machine'
 
 export const FAKE_GH = '/usr/bin/gh'
 
@@ -94,6 +106,9 @@ export type FakeGitHubOptions = {
   // How many entries of an edit or rename history come with a list (GitHub: 100); the rest is read page by page.
   readonly historyPage?: number
   readonly env?: Record<string, string>
+  // The clock of GitHub and of every computer on it: what GitHub writes is created at its reading. Without it GitHub
+  // has a clock of its own that moves a minute with each thing it creates, and the machine has another.
+  readonly clock?: FakeClock
 }
 
 export class FakeGitHub {
@@ -110,6 +125,8 @@ export class FakeGitHub {
   private readonly failures: Failure[] = []
   private readonly hooks: { readonly match: (call: FakeGhCall) => boolean; readonly run: () => void; times: number }[] = []
   private clock = Date.UTC(2026, 0, 15, 9, 0, 0)
+  private readonly shared: FakeClock | null
+  private readonly env: Record<string, string>
   private nextComment = 9_000_001
 
   constructor(options: FakeGitHubOptions) {
@@ -118,11 +135,21 @@ export class FakeGitHub {
     this.login = options.login
     this.pageSize = options.pageSize ?? 2
     this.historyPage = options.historyPage ?? 100
-    this.machine = fakeMachine({
+    this.shared = options.clock ?? null
+    this.env = { PATH: '/usr/bin', ...(options.env ?? {}) }
+    this.machine = this.computer()
+  }
+
+  // Another computer on this GitHub: a fake Linux machine of its own (files, data directory, the record of its starts)
+  // whose gh reaches this GitHub, on the shared clock when there is one.
+  computer(options: Partial<Pick<FakeMachineOptions, 'homedir' | 'files' | 'createError'>> = {}): FakeMachine {
+    return fakeMachine({
       platform: 'linux',
-      env: { PATH: '/usr/bin', ...(options.env ?? {}) },
+      env: this.env,
       executables: [FAKE_GH],
       answer: (request) => this.answer(request),
+      ...(this.shared ? { clock: this.shared } : { clock: fakeClock() }),
+      ...options,
     })
   }
 
@@ -196,6 +223,7 @@ export class FakeGitHub {
   }
 
   private tick(): string {
+    if (this.shared) return new Date(this.shared.now()).toISOString()
     this.clock += 60_000
     return new Date(this.clock).toISOString()
   }
@@ -616,7 +644,7 @@ function historyOf(author: string, edits: readonly (string | null)[]): Record<st
 
 // What gh would make of its arguments: the host (--hostname, else GH_HOST, else github.com; `--repo HOST/…` for gh pr),
 // the REST method and endpoint or the GraphQL operation and variables (-f strings, -F numbers, key[]= lists).
-function readCall(request: StartRequest): FakeGhCall {
+export function readCall(request: StartRequest): FakeGhCall {
   const args = request.args
   let method = 'GET'
   let endpoint = ''
