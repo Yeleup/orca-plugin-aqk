@@ -6,7 +6,7 @@ import { FAKE_GH, FakeGitHub, type FakeGhCall, type FakeGitHubOptions } from '..
 import { fakeMachine } from '../testing/fake-machine'
 import { field, type ProjectGitHubSettings } from './check'
 import { GitHubError, parseRepository } from './gh'
-import { GitHub, Q_COMMENTS, Q_EDITS, Q_ISSUE, Q_ISSUES, Q_RENAMES, Q_VIEWER } from './github'
+import { GitHub, Q_COMMENTS, Q_EDITS, Q_ISSUE, Q_ISSUES, Q_LABEL_EVENTS, Q_RENAMES, Q_VIEWER } from './github'
 import { PLUGIN_LABELS } from './labels'
 import { markLine, parseBody, type Finding, type Mark } from './mark'
 import { CheckError } from './mask'
@@ -1030,4 +1030,29 @@ test('шаблон для целого пути скрывает путь и т�
   })
   assert.deepEqual(fake.calls.at(-1)?.input, { body: 'Файл [скрыто]:4, файл src/cart.ts:9' })
   assert.deepEqual(written.rules, ['pattern:1'])
+})
+
+test('история метки задачи: события установки и снятия одной метки со временем GitHub и логином, все страницы; владелец — пользователь gh того же чтения', async () => {
+  const { fake, github } = setup({ pageSize: 2 })
+  fake.addLabel('agent-queue')
+  fake.addLabel('agent-queue:working')
+  fake.addIssue({ number: 7, user: OWNER })
+  await github.addLabels(7, ['agent-queue:working'])
+  fake.setLabel(7, 'agent-queue', true)
+  fake.setLabel(7, 'agent-queue:working', false, GUEST)
+  await github.addLabels(7, ['agent-queue:working'])
+  const read = await github.labelEvents(7, 'Agent-Queue:Working')
+  assert.equal(read.owner, OWNER)
+  assert.deepEqual(
+    read.events.map((event) => [event.kind, event.label, event.actor]),
+    [
+      ['labeled', 'agent-queue:working', OWNER],
+      ['unlabeled', 'agent-queue:working', GUEST],
+      ['labeled', 'agent-queue:working', OWNER],
+    ],
+  )
+  const times = read.events.map((event) => Date.parse(event.at))
+  assert.deepEqual(times, [...times].sort((a, b) => a - b))
+  // Four events of the issue, two to a page: the read follows every page.
+  assert.deepEqual(fake.calls.at(-1)?.args, graphql(Q_LABEL_EVENTS, true, '-F', 'number=7'))
 })

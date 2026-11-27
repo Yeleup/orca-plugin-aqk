@@ -3,7 +3,8 @@
 // arguments and standard input, and this fake answers it the way `gh` answers:
 //
 // - `gh api [--hostname H] <REST endpoint>` of one repository and `gh api [--hostname H] graphql` with the plugin's
-//   queries (AqViewer, AqIssues, AqIssue, AqComments) — JSON on stdout, an error text on stderr and a non-zero exit;
+//   queries (AqViewer, AqIssues, AqIssue, AqComments, AqLabelEvents) — JSON on stdout, an error text on stderr and a
+//   non-zero exit;
 // - `gh pr ready N --repo [HOST/]OWNER/REPO [--undo]`.
 //
 // The host is the one gh would use: `--hostname`, else GH_HOST of the environment, else github.com; a call for another
@@ -11,8 +12,20 @@
 // memory, with their authors, editors, edit histories and title renames, and changes them on writes. Lists come in
 // pages of `pageSize`, printed one after another like `gh api --paginate` does. A test can make a call fail — with
 // the change made anyway, as when GitHub's answer is lost — or answer what it likes.
+//
+// Several computers can work on one fake GitHub (`computer`): each its own fake machine — its own files, its own data
+// directory, its own record of gh calls — whose gh reaches this GitHub, all on one clock (`clock`). Comments keep the
+// order in which GitHub got them, as GitHub's own order: two coordinators writing at once are ordered by which write
+// came first.
 import type { StartRequest } from '../platform/machine'
-import { fakeMachine, type FakeAnswer, type FakeMachine } from './fake-machine'
+import {
+  fakeClock,
+  fakeMachine,
+  type FakeAnswer,
+  type FakeClock,
+  type FakeMachine,
+  type FakeMachineOptions,
+} from './fake-machine'
 
 export const FAKE_GH = '/usr/bin/gh'
 
@@ -44,6 +57,15 @@ export type FakeComment = {
 }
 
 export type FakeLabel = { name: string; color: string; description: string }
+
+// A label set on or taken off an issue: GitHub's time and the login that did it.
+export type FakeLabelEvent = {
+  issue: number
+  kind: 'labeled' | 'unlabeled'
+  label: string
+  actor: string | null
+  created_at: string
+}
 
 export type FakePull = {
   number: number
@@ -94,6 +116,9 @@ export type FakeGitHubOptions = {
   // How many entries of an edit or rename history come with a list (GitHub: 100); the rest is read page by page.
   readonly historyPage?: number
   readonly env?: Record<string, string>
+  // The clock of GitHub and of every computer on it: what GitHub writes is created at its reading. Without it GitHub
+  // has a clock of its own that moves a minute with each thing it creates, and the machine has another.
+  readonly clock?: FakeClock
 }
 
 export class FakeGitHub {
@@ -106,10 +131,14 @@ export class FakeGitHub {
   readonly comments: FakeComment[] = []
   readonly labels: FakeLabel[] = []
   readonly pulls: FakePull[] = []
+  // The label events of every issue, in the order GitHub made them (the API's writes, and `setLabel` of a test).
+  readonly labelEvents: FakeLabelEvent[] = []
   readonly machine: FakeMachine
   private readonly failures: Failure[] = []
   private readonly hooks: { readonly match: (call: FakeGhCall) => boolean; readonly run: () => void; times: number }[] = []
   private clock = Date.UTC(2026, 0, 15, 9, 0, 0)
+  private readonly shared: FakeClock | null
+  private readonly env: Record<string, string>
   private nextComment = 9_000_001
 
   constructor(options: FakeGitHubOptions) {
@@ -118,11 +147,21 @@ export class FakeGitHub {
     this.login = options.login
     this.pageSize = options.pageSize ?? 2
     this.historyPage = options.historyPage ?? 100
-    this.machine = fakeMachine({
+    this.shared = options.clock ?? null
+    this.env = { PATH: '/usr/bin', ...(options.env ?? {}) }
+    this.machine = this.computer()
+  }
+
+  // Another computer on this GitHub: a fake Linux machine of its own (files, data directory, the record of its starts)
+  // whose gh reaches this GitHub, on the shared clock when there is one.
+  computer(options: Partial<Pick<FakeMachineOptions, 'homedir' | 'files' | 'createError'>> = {}): FakeMachine {
+    return fakeMachine({
       platform: 'linux',
-      env: { PATH: '/usr/bin', ...(options.env ?? {}) },
+      env: this.env,
       executables: [FAKE_GH],
       answer: (request) => this.answer(request),
+      ...(this.shared ? { clock: this.shared } : { clock: fakeClock() }),
+      ...options,
     })
   }
 
@@ -180,6 +219,17 @@ export class FakeGitHub {
     this.labels.push({ name, color, description })
   }
 
+  // A person (`actor`, by default the login gh runs as) sets a label on an issue or takes it off on GitHub: the label
+  // and its event of the timeline.
+  setLabel(issue: number, label: string, on: boolean, actor: string | null = this.login): void {
+    const found = this.issues.find((one) => one.number === issue)
+    if (!found) throw new Error(`no issue #${issue}`)
+    const has = found.labels.includes(label)
+    if (on === has) return
+    found.labels = on ? [...found.labels, label] : found.labels.filter((one) => one !== label)
+    this.labelEvents.push({ issue, kind: on ? 'labeled' : 'unlabeled', label, actor, created_at: this.tick() })
+  }
+
   addPull(pull: Partial<FakePull> & { number: number; head: string; base: string; user: string }): FakePull {
     const full: FakePull = {
       title: `PR ${pull.number}`,
@@ -196,6 +246,7 @@ export class FakeGitHub {
   }
 
   private tick(): string {
+    if (this.shared) return new Date(this.shared.now()).toISOString()
     this.clock += 60_000
     return new Date(this.clock).toISOString()
   }
@@ -264,7 +315,7 @@ export class FakeGitHub {
         if (!Array.isArray(labels)) return invalid('labels')
         for (const label of labels) {
           if (!this.labels.some((one) => one.name.toLowerCase() === String(label).toLowerCase())) return invalid('labels')
-          if (!issue.labels.includes(String(label))) issue.labels.push(String(label))
+          this.setLabel(issue.number, String(label), true)
         }
         return ok(issue.labels.map((label) => ({ name: label })))
       }
@@ -277,7 +328,7 @@ export class FakeGitHub {
             stderr: 'gh: Label does not exist (HTTP 404)',
           }
         }
-        issue.labels = issue.labels.filter((one) => one !== label)
+        this.setLabel(issue.number, label, false)
         return ok(issue.labels.map((one) => ({ name: one })))
       }
     }
@@ -391,6 +442,26 @@ export class FakeGitHub {
       return this.graphPages(nodes, paginate, this.pageSize, (connection) => ({
         viewer,
         repository: { issueOrPullRequest: { __typename: kind, comments: connection } },
+      }))
+    }
+    if (call.operation === 'AqLabelEvents') {
+      if (!this.issues.some((one) => one.number === number)) {
+        return {
+          code: 1,
+          stderr: `GraphQL: Could not resolve to an issue or pull request with the number of ${number}. (repository.issueOrPullRequest)`,
+        }
+      }
+      const nodes = this.labelEvents
+        .filter((event) => event.issue === number)
+        .map((event) => ({
+          __typename: event.kind === 'labeled' ? 'LabeledEvent' : 'UnlabeledEvent',
+          createdAt: event.created_at,
+          actor: event.actor === null ? null : { login: event.actor },
+          label: { name: event.label },
+        }))
+      return this.graphPages(nodes, paginate, this.pageSize, (connection) => ({
+        viewer,
+        repository: { issueOrPullRequest: { __typename: 'Issue', timelineItems: connection } },
       }))
     }
     if (call.operation === 'AqEdits' || call.operation === 'AqRenames') {
@@ -616,7 +687,7 @@ function historyOf(author: string, edits: readonly (string | null)[]): Record<st
 
 // What gh would make of its arguments: the host (--hostname, else GH_HOST, else github.com; `--repo HOST/…` for gh pr),
 // the REST method and endpoint or the GraphQL operation and variables (-f strings, -F numbers, key[]= lists).
-function readCall(request: StartRequest): FakeGhCall {
+export function readCall(request: StartRequest): FakeGhCall {
   const args = request.args
   let method = 'GET'
   let endpoint = ''

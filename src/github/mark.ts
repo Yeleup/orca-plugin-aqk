@@ -27,6 +27,8 @@ import { CheckError } from './mask'
 export const MARK_KINDS = [
   'claim',
   'takeover',
+  // A claimant that lost its count to an earlier claim of the same count: «Задачу ведёт <id>» (TZ Ф4).
+  'yield',
   'stage',
   'review-round',
   'test-run',
@@ -176,13 +178,15 @@ export function findByOperation<T extends { readonly body: string }>(
 
 // A mark with exactly the fields of the format, each of its form, in a fixed order; CheckError `bad_field` otherwise.
 // Unknown fields of a newer plugin are left out.
-// The fields each kind needs (TZ Ф4–Ф6, Ф10–Ф12): every progress comment is the coordinator's; a claim, a takeover and
-// what ends a claim (block, deferral, release) name the claim count they belong to (К4.1); a stage its stage; a review
+// The fields each kind needs (TZ Ф4–Ф6, Ф10–Ф12): every progress comment is the coordinator's; a claim, a takeover,
+// the yield of a claimant that lost its count and what ends a claim (block, deferral, release) name the claim count they
+// belong to (К4.1); a stage its stage; a review
 // round its round and the SHA reviewed (with the verdict and findings, below); a test run its claim (with the run,
 // below); the start and end of an operation its operation id.
 const REQUIRED: Record<MarkKind, readonly ('coordinator' | 'claim' | 'operation' | 'stage' | 'round' | 'sha')[]> = {
   claim: ['coordinator', 'claim'],
   takeover: ['coordinator', 'claim'],
+  yield: ['coordinator', 'claim'],
   stage: ['coordinator', 'claim', 'stage'],
   'review-round': ['coordinator', 'claim', 'round', 'sha'],
   'test-run': ['coordinator', 'claim'],

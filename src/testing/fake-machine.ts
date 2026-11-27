@@ -208,6 +208,8 @@ export function fakeMachine(options: FakeMachineOptions): FakeMachine {
     files,
     links,
     clock,
+    // Its files in memory are its disk: a copy of this machine object works on the same files.
+    disk: files,
   }
 }
 
