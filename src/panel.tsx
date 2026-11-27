@@ -4,6 +4,7 @@
 import { plugin, read, settings, type PanelContext } from 'orca'
 import { LANGUAGE_SETTING } from './i18n/catalog'
 import { isSettingKey } from './settings'
+import { ConnectScreen } from './ui/connect'
 import { language, loadLanguage } from './ui/language'
 import { route } from './ui/navigation'
 import { connectedProjects, QueueScreen } from './ui/queue'
@@ -32,5 +33,6 @@ export default function Panel() {
   const { screen } = read(route)
   if (screen === 'queue') return <QueueScreen />
   if (screen === 'settings') return <SettingsScreen />
+  if (screen === 'connect') return <ConnectScreen />
   return <ScreenFrame screen={screen} />
 }

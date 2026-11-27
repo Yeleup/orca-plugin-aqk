@@ -1,8 +1,20 @@
 // The file operations of the real machine: whether a file can be run, reading a text file and the time of its last
-// write, the entries of a directory, and creating a file only if it is absent, in a way no reader ever sees half
-// written.
+// write, the entries of a directory, creating a file only if it is absent, in a way no reader ever sees half written,
+// and replacing or removing a file only while it holds the text the caller saw.
 import { randomUUID } from 'node:crypto'
-import { accessSync, constants, linkSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import {
+  accessSync,
+  constants,
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  lstatSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { dirname } from 'node:path'
 import { errorCode } from './errors'
 import type { DirectoryEntry, Platform } from './machine'
@@ -88,5 +100,46 @@ export async function createText(path: string, text: string, ops: PublishOps = N
     } catch {
       // Already gone.
     }
+  }
+}
+
+// Replaces the regular file `path` with exactly `text`, only while it holds exactly `expected` (its bytes as UTF-8 text):
+// the new text is written whole to a temporary file beside it, then — in one synchronous step, with nothing awaited
+// between the look and the swap — the file is checked to be a regular file (not a link) holding `expected`, and the
+// temporary file takes its name (a rename within one directory: a reader sees the old text or the new one). True when
+// it was replaced; false — something else is there now, and nothing was changed. Used for the files of a project's main
+// checkout the connection writes or puts back: what another hand wrote meanwhile is never overwritten.
+export function replaceText(path: string, text: string, expected: string): boolean {
+  const temporary = `${path}.${randomUUID()}.tmp`
+  writeFileSync(temporary, text, { encoding: 'utf8', flag: 'wx' })
+  try {
+    if (!holdsText(path, expected)) return false
+    renameSync(temporary, path)
+    return true
+  } finally {
+    try {
+      unlinkSync(temporary)
+    } catch {
+      // Renamed, or already gone.
+    }
+  }
+}
+
+// Removes the regular file `path` only while it holds exactly `expected`: the look and the removal in one synchronous
+// step. True when it was removed; false — something else is there, and nothing was changed.
+export function removeText(path: string, expected: string): boolean {
+  if (!holdsText(path, expected)) return false
+  unlinkSync(path)
+  return true
+}
+
+// Whether `path` is a regular file (not a link) holding exactly `expected`.
+function holdsText(path: string, expected: string): boolean {
+  try {
+    if (!lstatSync(path).isFile()) return false
+    return readFileSync(path, 'utf8') === expected
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return false
+    throw error
   }
 }

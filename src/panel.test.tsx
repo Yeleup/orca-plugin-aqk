@@ -88,7 +88,8 @@ afterEach(async () => {
   view = undefined
 })
 
-/** Mounts the panel over a mock host: the worker answers `projects.list` with `projects` (or by `list`). */
+/** Mounts the panel over a mock host: the worker answers `projects.list` with `projects` (or by `list`), and the
+ *  wizard «Подключение проекта», opened, finds no project to connect. */
 async function open(options: {
   language?: Language
   projects?: Project[]
@@ -97,7 +98,7 @@ async function open(options: {
   const projects = options.projects ?? [SHOP]
   const host = mockHost({
     settings: options.language ? { [LANGUAGE_SETTING]: options.language } : {},
-    requests: { 'projects.list': options.list ?? (() => ({ projects })) },
+    requests: { 'projects.list': options.list ?? (() => ({ projects })), 'connect.projects': { projects: [] } },
   })
   return show(host)
 }
@@ -162,8 +163,9 @@ test('Каркас панели: панель открывается на «Оч
     assert.deepEqual(headings(panel), ['Agent Queue'], `«Назад» с «${screen}» не вернул к «Очереди»`)
     assert.deepEqual(buttons(panel), MENU_RU)
   }
-  // The project list was read once, when the panel opened: moving between screens asks nothing more.
-  assert.deepEqual(requests(panel), [{ name: 'projects.list' }])
+  // The project list was read once, when the panel opened: moving between screens asks nothing more of it. Opening
+  // «Подключение проекта» asks for the projects it may connect.
+  assert.deepEqual(requests(panel), [{ name: 'projects.list' }, { name: 'connect.projects' }])
   assertClean(panel)
 })
 

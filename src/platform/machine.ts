@@ -11,7 +11,7 @@
 import { homedir } from 'node:os'
 import { posix, win32, type PlatformPath } from 'node:path'
 import { cwd, env, execPath, platform } from 'node:process'
-import { createText, isRunnableFile, listEntries, modifiedAt, readText } from './files'
+import { createText, isRunnableFile, listEntries, modifiedAt, readText, removeText, replaceText } from './files'
 import { startProcess } from './process'
 
 export type Platform = 'linux' | 'darwin' | 'win32'
@@ -82,6 +82,13 @@ export type Machine = {
   // Creates the file with exactly this text unless the file exists, creating its directory first. True when this call
   // created it, false when it was already there; a reader never sees it half written. Throws on any other failure.
   createText(path: string, text: string): Promise<boolean>
+  // Replaces the regular file with exactly `text` only while it holds exactly `expected`, the check and the swap in one
+  // step: true when replaced, false when something else is there (nothing changed). A reader sees the old text or the
+  // new one, never a mix. Throws on any other failure.
+  replaceText(path: string, text: string, expected: string): Promise<boolean>
+  // Removes the regular file only while it holds exactly `expected`, the check and the removal in one step: true when
+  // removed, false when something else is there (nothing changed). Throws on any other failure.
+  removeText(path: string, expected: string): Promise<boolean>
   start(request: StartRequest): Promise<StartOutcome>
 }
 
@@ -104,6 +111,8 @@ export function realMachine(overrides: Partial<Machine> = {}): Machine {
     modifiedAt,
     listEntries,
     createText: (path, text) => createText(path, text),
+    replaceText: async (path, text, expected) => replaceText(path, text, expected),
+    removeText: async (path, expected) => removeText(path, expected),
     start: startProcess,
     ...overrides,
   }

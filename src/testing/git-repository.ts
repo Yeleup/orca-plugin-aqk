@@ -10,6 +10,11 @@ import { realMachine } from '../platform/machine'
 import { runProgram } from '../platform/run'
 
 export type TestRepository = {
+  // The temporary directory that holds both.
+  readonly root: string
+  // The environment of the test's own git commands: an empty global configuration of its own, no system one, and an
+  // invented author and committer.
+  readonly env: Readonly<Record<string, string>>
   // The bare repository `origin`.
   readonly origin: string
   // The clone: the project's main checkout.
@@ -26,6 +31,9 @@ export type TestRepository = {
   // Clones origin into a new directory `name` beside the checkout: the project's checkout on another computer, which
   // knows only what origin has. `args` go to `git clone` (e.g. --single-branch --branch develop).
   clone(name: string, args?: readonly string[]): Promise<string>
+  // From now on the test's own git commands reach origin when they name `url` (git's `url.<origin>.insteadOf`, given
+  // in their environment only: the repository's configuration does not get it).
+  reachOriginAs(url: string): void
 }
 
 export type TestRepositoryOptions = {
@@ -44,7 +52,7 @@ export async function withRepository(
   const branch = options.defaultBranch ?? 'main'
   const config = join(root, 'gitconfig')
   writeFileSync(config, '')
-  const env = {
+  const env: Record<string, string> = {
     GIT_CONFIG_GLOBAL: config,
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_AUTHOR_NAME: 'Avery Example',
@@ -68,6 +76,8 @@ export async function withRepository(
     writeFileSync(file, text)
   }
   const repo: TestRepository = {
+    root,
+    env,
     origin,
     checkout,
     git,
@@ -82,6 +92,11 @@ export async function withRepository(
       const branch = target ?? (await git(['symbolic-ref', '--short', 'HEAD'])).trim()
       await git(['push', '--quiet', 'origin', `refs/heads/${branch}:refs/heads/${branch}`])
       await git(['fetch', '--quiet', 'origin'])
+    },
+    reachOriginAs: (url) => {
+      env.GIT_CONFIG_COUNT = '1'
+      env.GIT_CONFIG_KEY_0 = `url.${origin}.insteadOf`
+      env.GIT_CONFIG_VALUE_0 = url
     },
     clone: async (name, args = []) => {
       const dir = join(root, name)

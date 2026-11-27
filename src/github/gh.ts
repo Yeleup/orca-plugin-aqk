@@ -68,6 +68,12 @@ export function repositoryRef(repository: Repository): string {
   return `${repository.host}/${repository.owner}/${repository.name}`
 }
 
+// The REST path of the repository itself.
+export function repositoryRoot(repository: Repository): string {
+  checkRepository(repository)
+  return `repos/${repository.owner}/${repository.name}`
+}
+
 // The REST path of the repository's `rest` (`issues/7/comments` …).
 export function repositoryPath(repository: Repository, rest: string): string {
   checkRepository(repository)
