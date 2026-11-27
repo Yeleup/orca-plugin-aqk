@@ -4,7 +4,7 @@ import { assert, test } from 'orca/testing'
 import type { GithubLanguage } from '../github-texts/catalog'
 import { fencedBlock, inlineCode } from '../markdown'
 import { taskRulesTemplate } from '../project/task-rules'
-import { commonTaskPart, implementerTask, launchPrompt, reviewerTask, type RoleTaskInput } from './task-text'
+import { commonTaskPart, implementerTask, launchPrompt, messageLine, reviewerTask, type RoleTaskInput } from './task-text'
 
 const LANGUAGES: readonly GithubLanguage[] = ['ru', 'en']
 
@@ -122,5 +122,21 @@ test('Подсказка запуска — одна строка с путям�
   // A path with backticks stays whole, in a code span of its own.
   const odd = launchPrompt('en', 'C:\\Users\\Avery\\`odd`\\task.md', 'C:\\Users\\Avery\\`odd`\\report.md')
   assert.equal(odd, 'Your task is in the file ``C:\\Users\\Avery\\`odd`\\task.md``: read it whole and carry it out. The report goes to the file ``C:\\Users\\Avery\\`odd`\\report.md``.')
+  assert.ok(!odd.includes('\n'))
+})
+
+test('Строка сообщения — одна строка на языке проекта с путями файла сообщения и его собственного файла отчёта', () => {
+  const dir = '/Users/avery/Library/Application Support/orca-agent-queue/projects/sample-shop/issue-42/agents/1'
+  assert.equal(
+    messageLine('ru', `${dir}/message-1.md`, `${dir}/report-1.md`),
+    `Сообщение плагина — в файле \`${dir}/message-1.md\`: прочитайте его целиком и выполните. Отчёт о нём — в файл \`${dir}/report-1.md\`.`,
+  )
+  assert.equal(
+    messageLine('en', 'C:\\Users\\Avery\\message-2.md', 'C:\\Users\\Avery\\report-2.md'),
+    'A message from the plugin is in the file `C:\\Users\\Avery\\message-2.md`: read it whole and carry it out. The report on it goes to the file `C:\\Users\\Avery\\report-2.md`.',
+  )
+  // A path with backticks stays whole, in a code span of its own, and the line has no line break.
+  const odd = messageLine('en', '/data/`odd`/message-3.md', '/data/`odd`/report-3.md')
+  assert.equal(odd, 'A message from the plugin is in the file ``/data/`odd`/message-3.md``: read it whole and carry it out. The report on it goes to the file ``/data/`odd`/report-3.md``.')
   assert.ok(!odd.includes('\n'))
 })
