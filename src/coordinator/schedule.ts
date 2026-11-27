@@ -61,6 +61,8 @@ export function startQueueCheck(options: QueueCheckOptions): QueueCheck {
   let timer: unknown = null
   let current: Promise<void> | null = null
   let replanning: Promise<void> | null = null
+  // The interval changed while a wake was under way.
+  let changed = false
   // The end of the last check (the start of the worker before the first one), and the interval read last; null until
   // the settings were read.
   let since = options.now()
@@ -97,6 +99,8 @@ export function startQueueCheck(options: QueueCheckOptions): QueueCheck {
       arm(next - options.now())
     })().finally(() => {
       current = null
+      // The interval changed while this wake read the settings or checked: plan again by the new one.
+      if (changed) replan()
     })
   }
 
@@ -111,17 +115,23 @@ export function startQueueCheck(options: QueueCheckOptions): QueueCheck {
     }
   }
 
-  // A new interval moves the planned check at once; a check under way plans the next one by itself when it ends.
-  const listening = options.settings.onDidChange((change) => {
-    if (change.key !== SETTING_KEYS.queueCheckInterval || stopped || current !== null) return
-    const replan: Promise<void> = plan()
+  // A new interval moves the planned check at once; while a wake is under way, once it has ended.
+  const replan = () => {
+    changed = false
+    if (stopped) return
+    const one: Promise<void> = plan()
       .then((due) => {
         if (current === null) arm(due - options.now())
       })
       .finally(() => {
-        if (replanning === replan) replanning = null
+        if (replanning === one) replanning = null
       })
-    replanning = replan
+    replanning = one
+  }
+  const listening = options.settings.onDidChange((change) => {
+    if (change.key !== SETTING_KEYS.queueCheckInterval || stopped) return
+    if (current !== null) changed = true
+    else replan()
   })
 
   arm(MIN_INTERVAL_MINUTES * MINUTE_MS)
