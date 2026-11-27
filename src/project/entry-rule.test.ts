@@ -47,11 +47,10 @@ test('правило входа: старый блок заменяется на
   assert.equal(entryRuleIn(crlf.text), BLOCK)
 })
 
-test('правило входа: маркер без пары → проблема, файл не меняется', () => {
-  for (const text of [`текст\n${ENTRY_RULE_BEGIN} -->\nбез конца\n`, `текст\n${ENTRY_RULE_END}\n`]) {
-    const placed = placeEntryRule(text, BLOCK)
-    assert.equal(placed.ok, false, text)
-  }
+test('правило входа: маркер без пары → проблема с кодом, файл не меняется', () => {
+  assert.deepEqual(placeEntryRule(`текст\n${ENTRY_RULE_BEGIN} -->\nбез конца\n`, BLOCK), { ok: false, problem: 'begin-alone' })
+  assert.deepEqual(placeEntryRule(`текст\n${ENTRY_RULE_END}\n`, BLOCK), { ok: false, problem: 'end-alone' })
+  assert.deepEqual(placeEntryRule(`${ENTRY_RULE_BEGIN} -->\n${ENTRY_RULE_BEGIN} -->\n${ENTRY_RULE_END}\n`, BLOCK), { ok: false, problem: 'begin-again' })
 })
 
 test('правило входа: байты вне блока не меняются — BOM, смешанные LF и CRLF, строка без перевода в конце; окончания выбираются только для своего блока', () => {
@@ -62,4 +61,11 @@ test('правило входа: байты вне блока не меняют�
   const old = `${ENTRY_RULE_BEGIN} old -->\r\nстарое правило\nещё\r\n${ENTRY_RULE_END}`
   const replaced = placeEntryRule(`﻿до\n${old}\r\nпосле\n`, BLOCK)
   assert.deepEqual(replaced, { ok: true, text: `﻿до\n${BLOCK.split('\n').join('\r\n')}\r\nпосле\n` })
+})
+
+test('правило входа: BOM — префикс файла, а не часть первой строки: он остаётся первым и когда блок, который заменяется, открывает файл', () => {
+  const old = `${ENTRY_RULE_BEGIN} old -->\nстарое правило\n${ENTRY_RULE_END}`
+  assert.deepEqual(placeEntryRule(`\uFEFF${old}\nтекст проекта\n`, BLOCK), { ok: true, text: `\uFEFF${BLOCK}\nтекст проекта\n` })
+  assert.deepEqual(placeEntryRule(`\uFEFFтекст проекта\n${old}\n`, BLOCK), { ok: true, text: `\uFEFFтекст проекта\n${BLOCK}\n` })
+  assert.deepEqual(placeEntryRule(`\uFEFF${ENTRY_RULE_END}\n`, BLOCK), { ok: false, problem: 'end-alone' })
 })

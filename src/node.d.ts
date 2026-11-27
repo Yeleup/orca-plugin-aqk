@@ -33,6 +33,7 @@ declare module 'node:fs' {
   }
   export const constants: { readonly F_OK: number; readonly X_OK: number }
   export function statSync(path: string): Stats
+  export function lstatSync(path: string): Stats
   export function accessSync(path: string, mode?: number): void
   export function existsSync(path: string): boolean
   export function mkdirSync(path: string, options?: { recursive?: boolean }): string | undefined

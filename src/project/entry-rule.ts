@@ -55,7 +55,11 @@ export function entryRuleBlock(language: GithubLanguage, repository: string): st
   ].join('\n')
 }
 
-export type PlacedEntryRule = { readonly ok: true; readonly text: string } | { readonly ok: false; readonly problem: string }
+// Why the block cannot be placed: an opening marker again before the closing one, a closing marker with no opening one
+// before it, an opening marker with no closing one after it.
+export type UnpairedMarker = 'begin-again' | 'end-alone' | 'begin-alone'
+
+export type PlacedEntryRule = { readonly ok: true; readonly text: string } | { readonly ok: false; readonly problem: UnpairedMarker }
 
 // A line of a text with its own line ending ('' for a last line without one).
 type Line = { readonly body: string; readonly end: string }
@@ -81,9 +85,14 @@ function linesOf(text: string): Line[] {
 // a line ending chosen: that of its opening marker it replaces, or that of the file's last line (its first line ending
 // when the last has none, LF in a file without any). A marker without its pair (an opening line without its closing
 // one after it, or a closing line without an opening one before it) is a problem: what belongs to the block cannot be
-// told, and nothing is written.
+// told, and nothing is written. A UTF-8 byte order mark is the file's prefix, not part of its first line: it stays first
+// also when the block it replaces opens the file.
 export function placeEntryRule(current: string | null, block: string): PlacedEntryRule {
   if (current === null || current === '') return { ok: true, text: `${block}\n` }
+  if (current.startsWith('\uFEFF')) {
+    const placed = placeEntryRule(current.slice(1), block)
+    return placed.ok ? { ok: true, text: `\uFEFF${placed.text}` } : placed
+  }
   const lines = linesOf(current)
   const blockLines = block.split('\n')
   const withEnding = (end: string) => blockLines.map((line) => `${line}${end}`).join('')
@@ -93,12 +102,12 @@ export function placeEntryRule(current: string | null, block: string): PlacedEnt
   for (const line of lines) {
     const trimmed = line.body.trim()
     if (trimmed.startsWith(ENTRY_RULE_BEGIN)) {
-      if (inside !== null) return { ok: false, problem: 'the opening line of the Agent Queue block comes again before its closing line' }
+      if (inside !== null) return { ok: false, problem: 'begin-again' }
       inside = line
       continue
     }
     if (trimmed === ENTRY_RULE_END) {
-      if (inside === null) return { ok: false, problem: 'the closing line of the Agent Queue block has no opening line before it' }
+      if (inside === null) return { ok: false, problem: 'end-alone' }
       // The block takes the line ending of its opening marker; its last line keeps the closing marker's own.
       if (!placed) out += withEnding(inside.end || '\n').slice(0, -(inside.end || '\n').length) + line.end
       placed = true
@@ -107,7 +116,7 @@ export function placeEntryRule(current: string | null, block: string): PlacedEnt
     }
     if (inside === null) out += line.body + line.end
   }
-  if (inside !== null) return { ok: false, problem: 'the opening line of the Agent Queue block has no closing line after it' }
+  if (inside !== null) return { ok: false, problem: 'begin-alone' }
   if (placed) return { ok: true, text: out }
   const last = lines[lines.length - 1]
   const eol = last?.end || lines.find((line) => line.end !== '')?.end || '\n'

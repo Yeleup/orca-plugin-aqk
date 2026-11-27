@@ -8,10 +8,12 @@
 //   (`https://<host>/<owner>/<name>[.git]`, `ssh://git@<host>[:port]/<owner>/<name>[.git]` or
 //   `git@<host>:<owner>/<name>[.git]`, on github.com — or ssh.github.com — or a GitHub Enterprise Cloud host
 //   `*.ghe.com`); no `origin`, or one that is not such a URL — «нет удалённого репозитория GitHub». The URL is taken as
-//   configured, before any `url.*.insteadOf` rewrite: that is the repository the owner named. A push of `origin` must
-//   go where its fetch comes from: every `remote.origin.url` and `remote.origin.pushurl` names that same repository (in
-//   any of the forms above), and the addresses git really uses after its rewrites — each push address against the fetch
-//   address — are the same address or name the same GitHub repository; otherwise `push-elsewhere`. The base branches
+//   configured, before any `url.*.insteadOf` rewrite: that is the repository the owner named, and the one gh checks
+//   and writes the labels to. Fetch and push of `origin` must reach that very repository: every `remote.origin.url` and
+//   `remote.origin.pushurl` names it (in any of the forms above), and so do the addresses git really uses after its
+//   rewrites (`url.*.insteadOf`, `url.*.pushInsteadOf`) — the fetch address and each push address; otherwise
+//   `push-elsewhere`. These confirmed addresses are what the connection fetches from and pushes to, by URL, not by the
+//   name `origin` read again later (./connect.ts checks them again right before the push). The base branches
 //   the form offers are the branches of `origin` this clone knows; the default one there is the clone's idea of the
 //   repository's default branch (the gh check tells GitHub's own).
 // - gh: `gh` in PATH; the user gh runs as (`gh auth login` done: gh's exit 4 or its «gh auth login» means no login);
@@ -60,12 +62,10 @@ export function sameRepository(a: Repository, b: Repository): boolean {
   return a.host === b.host && a.owner.toLowerCase() === b.owner.toLowerCase() && a.name.toLowerCase() === b.name.toLowerCase()
 }
 
-// Whether two addresses git uses lead to one repository: the same address, or two forms of one GitHub repository.
-function sameTarget(a: string, b: string): boolean {
-  if (a.trim() === b.trim()) return true
-  const left = githubRepositoryOf(a)
-  const right = githubRepositoryOf(b)
-  return left !== null && right !== null && sameRepository(left, right)
+// Whether an address git uses names `repository`.
+function reaches(url: string, repository: Repository): boolean {
+  const named = githubRepositoryOf(url)
+  return named !== null && sameRepository(named, repository)
 }
 
 // The repository as people and `gh --repo` name it: `owner/name` on github.com, `host/owner/name` elsewhere.
@@ -74,7 +74,11 @@ export function repositoryName(repository: Repository): string {
   return repository.host === DEFAULT_HOST ? slug : `${repository.host}/${slug}`
 }
 
-export type GitReading = { readonly check: GitCheck; readonly repository: Repository | null }
+// The addresses of `origin` git really uses, each confirmed to name the repository: the one fetch uses and the one push
+// uses.
+export type OriginUrls = { readonly fetch: string; readonly push: string }
+
+export type GitReading = { readonly check: GitCheck; readonly repository: Repository | null; readonly urls: OriginUrls | null }
 
 function git(machine: Machine, path: string, args: string[]): Promise<RunResult> {
   return runProgram(machine, 'git', args, { cwd: path, timeoutMs: GIT_TIMEOUT_MS, env: { GIT_TERMINAL_PROMPT: '0' } })
@@ -96,43 +100,49 @@ export async function originRepository(machine: Machine, path: string): Promise<
   return urls === null || urls[0] === undefined ? null : githubRepositoryOf(urls[0])
 }
 
+// The addresses `origin` really uses, when every one of them — as configured and after git's rewrites — names
+// `repository`; `elsewhere` when one does not; null when git cannot tell.
+export async function originUrls(machine: Machine, path: string, repository: Repository): Promise<OriginUrls | 'elsewhere' | null> {
+  const urls = await configValues(machine, path, 'remote.origin.url')
+  const pushUrls = await configValues(machine, path, 'remote.origin.pushurl')
+  if (urls === null || pushUrls === null) return null
+  if (![...urls, ...pushUrls].every((url) => reaches(url, repository))) return 'elsewhere'
+  const fetchUrl = await git(machine, path, ['remote', 'get-url', 'origin'])
+  const pushTo = await git(machine, path, ['remote', 'get-url', '--push', '--all', 'origin'])
+  if (fetchUrl.error !== null || fetchUrl.code !== 0 || pushTo.error !== null || pushTo.code !== 0) return null
+  const fetch = fetchUrl.stdout.trim()
+  const pushes = pushTo.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== '')
+  const push = pushes[0]
+  if (push === undefined || !reaches(fetch, repository) || !pushes.every((one) => reaches(one, repository))) return 'elsewhere'
+  return { fetch, push }
+}
+
 // Step 2, git: the project's checkout at `path`.
 export async function checkGit(machine: Machine, path: string): Promise<GitReading> {
   const top = await git(machine, path, ['rev-parse', '--show-toplevel'])
   if (top.error !== null && top.error.kind !== 'not_found') return unchecked(`git: ${top.error.reason}`)
   if (top.error !== null) return unchecked(`git is not installed: ${top.error.reason}`)
-  if (top.code !== 0) return { check: { status: 'problem', problem: 'not-git' }, repository: null }
-  const urls = await configValues(machine, path, 'remote.origin.url')
-  const pushUrls = await configValues(machine, path, 'remote.origin.pushurl')
-  if (urls === null || pushUrls === null) return unchecked('git config of remote.origin failed')
-  const repository = urls[0] === undefined ? null : githubRepositoryOf(urls[0])
-  if (repository === null) return { check: { status: 'problem', problem: 'no-github' }, repository: null }
-  const elsewhere = { check: { status: 'problem', problem: 'push-elsewhere' } as const, repository }
-  for (const url of [...urls, ...pushUrls]) {
-    const named = githubRepositoryOf(url)
-    if (named === null || !sameRepository(named, repository)) return elsewhere
-  }
-  // The addresses git really uses, after url.*.insteadOf and url.*.pushInsteadOf.
-  const fetchUrl = await git(machine, path, ['remote', 'get-url', 'origin'])
-  const pushTo = await git(machine, path, ['remote', 'get-url', '--push', '--all', 'origin'])
-  if (fetchUrl.error !== null || fetchUrl.code !== 0 || pushTo.error !== null || pushTo.code !== 0) {
-    return { check: { status: 'unchecked', error: 'git remote get-url origin failed' }, repository }
-  }
-  const pushes = pushTo.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== '')
-  if (pushes.length === 0 || !pushes.every((push) => sameTarget(push, fetchUrl.stdout))) return elsewhere
+  if (top.code !== 0) return { check: { status: 'problem', problem: 'not-git' }, repository: null, urls: null }
+  const configured = await configValues(machine, path, 'remote.origin.url')
+  if (configured === null) return unchecked('git config of remote.origin failed')
+  const repository = configured[0] === undefined ? null : githubRepositoryOf(configured[0])
+  if (repository === null) return { check: { status: 'problem', problem: 'no-github' }, repository: null, urls: null }
+  const urls = await originUrls(machine, path, repository)
+  if (urls === null) return { check: { status: 'unchecked', error: 'git remote get-url origin failed' }, repository, urls: null }
+  if (urls === 'elsewhere') return { check: { status: 'problem', problem: 'push-elsewhere' }, repository, urls: null }
   try {
     const branches = (await remoteBranches(machine, path)).map((one) => one.branch)
-    if (branches.length === 0) return { check: { status: 'problem', problem: 'no-branches' }, repository }
+    if (branches.length === 0) return { check: { status: 'problem', problem: 'no-branches' }, repository, urls }
     const main = await defaultBranch(machine, path)
     const ordered = [main, ...branches.filter((branch) => branch !== main).sort()]
-    return { check: { status: 'ok', repository: repositoryName(repository), branches: ordered, defaultBranch: main }, repository }
+    return { check: { status: 'ok', repository: repositoryName(repository), branches: ordered, defaultBranch: main }, repository, urls }
   } catch (error) {
-    return { check: { status: 'unchecked', error: errorMessage(error) }, repository }
+    return { check: { status: 'unchecked', error: errorMessage(error) }, repository, urls }
   }
 }
 
 function unchecked(error: string): GitReading {
-  return { check: { status: 'unchecked', error }, repository: null }
+  return { check: { status: 'unchecked', error }, repository: null, urls: null }
 }
 
 // Step 2, gh: for the project's repository.

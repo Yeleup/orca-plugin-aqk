@@ -25,7 +25,7 @@ import {
   writeMarkingHooks,
   type ConnectWorld,
 } from '../testing/connect-world'
-import type { FakeGhCall } from '../testing/fake-github'
+import { readCall, type FakeGhCall } from '../testing/fake-github'
 
 const FOUR = ['.agent-queue.json', '.agent-queue.md', 'AGENTS.md', 'CLAUDE.md']
 const CHOOSE = `choose:local:${SHOP.id}`
@@ -519,7 +519,7 @@ test('Подключение: игнорируемый локальный AGENTS
     const result = await connect(world)
     assert.deepEqual(result, {
       status: 'refused',
-      refusal: { reason: 'file', file: 'AGENTS.md', problem: 'present', detail: 'in the working tree, not in the commit' },
+      refusal: { reason: 'file', file: 'AGENTS.md', problem: 'present', detail: '' },
     })
     assert.equal(readFileSync(join(world.repo.checkout, 'AGENTS.md'), 'utf8'), own, 'локальный AGENTS.md изменён')
     await assertNothingWritten(world, before, 'игнорируемый AGENTS.md')
@@ -532,7 +532,7 @@ test('Подключение: игнорируемый локальный AGENTS
     const absent = await repoState(world)
     assert.deepEqual(await connect(world), {
       status: 'refused',
-      refusal: { reason: 'file', file: 'AGENTS.md', problem: 'ignored', detail: 'git ignores it' },
+      refusal: { reason: 'file', file: 'AGENTS.md', problem: 'ignored', detail: '' },
     })
     await assertNothingWritten(world, absent, 'игнорируемый путь')
   })
@@ -574,7 +574,7 @@ test('Подключение: файл появился в рабочем дер
     const result = await connect(world)
     world.beforeWrite = null
     assert.ok(result.status === 'failed' && result.failure.step === 'files', JSON.stringify(result))
-    assert.deepEqual(result.status === 'failed' && result.failure.step === 'files' ? result.failure.left : null, [])
+    assert.deepEqual(result.status === 'failed' ? result.failure : null, { step: 'files', reason: 'changed', file: 'AGENTS.md', detail: null, left: [] })
     assert.equal(readFileSync(join(world.repo.checkout, 'AGENTS.md'), 'utf8'), 'файл пользователя\n')
     const after = await repoState(world)
     assert.equal(after.head, before.head)
@@ -597,7 +597,10 @@ test('Подключение: пользователь сделал свой к�
     chmodSync(hook, 0o755)
     const result = await connect(world)
     assert.ok(
-      result.status === 'failed' && result.failure.step === 'undo' && (result.failure.push ?? '').includes('pre-receive hook declined'),
+      result.status === 'failed' &&
+        result.failure.step === 'undo' &&
+        result.failure.reason === 'moved' &&
+        (result.failure.push ?? '').includes('pre-receive hook declined'),
       JSON.stringify(result),
     )
     assert.equal((await world.repo.git(['log', '-1', '--format=%s'])).trim(), 'user work', 'коммит пользователя потерян')
@@ -614,7 +617,7 @@ test('Подключение: git add изменил бы новое содер�
     const before = await repoState(world)
     assert.deepEqual(await connect(world), {
       status: 'refused',
-      refusal: { reason: 'file', file: '.agent-queue.json', problem: 'transformed', detail: 'git add would change it (.gitattributes)' },
+      refusal: { reason: 'file', file: '.agent-queue.json', problem: 'transformed', detail: '' },
     })
     await assertNothingWritten(world, before, 'фильтр')
   })
@@ -673,6 +676,11 @@ test('Подключение: пуш origin уходит в другой реп�
         async () => {
           await world.repo.git(['config', '--unset', 'remote.origin.pushurl'])
           await world.repo.git(['config', `url.${bare}.pushInsteadOf`, 'https://github.com/demo-org/shop-demo.git'])
+        },
+        // One rewrite of fetch and push alike, to another GitHub repository: the two agree, but not with gh's.
+        async () => {
+          await world.repo.git(['config', '--unset', `url.${bare}.pushInsteadOf`])
+          await world.repo.git(['config', `url.${otherUrl}.insteadOf`, 'https://github.com/demo-org/shop-demo.git'])
         },
       ]
       for (const setup of setups) {
@@ -914,7 +922,7 @@ test('Подключение, другой хост: проверки и «По�
           () => world.worker.request('connect.checkGh', target),
           () => world.worker.request('connect.checkAgents', target),
           () => world.worker.request('connect.connect', { ...target, form: form() }),
-          () => world.worker.request('connect.wait', target),
+          () => world.worker.request('connect.wait', { ...target, attempt: '7d3c1f2a-0b4e-4c5d-8e6f-1a2b3c4d5e6f' }),
         ]
         for (const ask of asks) await assert.rejects(ask, (error: unknown) => (error as { code?: string }).code === 'invalid_params')
       }
@@ -1075,23 +1083,24 @@ test('Подключение, агенты: после открытия форм
   })
 })
 
-test('Подключение, агенты: все агенты пропали после открытия формы → «ни одного агента» и «Проверить снова», введённое сохранено; список сменился новым агентом → ошибки у ролей и новые варианты, с ним проект подключается', async () => {
+test('Подключение, агенты: все агенты пропали после открытия формы → форма остаётся, ошибки у всех четырёх ролей, «Подключить» недоступна, «Проверить снова»; введённое сохранено; список сменился новым агентом → с ним проект подключается', async () => {
   await withConnectWorld(async (world) => {
     const before = await repoState(world)
     const panel = await openForm(world)
     world.orca.installedAgents = []
     await panel.press({ type: 'Button', text: 'Подключить' })
+    for (const label of ['Исполнитель', 'Ревьюер', 'Решатель', 'Агент старта']) {
+      assert.equal(fieldError(panel, label), 'Выберите агента из тех, кого знает Orca', label)
+    }
     assert.ok(shown(panel).includes('агенты: Orca не нашла на этом компьютере ни одного агента'), shown(panel))
-    assert.equal(connectButton(panel), null)
+    assert.equal(connectButton(panel)?.disabled, true, '«Подключить» доступна без агентов')
     assert.ok(panel.find({ type: 'Button', text: 'Проверить снова' }))
     await assertNothingWritten(world, before, 'агентов нет')
 
     world.orca.installedAgents = [{ id: 'copilot', name: 'Copilot' }]
     await panel.press({ type: 'Button', text: 'Проверить снова' })
     assert.equal(panel.valueOf({ label: 'Команда полных тестов' }), 'make test', 'введённое потеряно')
-    await panel.press({ type: 'Button', text: 'Подключить' })
     for (const label of ['Исполнитель', 'Ревьюер', 'Решатель', 'Агент старта']) {
-      assert.equal(fieldError(panel, label), 'Выберите агента из тех, кого знает Orca', label)
       assert.deepEqual(panel.find({ role: 'combobox', label })?.props.options, [{ value: 'copilot', label: 'Copilot' }], label)
       await panel.select({ role: 'combobox', label }, 'copilot')
     }
@@ -1099,6 +1108,16 @@ test('Подключение, агенты: все агенты пропали �
     assert.deepEqual(headings(panel), ['Проверка проекта'])
     const settings = JSON.parse(await fileOnOrigin(world, '.agent-queue.json')) as { agents: Record<string, string> }
     assert.deepEqual(settings.agents, { implementer: 'copilot', reviewer: 'copilot', solver: 'copilot', start: 'copilot' })
+  })
+})
+
+test('Подключение, агенты: пустой список Orca на первом шаге 2 по-прежнему не открывает форму', async () => {
+  await withConnectWorld(async (world) => {
+    world.orca.installedAgents = []
+    const panel = await openWizard(world)
+    await chooseShop(panel)
+    assert.equal(panel.find({ label: 'Команда полных тестов' }), null)
+    assert.equal(connectButton(panel), null)
   })
 })
 
@@ -1112,6 +1131,7 @@ test('Подключение: проверки идут одна за друго
     path: '/work/shop-demo',
     repository: GITHUB_REPOSITORY,
     kit: false,
+    kitUnknown: false,
     otherHost: false,
   }
   for (const theme of ['light', 'dark'] as const) {
@@ -1177,4 +1197,246 @@ test('Подключение: проверки идут одна за друго
     assert.deepEqual(panel.warnings, [], theme)
     assert.deepEqual(panel.refusals, [], theme)
   }
+})
+
+// ── Review round 2 ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+test('Подключение: пользователь сделал коммит на базовой ветке между проверкой и коммитом мастера → ветка не тронута, коммит пользователя на месте, записанные плагином файлы возвращены, пуша нет', async () => {
+  await withConnectWorld(async (world) => {
+    const source = (await repoState(world)).head
+    let once = false
+    world.beforeWrite = async (path) => {
+      if (once || !path.startsWith(world.repo.checkout)) return
+      once = true
+      await world.repo.git(['commit', '--quiet', '--allow-empty', '-m', 'user work'])
+    }
+    const panel = await openForm(world)
+    await panel.press({ type: 'Button', text: 'Подключить' })
+    world.beforeWrite = null
+    assert.ok(
+      shown(panel).includes('Базовая ветка сдвинулась во время подключения (на ней новый коммит): коммит подключения на неё не поставлен.'),
+      shown(panel),
+    )
+    assert.equal((await world.repo.git(['log', '-1', '--format=%s'])).trim(), 'user work')
+    assert.equal((await world.repo.git(['rev-parse', 'HEAD^'])).trim(), source)
+    const after = await repoState(world)
+    assert.equal(after.status, '', 'остались файлы плагина')
+    assert.equal(after.origin, source, 'что-то запушено')
+  })
+})
+
+test('Подключение: пока шёл отклонённый пуш, пользователь подготовил в индексе правку другого файла → после отмены коммита эта правка в индексе и рабочем дереве на месте', async () => {
+  await withConnectWorld(async (world) => {
+    const source = (await repoState(world)).head
+    const hook = join(world.repo.origin, 'hooks', 'pre-receive')
+    const checkout = world.repo.checkout.replace(/\\/g, '/')
+    writeFileSync(
+      hook,
+      '#!/bin/sh\nunset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES\n' +
+        `printf 'staged\\n' > "${checkout}/README.md"\ngit -C "${checkout}" add README.md\nprintf 'worktree\\n' > "${checkout}/README.md"\nexit 1\n`,
+    )
+    chmodSync(hook, 0o755)
+    const result = await connect(world)
+    assert.equal(result.status, 'pushRejected', JSON.stringify(result))
+    assert.equal((await world.repo.git(['rev-parse', 'HEAD'])).trim(), source)
+    assert.equal(await world.repo.git(['show', ':README.md']), 'staged\n', 'правка в индексе потеряна')
+    assert.equal(readFileSync(join(world.repo.checkout, 'README.md'), 'utf8'), 'worktree\n')
+    assert.equal(await world.repo.git(['status', '--porcelain']), 'MM README.md\n', 'остались файлы плагина')
+  })
+})
+
+test('Подключение: файл изменили после снимка, прямо перед заменой, и записанный плагином файл — прямо перед его возвратом → поверх правок ничего не записано и не удалено', async () => {
+  await withConnectWorld(async (world) => {
+    await world.repo.commit({ 'CLAUDE.md': '# Заметки\n' }, 'notes')
+    await world.repo.push()
+    const seen = new Map<string, number>()
+    world.beforeWrite = (path) => {
+      if (!path.startsWith(world.repo.checkout)) return
+      const name = path.slice(world.repo.checkout.length + 1)
+      seen.set(name, (seen.get(name) ?? 0) + 1)
+      if (name === 'CLAUDE.md') writeFileSync(path, '# Заметки\nправка пользователя\n')
+      // The second time for .agent-queue.md is its removal: someone wrote into it meanwhile.
+      if (name === '.agent-queue.md' && seen.get(name) === 2) writeFileSync(path, 'правила пользователя\n')
+    }
+    const result = await connect(world)
+    world.beforeWrite = null
+    assert.deepEqual(result.status === 'failed' ? result.failure : result, {
+      step: 'files',
+      reason: 'changed',
+      file: 'CLAUDE.md',
+      detail: null,
+      left: ['.agent-queue.md'],
+    })
+    assert.equal(readFileSync(join(world.repo.checkout, 'CLAUDE.md'), 'utf8'), '# Заметки\nправка пользователя\n')
+    assert.equal(readFileSync(join(world.repo.checkout, '.agent-queue.md'), 'utf8'), 'правила пользователя\n')
+    assert.equal(existsSync(join(world.repo.checkout, '.agent-queue.json')), false, '.agent-queue.json плагина не возвращён')
+    assert.equal(existsSync(join(world.repo.checkout, 'AGENTS.md')), false, 'AGENTS.md записан после отказа')
+  })
+})
+
+test('Подключение: после проверки конфигурацию пуша origin сменили на другой репозиторий → пуша нет ни туда, ни туда, коммит отменён', async () => {
+  await withConnectWorld(async (world) => {
+    const second = mkdtempSync(join(tmpdir(), 'agent-queue-second-'))
+    try {
+      const bare = join(second, 'other.git')
+      await world.repo.git(['init', '--quiet', '--bare', '--initial-branch=main', bare], second)
+      const before = await repoState(world)
+      const otherUrl = 'https://github.com/demo-org/other-shop.git'
+      world.github.before(
+        (call) => call.method === 'POST' && call.path.endsWith('/labels'),
+        () => {
+          writeFileSync(join(world.repo.checkout, '.git', 'config'), `${readFileSync(join(world.repo.checkout, '.git', 'config'), 'utf8')}[remote "origin"]\n\tpushurl = ${otherUrl}\n[url "${bare.replace(/\\/g, '/')}"]\n\tinsteadOf = ${otherUrl}\n`)
+        },
+      )
+      const result = await connect(world)
+      assert.ok(result.status === 'failed' && result.failure.step === 'push-address', JSON.stringify(result))
+      assert.equal((await world.repo.git(['for-each-ref'], bare)).trim(), '', 'запушено в другой репозиторий')
+      const after = await repoState(world)
+      assert.equal(after.head, before.head)
+      assert.equal(after.origin, before.origin)
+      assert.equal(after.status, '')
+    } finally {
+      rmSync(second, { recursive: true, force: true })
+    }
+  })
+})
+
+test('Подключение: базовую ветку удалили в origin (и отдельно — перемотали на предка) после fetch, пока запись меток задержана → пуш отклонён, ветка не создана и не сдвинута, коммит отменён', async () => {
+  await withConnectWorld(async (world) => {
+    const start = (await repoState(world)).head
+    await world.repo.commit({ 'src/app.txt': 'приложение\n' }, 'app')
+    await world.repo.push()
+    const source = (await repoState(world)).head
+    const labelPost = (call: FakeGhCall) => call.method === 'POST' && call.path.endsWith('/labels')
+    const heldLabels = () => world.starts.some((one) => /(^|[\\/])gh(\.exe)?$/.test(one.file) && labelPost(readCall(one)))
+    for (const [what, change, check] of [
+      [
+        'удалена',
+        () => world.repo.git(['update-ref', '-d', 'refs/heads/main'], world.repo.origin),
+        async () => assert.equal((await world.repo.git(['branch', '--list', 'main'], world.repo.origin)).trim(), '', 'ветка создана заново'),
+      ],
+      [
+        'перемотана на предка',
+        () => world.repo.git(['update-ref', 'refs/heads/main', start], world.repo.origin),
+        async () => assert.equal((await world.repo.git(['rev-parse', 'main'], world.repo.origin)).trim(), start, 'ветка сдвинута пушем'),
+      ],
+    ] as const) {
+      await world.repo.git(['update-ref', 'refs/heads/main', source], world.repo.origin)
+      world.starts.splice(0)
+      // The labels are created anew each time, so that their write can be held.
+      world.github.labels.splice(0)
+      const release = world.holdGh(labelPost)
+      const pending = connect(world)
+      await until(heldLabels, `${what}: запись меток не задержана`)
+      await change()
+      release()
+      const result = await pending
+      assert.ok(result.status === 'pushRejected' && result.error.includes('stale info'), `${what}: ${JSON.stringify(result)}`)
+      await check()
+      assert.equal((await world.repo.git(['rev-parse', 'HEAD'])).trim(), source, `${what}: коммит не отменён`)
+      assert.equal(await world.repo.git(['status', '--porcelain']), '', `${what}: остались файлы плагина`)
+    }
+  })
+})
+
+test('Подключение: базовая ветка вне fetch-refspec клона → после подключения проект в projects.list, origin/<база> клона — коммит подключения', async () => {
+  await withConnectWorld(async (world) => {
+    await world.repo.git(['config', 'remote.origin.fetch', '+refs/heads/docs:refs/remotes/origin/docs'])
+    const source = (await repoState(world)).head
+    const panel = await openForm(world)
+    await panel.press({ type: 'Button', text: 'Подключить' })
+    assert.deepEqual(headings(panel), ['Проверка проекта'])
+    const commit = await assertConnected(world, source)
+    assert.equal((await world.repo.git(['rev-parse', 'refs/remotes/origin/main'])).trim(), commit)
+    assert.deepEqual(await world.worker.request('projects.list'), { projects: [SHOP] })
+  })
+})
+
+test('Подключение: .agent-queue/config.json есть, но система не говорит, есть ли он (нет доступа) → проект нельзя выбрать, «Подключить» отказывает, ничего не записано', async () => {
+  await withConnectWorld(async (world) => {
+    await world.repo.commit({ '.agent-queue/config.json': '{ "repo": "demo-org/shop-demo" }\n' }, 'on the kit')
+    await world.repo.push()
+    world.statError = (path) => path.replace(/\\/g, '/').endsWith('.agent-queue/config.json')
+    const before = await repoState(world)
+    const panel = await openWizard(world)
+    assert.ok(shown(panel).includes('Не удалось узнать, на agent-queue-kit ли проект (.agent-queue/config.json недоступен), — подключить его нельзя'), shown(panel))
+    assert.equal(panel.find({ testId: CHOOSE })?.disabled, true)
+    assert.deepEqual(await connect(world), { status: 'refused', refusal: { reason: 'kit-unknown' } })
+    await assertNothingWritten(world, before, 'конфиг кита недоступен')
+    assert.deepEqual(world.github.calls, [])
+  })
+})
+
+test('Подключение, агенты: id агента от Orca совпадает с маской (адрес почты) → ошибка у поля роли без текста совпадения, ничего не записано', async () => {
+  await withConnectWorld(async (world) => {
+    world.orca.installedAgents = [
+      { id: 'claude', name: 'Claude' },
+      { id: 'codex', name: 'Codex' },
+      { id: 'ops-agent@example.com', name: 'Ops Agent' },
+    ]
+    const before = await repoState(world)
+    const panel = await openForm(world)
+    await panel.select({ role: 'combobox', label: 'Ревьюер' }, 'ops-agent@example.com')
+    await panel.press({ type: 'Button', text: 'Подключить' })
+    assert.equal(fieldError(panel, 'Ревьюер'), 'Здесь данные, которые не попадают в GitHub (email)')
+    assert.ok(!shown(panel).includes('ops-agent@example.com'), 'совпадение показано')
+    await assertNothingWritten(world, before, 'id агента под маской')
+  })
+})
+
+test('Подключение: при push.followTags=true и локальном аннотированном теге на исходном коммите в origin уходит только базовая ветка', async () => {
+  await withConnectWorld(async (world) => {
+    await world.repo.git(['config', 'push.followTags', 'true'])
+    await world.repo.git(['tag', '-a', 'v0.1.0', '-m', 'release'])
+    const result = await connect(world)
+    assert.equal(result.status, 'connected', JSON.stringify(result))
+    assert.equal((await world.repo.git(['for-each-ref', '--format=%(refname)', 'refs/tags'], world.repo.origin)).trim(), '', 'тег ушёл в origin')
+    assert.deepEqual(
+      (await world.repo.git(['for-each-ref', '--format=%(refname)'], world.repo.origin)).trim().split('\n'),
+      ['refs/heads/main'],
+    )
+  })
+})
+
+test('Подключение: ответ ожидания — только своей попытки: долгая попытка закончилась, другая попытка того же проекта пришла раньше её ожидания → ожидание первой получает её успех', async () => {
+  await withConnectWorld(
+    async (world) => {
+      const timer = world.timer
+      assert.ok(timer !== null)
+      const release = world.holdGh((call) => call.method === 'POST' && call.path.endsWith('/labels'))
+      const first = connect(world)
+      await until(() => timer.pending() > 0, 'воркер не ждёт окна ответа')
+      timer.fire()
+      const running = await first
+      assert.ok(running.status === 'running', JSON.stringify(running))
+      release()
+      await until(() => world.worker.posts.some((post) => post.event === 'projects.changed'), 'первая попытка не закончилась')
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      const other = await connect(world, { testCommand: 'npm test' })
+      assert.deepEqual(other, { status: 'refused', refusal: { reason: 'connected' } })
+      const waited = await world.worker.request('connect.wait', { projectId: SHOP.id, hostId: SHOP.hostId, attempt: running.status === 'running' ? running.attempt : '' })
+      assert.equal(waited.status, 'connected', JSON.stringify(waited))
+      assert.deepEqual(
+        await world.worker.request('connect.wait', { projectId: SHOP.id, hostId: SHOP.hostId, attempt: 'a2f3c1d0-0000-4000-8000-000000000000' }),
+        { status: 'failed', failure: { step: 'lost' }, operation: null },
+      )
+    },
+    { manualTimer: true },
+  )
+})
+
+test('Подключение: непарный маркер в CLAUDE.md → отказ называет причину по-русски, без английских фраз плагина', async () => {
+  await withConnectWorld(async (world) => {
+    await world.repo.commit({ 'CLAUDE.md': `# Заметки\n${ENTRY_RULE_BEGIN} -->\nбез конца\n` }, 'notes')
+    await world.repo.push()
+    const panel = await openForm(world)
+    await panel.press({ type: 'Button', text: 'Подключить' })
+    assert.ok(
+      shown(panel).includes(
+        'CLAUDE.md: у открывающего маркера блока Agent Queue нет закрывающего после него — неясно, что относится к блоку. Ничего не записано.',
+      ),
+      shown(panel),
+    )
+    assertClean(panel, ['CLAUDE.md'])
+  })
 })

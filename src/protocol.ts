@@ -39,6 +39,8 @@ export type ConnectCandidate = {
   repository: string | null
   /** On agent-queue-kit (`.agent-queue/config.json`): marked «На agent-queue-kit — переход после MVP», never chosen. */
   kit: boolean
+  /** Whether `.agent-queue/config.json` is there could not be told (no access): never chosen. */
+  kitUnknown: boolean
   /** On another host of Orca (`ssh:…`, `runtime:…`): marked with `hostId`, never chosen. */
   otherHost: boolean
 }
@@ -122,17 +124,20 @@ export type ConnectField =
 
 /** A field the owner must fix: `required` — empty; `oneLine` — a command of several lines; `agent` — no agent, or one
  *  Orca does not know now; `number` — not a whole number from 1; `branch-name` — not a git branch name; `no-branch` —
- *  `origin` has no such branch now; `masked` — the mask of the plugin finds data that never goes to GitHub (`detail`
- *  names its rules, never the text); `invalid` — what the check of .agent-queue.json says (`detail`). */
+ *  `origin` has no such branch now; `directory` — a dependency directory not inside the repository; `masked` — the mask
+ *  of the plugin finds data that never goes to GitHub (`detail` names its rules, never the text); `invalid` — what the
+ *  check of .agent-queue.json says (`detail`). */
 export type FieldError = {
   field: ConnectField
-  code: 'required' | 'oneLine' | 'agent' | 'number' | 'branch-name' | 'no-branch' | 'masked' | 'invalid'
+  code: 'required' | 'oneLine' | 'agent' | 'number' | 'branch-name' | 'no-branch' | 'directory' | 'masked' | 'invalid'
   detail: string
 }
 
 /** Why «Подключить» wrote nothing. */
 export type ConnectRefusal =
   | { reason: 'kit' }
+  /** Whether the project is on agent-queue-kit could not be told: nothing is written over a project that may be. */
+  | { reason: 'kit-unknown' }
   | { reason: 'busy' }
   /** The project is connected already: the base branch of `origin` has .agent-queue.json now. */
   | { reason: 'connected' }
@@ -148,15 +153,16 @@ export type ConnectRefusal =
   | { reason: 'ahead'; commits: number; base: string }
   | { reason: 'diverged'; ahead: number; behind: number; base: string }
   /** One of the four files cannot take the plugin's change: `present` — the commit lacks it, but the working tree has
-   *  it (an ignored file, a file made meanwhile); `ignored` — git ignores the path, its file would not be committed;
-   *  `transformed` — git would change its content when adding it (attributes, filters); `not-text` — its content in the
-   *  commit is not UTF-8 text the plugin can keep as it is; `not-file` — not a regular file in the commit;
-   *  `unpaired` — a marker of the plugin's block without its pair; `masked` — the entry rule's block would carry data
-   *  the mask hides (`rules`). */
+   *  it (an ignored file, a file made meanwhile); `differs` — the commit has it, the working tree holds other content;
+   *  `ignored` — git ignores the path, its file would not be committed; `transformed` — git would change its content
+   *  when adding it (attributes, filters); `not-text` — its content in the commit is not UTF-8 text the plugin can keep
+   *  as it is; `not-file` — not a regular file in the commit; `unpaired` — a marker of the plugin's block without its
+   *  pair (`detail`: `begin-again`, `end-alone` or `begin-alone`); `masked` — the entry rule's block would carry data
+   *  the mask hides (`detail`: its rules). */
   | {
       reason: 'file'
       file: string
-      problem: 'present' | 'ignored' | 'transformed' | 'not-text' | 'not-file' | 'unpaired' | 'masked'
+      problem: 'present' | 'differs' | 'ignored' | 'transformed' | 'not-text' | 'not-file' | 'unpaired' | 'masked'
       detail: string
     }
   | { reason: 'journal'; error: string }
@@ -169,18 +175,27 @@ export type CheckoutChange =
   | { kind: 'file'; file: string }
 
 /** Why «Подключить» failed once the operation had begun. `left` — paths the plugin did not put back, since they were
- *  changed after it wrote them. */
+ *  changed after it wrote them. `detail` — what git said, for diagnostics; null when the plugin's own reason says it
+ *  all. */
 export type ConnectFailure =
   | { step: 'labels'; detail: string }
   /** The checkout changed after the checks: none of the files was written. */
   | { step: 'changed'; change: CheckoutChange }
-  | { step: 'files' | 'commit'; detail: string; left: string[] }
+  /** A file could not be written: `changed` — `file` changed in the working tree right before (nothing written over it);
+   *  `error` — the disk refused. The files written before are put back. */
+  | { step: 'files'; reason: 'changed' | 'error'; file: string; detail: string | null; left: string[] }
+  /** The commit could not be made: `moved` — the base branch moved meanwhile (another commit on it), so the operation's
+   *  commit was not put on it; `error` — git failed. The files written are put back. */
+  | { step: 'commit'; reason: 'moved' | 'error'; detail: string | null; left: string[] }
   /** The commit is not the operation's: `what` says how. No push; the plugin's own changes are undone. */
   | { step: 'verify'; what: 'parent' | 'paths' | 'blob' | 'message'; file: string | null; left: string[] }
   /** The push gave no certain answer: it may have reached origin; the commit stays. */
   | { step: 'push-unknown'; detail: string }
-  /** The commit could not be undone after the push was refused: the checkout moved on, or git failed. */
-  | { step: 'undo'; push: string | null; detail: string }
+  /** The push address of `origin` changed after the checks: no push; the commit is undone. */
+  | { step: 'push-address'; left: string[] }
+  /** The commit could not be undone after the push was refused (`push`: git's reason, or null after a failed check):
+   *  `moved` — the base branch is no longer the operation's commit (work of the user on it); `error` — git failed. */
+  | { step: 'undo'; push: string | null; reason: 'moved' | 'error'; detail: string | null }
   | { step: 'unexpected'; detail: string }
   /** The worker knows nothing of the attempt (it was restarted). */
   | { step: 'lost' }
@@ -194,8 +209,8 @@ export type ConnectResult =
   /** The push was rejected: the local commit is undone, the checkout is back on its commit. */
   | { status: 'pushRejected'; error: string; operation: string }
   | { status: 'failed'; failure: ConnectFailure; operation: string | null }
-  /** Still under way: ask again with `connect.wait`. */
-  | { status: 'running'; operation: string | null }
+  /** Still under way: ask again with `connect.wait` and this attempt's id. */
+  | { status: 'running'; attempt: string }
 
 declare module 'orca' {
   interface PluginRequests {
@@ -216,9 +231,9 @@ declare module 'orca' {
     /** «Подключить»: checks everything again, then connects the project (Ф1, point 4). The answer comes within
      *  CONNECT_ANSWER_MS; a connection still under way then answers `running`. */
     'connect.connect': { input: ConnectTarget & { form: ConnectForm }; output: ConnectResult }
-    /** The end of the project's connection under way, within CONNECT_ANSWER_MS (`running` again otherwise); the answer
-     *  of one that ended meanwhile; `failed` with `lost` when the worker knows of none. */
-    'connect.wait': { input: ConnectTarget; output: ConnectResult }
+    /** The end of the attempt `attempt` (the id `running` gave), within CONNECT_ANSWER_MS (`running` again otherwise);
+     *  its answer when it ended meanwhile — never another attempt's; `failed` with `lost` when the worker knows none. */
+    'connect.wait': { input: ConnectTarget & { attempt: string }; output: ConnectResult }
   }
   interface PluginPanelEvents {
     /** Posted to every open panel when the connected projects change: the whole new list. */

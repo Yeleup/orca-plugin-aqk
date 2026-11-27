@@ -120,7 +120,9 @@ test('Каркас панели: воркер отвечает панели на
     const other = await mountWorker(main, { host })
     assert.deepEqual(await other.request('projects.list', undefined, { panel: 'agent-queue' }), { projects: [] })
     assert.deepEqual(await other.request('connect.projects', undefined, { panel: 'agent-queue' }), {
-      projects: [{ id: 'remote-shop', hostId: 'ssh:build-box', name: 'shop-demo', path: '', repository: null, kit: false, otherHost: true }],
+      projects: [
+        { id: 'remote-shop', hostId: 'ssh:build-box', name: 'shop-demo', path: '', repository: null, kit: false, kitUnknown: false, otherHost: true },
+      ],
     })
     assert.deepEqual(other.refusals, [])
     await other.deactivate()

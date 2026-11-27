@@ -10,13 +10,16 @@
 // - `gh` is found in PATH and answered by the fake GitHub (a test may hold a call back: `holdGh`); the CLI of Orca is
 //   found at its known path under the home and answered by the fake Orca; any other `gh`, `orca` or `orca-ide` of this
 //   computer is never found or started;
-// - the project's `origin` looks like a GitHub repository (`https://github.com/demo-org/shop-demo.git`, the owner's
-//   repository the fake GitHub serves) while git reaches the local bare repository through `url.<bare>.insteadOf`.
-//   `github: false` leaves `origin` the local path: no GitHub repository;
+// - the project's `origin` is a GitHub repository (`https://github.com/demo-org/shop-demo.git`, the owner's repository
+//   the fake GitHub serves), as the repository's configuration says and as git resolves it; only the network commands
+//   of git (fetch, push, ls-remote) reach the local bare repository instead — the computer gives each of them
+//   `-c url.<bare>.insteadOf=<GitHub URL>`, and the test's own git commands get the same in their environment. Nothing
+//   of it is in the repository's configuration. `github: false` leaves `origin` the local path: no GitHub repository;
 // - `otherHost` adds a copy of the project with the same id on the host `ssh:build-box` (or the host given), listed by
 //   Orca before the local one: its path is a second real repository of this computer, connected (its `origin` has
 //   .agent-queue.json);
-// - `beforeWrite` runs right before the worker writes a file: someone changes the disk at that moment;
+// - `beforeWrite` runs right before the worker writes or removes a file of the disk (and may wait): someone changes the
+//   disk at that moment; `statError` makes the system refuse to tell whether a path exists (no access);
 // - `manualTimer` gives the worker's answer window of «Подключить» to the test (`timer`): it elapses only when fired.
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -91,8 +94,11 @@ export type ConnectWorld = {
   acceptPushes(): void
   // Holds back the next gh call that `match` until the returned release.
   holdGh(match: (call: FakeGhCall) => boolean): () => void
-  // Runs right before the worker writes a file (createText, replaceText) — someone acts on the disk meanwhile.
-  beforeWrite: ((path: string) => void) | null
+  // Runs right before the worker writes or removes a file (createText, replaceText, removeText) — someone acts on the
+  // disk meanwhile.
+  beforeWrite: ((path: string) => void | Promise<void>) | null
+  // Paths whose existence the system refuses to tell (EACCES of stat).
+  statError: ((path: string) => boolean) | null
 }
 
 export type ConnectWorldOptions = {
@@ -118,9 +124,11 @@ export async function withConnectWorld(body: (world: ConnectWorld) => Promise<vo
 
 async function inWorld(body: (world: ConnectWorld) => Promise<void>, options: ConnectWorldOptions, other: TestRepository | null): Promise<void> {
   await withRepository(async (repo) => {
+    // The worker's own environment: the test's git configuration without the test's way to origin.
+    const env = { ...repo.env }
     if (options.github !== false) {
       await repo.git(['remote', 'set-url', 'origin', GITHUB_URL])
-      await repo.git(['config', `url.${repo.origin}.insteadOf`, GITHUB_URL])
+      repo.reachOriginAs(GITHUB_URL)
       await repo.git(['fetch', '--quiet', 'origin'])
     }
     const home = mkdtempSync(join(tmpdir(), 'agent-queue-connect-home-'))
@@ -135,8 +143,9 @@ async function inWorld(body: (world: ConnectWorld) => Promise<void>, options: Co
       const clock = fakeClock()
       const starts: StartRequest[] = []
       const holds: { match: (call: FakeGhCall) => boolean; gate: Promise<void> }[] = []
-      const writes: { before: ((path: string) => void) | null } = { before: null }
-      const machine = connectMachine({ home, env: repo.env, github, orca, clock, starts, holds, writes })
+      const writes: ConnectHooks = { before: null, statError: null }
+      const network = options.github === false ? null : { url: GITHUB_URL, origin: repo.origin }
+      const machine = connectMachine({ home, env, github, orca, clock, starts, holds, writes, network })
       const timer = options.manualTimer === true ? manualTimer() : null
       const worker = await mountWorker(
         { default: (api) => startOn(api, machine, timer === null ? {} : { connectTimer: timer.timer }) },
@@ -170,6 +179,12 @@ async function inWorld(body: (world: ConnectWorld) => Promise<void>, options: Co
         },
         set beforeWrite(run) {
           writes.before = run
+        },
+        get statError() {
+          return writes.statError
+        },
+        set statError(run) {
+          writes.statError = run
         },
         holdGh: (match) => {
           let release: () => void = () => {}
@@ -215,6 +230,21 @@ export function writeMarkingHooks(dir: string, marks: string): void {
   }
 }
 
+export type ConnectHooks = {
+  before: ((path: string) => void | Promise<void>) | null
+  statError: ((path: string) => boolean) | null
+}
+
+// The subcommand of git's arguments (after the options before it, `-c <key>=<value>` included), or null.
+function gitSubcommand(args: readonly string[]): string | null {
+  for (let at = 0; at < args.length; at++) {
+    const arg = args[at] ?? ''
+    if (arg === '-c' || arg === '-C') at++
+    else if (!arg.startsWith('-')) return arg
+  }
+  return null
+}
+
 // The computer of the worker in these tests: this one, with real git, and only the fakes as `gh` and Orca's CLI.
 export function connectMachine(options: {
   readonly home: string
@@ -224,7 +254,9 @@ export function connectMachine(options: {
   readonly clock: FakeClock
   readonly starts: StartRequest[]
   readonly holds: { match: (call: FakeGhCall) => boolean; gate: Promise<void> }[]
-  readonly writes: { before: ((path: string) => void) | null }
+  readonly writes: ConnectHooks
+  // The network commands of git reach the bare `origin` when they name `url`.
+  readonly network: { readonly url: string; readonly origin: string } | null
 }): Machine {
   const real = realMachine()
   const paths = pathsOf(real)
@@ -247,12 +279,20 @@ export function connectMachine(options: {
     homedir: options.home,
     now: () => options.clock.now(),
     createText: async (path, text) => {
-      options.writes.before?.(path)
+      await options.writes.before?.(path)
       return real.createText(path, text)
     },
-    replaceText: async (path, text) => {
-      options.writes.before?.(path)
-      return real.replaceText(path, text)
+    replaceText: async (path, text, expected) => {
+      await options.writes.before?.(path)
+      return real.replaceText(path, text, expected)
+    },
+    removeText: async (path, expected) => {
+      await options.writes.before?.(path)
+      return real.removeText(path, expected)
+    },
+    modifiedAt: (path) => {
+      if (options.writes.statError?.(path) === true) throw Object.assign(new Error(`EACCES: permission denied, stat '${path}'`), { code: 'EACCES' })
+      return real.modifiedAt(path)
     },
     isRunnableFile: (path) => {
       if (same(path, gh)) return true
@@ -284,6 +324,10 @@ export function connectMachine(options: {
           stopError: null,
           startError: { code: 'ENOENT', message: `spawn ${request.file} ENOENT` },
         }
+      }
+      const subcommand = paths.basename(request.file).toLowerCase().replace(/\.exe$/, '') === 'git' ? gitSubcommand(request.args) : null
+      if (options.network !== null && subcommand !== null && ['fetch', 'push', 'ls-remote'].includes(subcommand)) {
+        return real.start({ ...request, args: ['-c', `url.${options.network.origin}.insteadOf=${options.network.url}`, ...request.args] })
       }
       return real.start(request)
     },

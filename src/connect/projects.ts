@@ -10,8 +10,10 @@
 // plugin's .agent-queue.json there, read as the project's settings are read (src/project/settings.ts: from the branches
 // of `origin` this clone knows, no fetch); a file with a wrong field still counts as connected («Проверка проекта»
 // names the field). A project on agent-queue-kit — `.agent-queue/config.json` in its main checkout — is offered with
-// its mark and never chosen: the plugin touches neither its files nor its labels nor its entry rule. The project's main
-// checkout is the project's own path.
+// its mark and never chosen: the plugin touches neither its files nor its labels nor its entry rule. Whether that file
+// is there is told by the path alone (its contents are never read); when even that cannot be told (no access), the
+// project is not chosen either: nothing is written over a project that may be on the kit. The project's main checkout
+// is the project's own path.
 import type { HostApi } from 'orca/host'
 import type { Machine } from '../platform/machine'
 import { worktreeFile } from '../platform/paths'
@@ -55,13 +57,13 @@ export async function isConnected(machine: Machine, project: OrcaProject): Promi
   return read.ok || read.kind === 'invalid'
 }
 
-// Whether the project is on agent-queue-kit: its main checkout has `.agent-queue/config.json`.
-export function isOnKit(machine: Machine, project: OrcaProject): boolean {
+// Whether the project is on agent-queue-kit — its main checkout has a `.agent-queue/config.json` path, whatever it is —
+// or `unknown` when the system cannot tell (no access on the way).
+export function kitOf(machine: Machine, project: OrcaProject): 'yes' | 'no' | 'unknown' {
   try {
-    return machine.readText(worktreeFile(machine, project.path, KIT_CONFIG)) !== null
+    return machine.modifiedAt(worktreeFile(machine, project.path, KIT_CONFIG)) === null ? 'no' : 'yes'
   } catch {
-    // Not a readable file there (a directory, no access): not the kit's settings.
-    return false
+    return 'unknown'
   }
 }
 
@@ -80,18 +82,29 @@ export async function connectCandidates(host: Host, machine: Machine): Promise<C
   const candidates: ConnectCandidate[] = []
   for (const { project, local } of await gitProjects(host)) {
     if (!local) {
-      candidates.push({ id: project.id, hostId: project.hostId, name: project.name, path: '', repository: null, kit: false, otherHost: true })
+      candidates.push({
+        id: project.id,
+        hostId: project.hostId,
+        name: project.name,
+        path: '',
+        repository: null,
+        kit: false,
+        kitUnknown: false,
+        otherHost: true,
+      })
       continue
     }
     if (await isConnected(machine, project)) continue
     const repository = await originRepository(machine, project.path)
+    const kit = kitOf(machine, project)
     candidates.push({
       id: project.id,
       hostId: project.hostId,
       name: project.name,
       path: project.path,
       repository: repository === null ? null : repositoryName(repository),
-      kit: isOnKit(machine, project),
+      kit: kit === 'yes',
+      kitUnknown: kit === 'unknown',
       otherHost: false,
     })
   }

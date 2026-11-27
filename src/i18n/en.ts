@@ -158,8 +158,7 @@ export const en = {
     '{file}: git add would change its content (.gitattributes, filters) — the commit would not match the journal.',
   'connect.fileNotText': '{file}: its content in the commit is not UTF-8 text the plugin can keep as it is.',
   'connect.fileNotFile': '{file}: in the commit it is not a regular file (a directory, a link or a submodule).',
-  'connect.fileUnpaired':
-    '{file}: a marker of the Agent Queue block has no pair — what belongs to the block cannot be told.',
+  'connect.fileUnpaired': '{file}: {detail} — what belongs to the block cannot be told.',
   'connect.fileMasked': '{file}: the block of the entry rule would carry data that never goes to GitHub ({detail}).',
   'connect.failedLabels': 'Could not create the labels in GitHub: {detail}',
   'connect.failedChanged': 'The main checkout changed during the connection: {what}. No file was written.',
@@ -170,7 +169,8 @@ export const en = {
   'connect.failedFiles': 'Could not write the files: {detail}.',
   'connect.failedCommit': 'Could not commit: {detail}.',
   'connect.left': 'Not put back, since they changed after the plugin wrote them: {paths}.',
-  'connect.failedVerify': 'The commit is not the operation\'s: {what}. Nothing was pushed, the commit is undone.',
+  'connect.failedVerify':
+    'The commit is not the operation\'s: {what}. Nothing was pushed, and it was not put on the base branch.',
   'connect.verifyParent': 'its parent is not the commit the connection started from',
   'connect.verifyPaths': 'it changes other paths than the four',
   'connect.verifyBlob': 'the content of {file} is not the one in the journal',
@@ -179,7 +179,24 @@ export const en = {
     'The push gave no certain answer: {detail}. The commit stays: it may be on origin already.',
   'connect.failedUndo': 'Could not undo the commit: {detail}.',
   'connect.failedUndoPush': 'Push rejected: {push}. Could not undo the commit: {detail}.',
+  'connect.failedPushAddress':
+    'The push address of origin changed after the checks: nothing was pushed, the commit is undone.',
   'connect.failedLost': 'The worker knows nothing of this connection (it was restarted). Open «Connect project» again.',
+  'connect.kitUnknown':
+    'Cannot tell whether the project is on agent-queue-kit (.agent-queue/config.json is not accessible) — it cannot be connected',
+  'connect.kitUnknownRefused':
+    'Cannot tell whether the project is on agent-queue-kit (.agent-queue/config.json is not accessible).',
+  'connect.errorDirectory': 'A directory inside the repository, from its root: {detail}',
+  'connect.fileDiffers': '{file}: the working tree holds other content than the commit — commit or undo the change.',
+  'connect.unpairedBeginAgain': 'an opening marker of the Agent Queue block comes again before its closing one',
+  'connect.unpairedEndAlone': 'a closing marker of the Agent Queue block has no opening one before it',
+  'connect.unpairedBeginAlone': 'an opening marker of the Agent Queue block has no closing one after it',
+  'connect.failedFilesChanged':
+    '{file} changed in the working tree right before the plugin wrote it: nothing was written over it.',
+  'connect.failedCommitMoved':
+    'The base branch moved during the connection (a new commit on it): the connection commit was not put on it.',
+  'connect.failedUndoMoved':
+    'Push rejected: {push}. The base branch is no longer the connection commit (work on top of it), so the commit is not undone.',
 } as const satisfies Record<string, string>
 
 export type MessageKey = keyof typeof en

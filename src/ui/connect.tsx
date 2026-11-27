@@ -83,6 +83,9 @@ type Checks = {
   readonly git: CheckState<GitCheck>
   readonly gh: CheckState<GhCheck>
   readonly agents: CheckState<AgentsCheck>
+  // Whether the form opened when the checks ended: once open, it stays open after «Подключить», whatever the worker
+  // then says of the agents — the errors of their fields stand there.
+  readonly opened: boolean
 }
 
 /** Where the wizard is. */
@@ -129,7 +132,7 @@ function current(mine: number): boolean {
 async function runChecks(project: ConnectCandidate): Promise<void> {
   const mine = ++runs
   const target = { projectId: project.id, hostId: project.hostId }
-  let checks: Checks = { project, git: { state: 'running' }, gh: { state: 'waiting' }, agents: { state: 'waiting' } }
+  let checks: Checks = { project, git: { state: 'running' }, gh: { state: 'waiting' }, agents: { state: 'waiting' }, opened: false }
   const show = (next: Checks) => {
     checks = next
     if (current(mine)) set(wizard, { step: 'checks', ...checks })
@@ -145,8 +148,9 @@ async function runChecks(project: ConnectCandidate): Promise<void> {
   const agents = await ask(() => plugin.request('connect.checkAgents', target, LONG_REQUEST))
   if (!current(mine)) return
   const kept = read(form)
-  const done = { ...checks, agents }
-  if (formOpens(done) && (kept === null || kept.project !== project.id)) set(form, { project: project.id, values: initialForm(done) })
+  const ended = { ...checks, agents }
+  const done = { ...ended, opened: formOpens(ended) }
+  if (done.opened && (kept === null || kept.project !== project.id)) set(form, { project: project.id, values: initialForm(done) })
   show(done)
 }
 
@@ -235,12 +239,15 @@ async function submit(): Promise<void> {
   const now = read(wizard)
   const filled = read(form)
   if (now.step === 'choose' || filled === null) return
-  let checks: Checks = { project: now.project, git: now.git, gh: now.gh, agents: now.agents }
+  let checks: Checks = { project: now.project, git: now.git, gh: now.gh, agents: now.agents, opened: now.opened }
   const mine = ++runs
   set(wizard, { step: 'connecting', ...checks })
   const target = { projectId: checks.project.id, hostId: checks.project.hostId }
-  let result = await answer(() => plugin.request('connect.connect', { ...target, form: formToSend(filled.values) }, LONG_REQUEST))
-  while (result.status === 'running' && current(mine)) result = await answer(() => plugin.request('connect.wait', target, LONG_REQUEST))
+  let result = await answer(null, () => plugin.request('connect.connect', { ...target, form: formToSend(filled.values) }, LONG_REQUEST))
+  while (result.status === 'running' && current(mine)) {
+    const attempt = result.attempt
+    result = await answer(attempt, () => plugin.request('connect.wait', { ...target, attempt }, LONG_REQUEST))
+  }
   if (result.status === 'connected') void connectedProjects.load()
   if (!current(mine) || result.status === 'running') return
   if (result.status === 'connected') {
@@ -265,13 +272,14 @@ async function submit(): Promise<void> {
   set(wizard, { step: 'outcome', outcome, ...checks })
 }
 
-/** The worker's answer; a request that timed out is asked again as `running`, any other error is a failure. */
-async function answer(request: () => Promise<ConnectResult>): Promise<ConnectResult> {
+/** The worker's answer. A wait for attempt `attempt` that timed out is asked again (`running`); any other error is a
+ *  failure. */
+async function answer(attempt: string | null, request: () => Promise<ConnectResult>): Promise<ConnectResult> {
   try {
     return await request()
   } catch (error) {
     const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined
-    if (code === 'timeout') return { status: 'running', operation: null }
+    if (code === 'timeout' && attempt !== null) return { status: 'running', attempt }
     return { status: 'failed', failure: { step: 'unexpected', detail: errorMessage(error) }, operation: null }
   }
 }
@@ -304,6 +312,7 @@ function Steps(props: { current: 1 | 2 | 3 }) {
 function candidateLine(project: ConnectCandidate): string {
   if (project.otherHost) return t('connect.otherHost', { host: project.hostId })
   if (project.kit) return t('connect.kit')
+  if (project.kitUnknown) return t('connect.kitUnknown')
   if (project.repository === null) return t('connect.candidateNoGithub', { path: project.path })
   return t('connect.candidateGithub', { path: project.path, repository: project.repository })
 }
@@ -330,7 +339,7 @@ function ChooseStep() {
                 <Button
                   key={`choose:${project.hostId}:${project.id}`}
                   size="sm"
-                  disabled={project.kit || project.otherHost}
+                  disabled={project.kit || project.kitUnknown || project.otherHost}
                   onPress={() => void runChecks(project)}
                 >
                   {t('connect.choose')}
@@ -447,7 +456,7 @@ function ProjectSteps(props: { wizard: Exclude<Wizard, { step: 'choose' }> }) {
   const gitOk = git.state === 'done' && git.result.status === 'ok'
   const repository = git.state === 'done' && git.result.status === 'ok' ? git.result.repository : (checks.project.repository ?? '')
   const lines = [gitLine(git, repository), ...(gitOk ? [ghLine(checks.gh, repository), agentsLine(checks.agents)] : [])]
-  const opens = formOpens(checks)
+  const opens = checks.opened
   if (props.wizard.step === 'connecting') {
     return (
       <Stack gap="md">
@@ -515,6 +524,7 @@ const FIELD_ERRORS: { readonly [C in FieldError['code']]: MessageKey } = {
   number: 'connect.errorNumber',
   'branch-name': 'connect.errorBranchName',
   'no-branch': 'connect.errorNoBranch',
+  directory: 'connect.errorDirectory',
   masked: 'connect.errorMasked',
   invalid: 'connect.errorInvalid',
 }
@@ -621,8 +631,20 @@ function SettingsForm(props: { checks: Checks }) {
           onChange={(value) => changeForm('taskRules', (now) => ({ ...now, taskRules: value }))}
         />
       </Field>
+      {agents.length === 0 ? (
+        <Callout tone="danger">
+          <Stack gap="sm">
+            <Text>{t('connect.blocked', { fix: t('connect.fixOther') })}</Text>
+            <Row>
+              <Button tone="accent" icon="refresh" onPress={() => void runChecks(props.checks.project)}>
+                {t('connect.checkAgain')}
+              </Button>
+            </Row>
+          </Stack>
+        </Callout>
+      ) : null}
       <Row>
-        <Button tone="accent" variant="solid" disabled={errors.length > 0} onPress={() => void submit()}>
+        <Button tone="accent" variant="solid" disabled={errors.length > 0 || agents.length === 0} onPress={() => void submit()}>
           {t('connect.connect')}
         </Button>
       </Row>
@@ -667,6 +689,8 @@ function refusalText(refusal: ConnectRefusal, repository: string): string {
   switch (refusal.reason) {
     case 'kit':
       return t('connect.kitRefused')
+    case 'kit-unknown':
+      return t('connect.kitUnknownRefused')
     case 'busy':
       return t('connect.busy')
     case 'connected':
@@ -694,6 +718,7 @@ function refusalText(refusal: ConnectRefusal, repository: string): string {
     case 'file': {
       const keys = {
         present: 'connect.filePresent',
+        differs: 'connect.fileDiffers',
         ignored: 'connect.fileIgnored',
         transformed: 'connect.fileTransformed',
         'not-text': 'connect.fileNotText',
@@ -701,7 +726,10 @@ function refusalText(refusal: ConnectRefusal, repository: string): string {
         unpaired: 'connect.fileUnpaired',
         masked: 'connect.fileMasked',
       } as const
-      return t(keys[refusal.problem], { file: refusal.file, detail: refusal.detail })
+      const unpaired = { 'begin-again': 'connect.unpairedBeginAgain', 'end-alone': 'connect.unpairedEndAlone', 'begin-alone': 'connect.unpairedBeginAlone' } as const
+      const detail =
+        refusal.problem === 'unpaired' && refusal.detail in unpaired ? t(unpaired[refusal.detail as keyof typeof unpaired]) : refusal.detail
+      return t(keys[refusal.problem], { file: refusal.file, detail })
     }
     case 'journal':
       return t('connect.journalRefused', { error: refusal.error })
@@ -726,9 +754,13 @@ function failureText(failure: ConnectFailure): string {
       return t('connect.failedChanged', { what })
     }
     case 'files':
-      return `${t('connect.failedFiles', { detail: failure.detail })}${left(failure.left)}`
+      return failure.reason === 'changed'
+        ? `${t('connect.failedFilesChanged', { file: failure.file })}${left(failure.left)}`
+        : `${t('connect.failedFiles', { detail: `${failure.file}: ${failure.detail ?? ''}` })}${left(failure.left)}`
     case 'commit':
-      return `${t('connect.failedCommit', { detail: failure.detail })}${left(failure.left)}`
+      return failure.reason === 'moved'
+        ? `${t('connect.failedCommitMoved')}${left(failure.left)}`
+        : `${t('connect.failedCommit', { detail: failure.detail ?? '' })}${left(failure.left)}`
     case 'verify': {
       const what =
         failure.what === 'parent'
@@ -742,10 +774,13 @@ function failureText(failure: ConnectFailure): string {
     }
     case 'push-unknown':
       return t('connect.failedPushUnknown', { detail: failure.detail })
+    case 'push-address':
+      return `${t('connect.failedPushAddress')}${left(failure.left)}`
     case 'undo':
+      if (failure.reason === 'moved') return t('connect.failedUndoMoved', { push: failure.push ?? '' })
       return failure.push === null
-        ? t('connect.failedUndo', { detail: failure.detail })
-        : t('connect.failedUndoPush', { push: failure.push, detail: failure.detail })
+        ? t('connect.failedUndo', { detail: failure.detail ?? '' })
+        : t('connect.failedUndoPush', { push: failure.push, detail: failure.detail ?? '' })
     case 'unexpected':
       return t('connect.failed', { error: failure.detail })
     case 'lost':

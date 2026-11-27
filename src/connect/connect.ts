@@ -76,10 +76,10 @@ import {
   type GhCheck,
   type GitCheck,
 } from '../protocol'
-import { checkAgents, checkGh, checkGit, originRepository, repositoryName } from './checks'
+import { checkAgents, checkGh, checkGit, originRepository, originUrls, repositoryName, type OriginUrls } from './checks'
 import { Checkout, type OperationFile } from './checkout'
 import { OperationJournal, type JournalStep } from './journal'
-import { connectCandidates, connectedProjects, findProject, isConnected, isOnKit, type OrcaProject } from './projects'
+import { connectCandidates, connectedProjects, findProject, isConnected, kitOf, type OrcaProject } from './projects'
 
 type Host = Pick<HostApi<'worker'>, 'call'>
 
@@ -115,11 +115,13 @@ export type ConnectorOptions = {
   readonly timer?: AnswerTimer
 }
 
-// A connection of a project: under way (`result` null) or ended, its answer not taken yet.
-type Attempt = { readonly done: Promise<ConnectResult>; result: ConnectResult | null; operation: string | null }
+// An attempt of «Подключить»: under way (`result` null) or ended, its answer not taken yet; `project` — the project's
+// key.
+type Attempt = { readonly done: Promise<ConnectResult>; result: ConnectResult | null; readonly project: string }
 
 export class Connector {
-  // The connections of the projects by id and host: running, or ended and not answered yet.
+  // The attempts by their id (a UUID given before anything is written): running, or ended and not answered yet. A wait
+  // gets the answer of its own attempt only.
   private readonly attempts = new Map<string, Attempt>()
   private readonly timer: AnswerTimer
   private readonly hooksOff: string
@@ -158,52 +160,62 @@ export class Connector {
     const form = parseForm(input)
     const project = await this.project(input, 'connect.connect')
     const key = JSON.stringify([project.id, project.hostId])
-    if (this.attempts.get(key)?.result === null) return { status: 'refused', refusal: { reason: 'busy' } }
-    const state: { result: ConnectResult | null; operation: string | null } = { result: null, operation: null }
-    const done = this.run(project, form, (operation) => (state.operation = operation)).then((result) => {
+    if ([...this.attempts.values()].some((one) => one.project === key && one.result === null)) {
+      return { status: 'refused', refusal: { reason: 'busy' } }
+    }
+    const id = randomUUID()
+    const state: { result: ConnectResult | null } = { result: null }
+    const done = this.run(project, form).then((result) => {
       state.result = result
       return result
     })
-    const attempt: Attempt = Object.assign(state, { done })
-    this.attempts.set(key, attempt)
-    return this.answer(key, attempt)
+    const attempt: Attempt = Object.assign(state, { done, project: key })
+    this.attempts.set(id, attempt)
+    return this.answer(id, attempt)
   }
 
-  // The end of the project's connection, within the answer window.
+  // The end of the attempt the request names, within the answer window; `lost` when this worker knows no such attempt
+  // of the project.
   async wait(input: unknown): Promise<ConnectResult> {
     const project = await this.project(input, 'connect.wait')
-    const key = JSON.stringify([project.id, project.hostId])
-    const attempt = this.attempts.get(key)
-    if (attempt === undefined) return { status: 'failed', failure: { step: 'lost' }, operation: null }
-    return this.answer(key, attempt)
+    const id = isObject(input) ? input.attempt : undefined
+    if (typeof id !== 'string' || id === '') throw invalidParams('connect.wait: no attempt')
+    const attempt = this.attempts.get(id)
+    if (attempt === undefined || attempt.project !== JSON.stringify([project.id, project.hostId])) {
+      return { status: 'failed', failure: { step: 'lost' }, operation: null }
+    }
+    return this.answer(id, attempt)
   }
 
-  private async answer(key: string, attempt: Attempt): Promise<ConnectResult> {
+  private async answer(id: string, attempt: Attempt): Promise<ConnectResult> {
     const window = this.timer(CONNECT_ANSWER_MS)
     const result = await Promise.race([attempt.done, window.elapsed.then(() => null)])
     window.cancel()
-    if (result === null) return { status: 'running', operation: attempt.operation }
-    if (this.attempts.get(key) === attempt) this.attempts.delete(key)
+    if (result === null) return { status: 'running', attempt: id }
+    this.attempts.delete(id)
     return result
   }
 
-  private async run(project: OrcaProject, form: ConnectForm, began: (operation: string) => void): Promise<ConnectResult> {
+  private async run(project: OrcaProject, form: ConnectForm): Promise<ConnectResult> {
     try {
-      return await this.connectProject(project, form, began)
+      return await this.connectProject(project, form)
     } catch (error) {
       return { status: 'failed', failure: { step: 'unexpected', detail: errorMessage(error) }, operation: null }
     }
   }
 
-  private async connectProject(project: OrcaProject, form: ConnectForm, began: (operation: string) => void): Promise<ConnectResult> {
+  private async connectProject(project: OrcaProject, form: ConnectForm): Promise<ConnectResult> {
     const { machine } = this.options
     const refused = (refusal: ConnectRefusal): ConnectResult => ({ status: 'refused', refusal })
-    if (isOnKit(machine, project)) return refused({ reason: 'kit' })
+    const kit = kitOf(machine, project)
+    if (kit === 'yes') return refused({ reason: 'kit' })
+    if (kit === 'unknown') return refused({ reason: 'kit-unknown' })
 
     // Everything the wizard checked, again.
     const git = await checkGit(machine, project.path)
-    if (git.check.status !== 'ok' || git.repository === null) return refused({ reason: 'git', check: git.check })
+    if (git.check.status !== 'ok' || git.repository === null || git.urls === null) return refused({ reason: 'git', check: git.check })
     const repository = git.repository
+    const urls = git.urls
     const gh = await checkGh(machine, repository)
     if (gh.status !== 'ok') return refused({ reason: 'gh', check: gh })
     const agents = await checkAgents(machine)
@@ -219,7 +231,7 @@ export class Connector {
 
     // The base branch, as origin has it now, and the checkout against it.
     const checkout = new Checkout(machine, project.path, this.hooksOff)
-    const fetched = await checkout.fetchBase(form.baseBranch)
+    const fetched = await checkout.fetchBase(urls.fetch, form.baseBranch)
     if ('error' in fetched) {
       if (fetched.missing) return { status: 'fields', errors: [{ field: 'baseBranch', code: 'no-branch', detail: form.baseBranch }], agents: null }
       return refused({ reason: 'fetch', error: fetched.error })
@@ -235,7 +247,7 @@ export class Connector {
     const files: OperationFile[] = []
     for (const path of CONNECT_PATHS) {
       const at = await checkout.fileAt(source, path)
-      if ('problem' in at) return refused({ reason: 'file', file: path, problem: at.problem, detail: at.detail })
+      if ('problem' in at) return refused({ reason: 'file', file: path, problem: at.problem, detail: '' })
       if (path === SETTINGS_FILE && at.file !== null) return refused({ reason: 'connected' })
       let text: string
       if (path === SETTINGS_FILE) text = formatProjectSettings(fields.settings)
@@ -246,18 +258,15 @@ export class Connector {
         text = placed.text
       }
       const blob = await checkout.blobId(text)
-      if ((await checkout.addedBlobId(path, text)) !== blob) {
-        return refused({ reason: 'file', file: path, problem: 'transformed', detail: 'git add would change it (.gitattributes)' })
-      }
+      if ((await checkout.addedBlobId(path, text)) !== blob) return refused({ reason: 'file', file: path, problem: 'transformed', detail: '' })
       files.push({ path, text, blob, source: at.file })
     }
     for (const file of files) {
-      const now = checkout.worktree(file.path)
       if (file.source === null) {
-        if (now.kind !== 'none') return refused({ reason: 'file', file: file.path, problem: 'present', detail: 'in the working tree, not in the commit' })
-        if (await checkout.isIgnored(file.path)) return refused({ reason: 'file', file: file.path, problem: 'ignored', detail: 'git ignores it' })
-      } else if (!(await checkout.holds(file.path, file.source.blob))) {
-        return refused({ reason: 'file', file: file.path, problem: 'present', detail: 'the working tree differs from the commit' })
+        if (checkout.worktree(file.path).kind !== 'none') return refused({ reason: 'file', file: file.path, problem: 'present', detail: '' })
+        if (await checkout.isIgnored(file.path)) return refused({ reason: 'file', file: file.path, problem: 'ignored', detail: '' })
+      } else if ((await checkout.snapshot(file.path, file.source.blob)) === null) {
+        return refused({ reason: 'file', file: file.path, problem: 'differs', detail: '' })
       }
     }
 
@@ -277,7 +286,6 @@ export class Connector {
     } catch (error) {
       return refused({ reason: 'journal', error: errorMessage(error) })
     }
-    began(operation)
     const step = async (name: JournalStep, data: Record<string, unknown>) => {
       try {
         await journal.record(name, data)
@@ -290,7 +298,7 @@ export class Connector {
       return { status: 'failed', failure, operation }
     }
     try {
-      return await this.write({ project, form, repository, checkout, source, files, operation, step, failed })
+      return await this.write({ project, form, repository, urls, checkout, source, files, operation, step, failed })
     } catch (error) {
       // git itself failed where no answer was expected: the state is left for the interrupted connection to tell.
       return failed({ step: 'unexpected', detail: errorMessage(error) })
@@ -302,6 +310,7 @@ export class Connector {
     readonly project: OrcaProject
     readonly form: ConnectForm
     readonly repository: Repository
+    readonly urls: OriginUrls
     readonly checkout: Checkout
     readonly source: string
     readonly files: readonly OperationFile[]
@@ -310,7 +319,7 @@ export class Connector {
     readonly failed: (failure: ConnectFailure) => Promise<ConnectResult>
   }): Promise<ConnectResult> {
     const { machine } = this.options
-    const { project, form, repository, checkout, source, files, operation, step, failed } = op
+    const { project, form, repository, urls, checkout, source, files, operation, step, failed } = op
     const base = form.baseBranch
 
     // 2. The labels.
@@ -326,56 +335,82 @@ export class Connector {
     const change = await checkout.changeSince(source, base, files)
     if (change !== null) return failed({ step: 'changed', change })
     const written: OperationFile[] = []
-    const putBack = async (name: 'files' | 'commit', detail: string): Promise<ConnectResult> => {
-      const left = await checkout.restore(source, written)
+    const putBack = async (failure: (left: string[]) => ConnectFailure): Promise<ConnectResult> => {
+      const left = await checkout.restore(written, false)
       await step('undo', { restored: written.map((file) => file.path).filter((path) => !left.includes(path)), left })
-      return failed({ step: name, detail, left })
+      return failed(failure(left))
     }
     for (const file of files) {
       let wrote: boolean
       try {
         wrote = await checkout.writeFile(file)
       } catch (error) {
-        return putBack('files', `${file.path}: ${errorMessage(error)}`)
+        return putBack((left) => ({ step: 'files', reason: 'error', file: file.path, detail: errorMessage(error), left }))
       }
-      if (!wrote) return putBack('files', `${file.path} changed in the working tree`)
+      if (!wrote) return putBack((left) => ({ step: 'files', reason: 'changed', file: file.path, detail: null, left }))
       written.push(file)
     }
     await step('files', { written: files.map((file) => file.path) })
 
-    // 4. The commit, and its check against the intent.
+    // 4. The operation's commit, its check against the intent, and the base branch moved to it from the source commit
+    //    only; then its index entries.
     const title = githubText(form.language, 'connect.commitTitle')
     const trailer = `${OPERATION_TRAILER}: ${operation}`
-    const committed = await checkout.commit(
-      files.map((file) => file.path),
-      [title, trailer],
-      source,
-    )
-    if ('error' in committed) return putBack('commit', committed.error)
-    const commit = committed.commit
-    await step('commit', { commit })
+    let commit: string
+    try {
+      commit = await checkout.commitOf(source, files, [title, trailer])
+    } catch (error) {
+      return putBack((left) => ({ step: 'commit', reason: 'error', detail: errorMessage(error), left }))
+    }
     const mismatch = await checkout.verify(commit, source, files, `${title}\n\n${trailer}\n`)
     if (mismatch !== null) {
-      const undone = await checkout.undoCommit(commit, source, base)
-      await step('undo', undone === null ? { head: source } : { error: undone })
-      if (undone !== null) return failed({ step: 'undo', push: null, detail: undone })
-      return failed({ step: 'verify', what: mismatch.what, file: mismatch.file, left: [] })
+      await step('commit', { commit, verified: false })
+      return putBack((left) => ({ step: 'verify', what: mismatch.what, file: mismatch.file, left }))
     }
+    const moved = await checkout.moveRef(`refs/heads/${base}`, commit, source, `Agent Queue: connect the project (${operation})`)
+    if (moved !== null) {
+      await step('commit', { commit, onBranch: false, error: moved.detail })
+      return putBack((left) => ({ step: 'commit', reason: moved.reason, detail: moved.reason === 'error' ? moved.detail : null, left }))
+    }
+    await step('commit', { commit })
+    // The index is HEAD's: it gets the four entries only while HEAD is still on the base branch.
+    if ((await checkout.state()).branch !== base) {
+      const back = await checkout.moveRef(`refs/heads/${base}`, source, commit, 'Agent Queue: the connection commit undone')
+      await step('undo', back === null ? { head: source } : { error: back.detail })
+      if (back !== null) return failed({ step: 'undo', push: null, reason: back.reason, detail: back.reason === 'error' ? back.detail : null })
+      return putBack(() => ({ step: 'changed', change: { kind: 'branch' } }))
+    }
+    await checkout.stage(files)
 
-    // 5. The push of that commit.
-    const pushed = await checkout.push(commit, base)
+    // 5. The push of that commit, to the address confirmed again now.
+    const now = await originUrls(machine, project.path, repository)
+    if (now === null || now === 'elsewhere' || now.push !== urls.push) {
+      await step('push', { outcome: 'not-sent', error: 'the push address of origin changed after the checks' })
+      const undone = await checkout.undoCommit(commit, source, base, files)
+      await step('undo', 'refusal' in undone ? { error: undone.refusal.detail } : { head: source, left: undone.left })
+      if ('refusal' in undone) {
+        const { reason, detail } = undone.refusal
+        return failed({ step: 'undo', push: null, reason, detail: reason === 'error' ? detail : null })
+      }
+      return failed({ step: 'push-address', left: undone.left })
+    }
+    const pushed = await checkout.push(urls.push, commit, base, source)
     if (pushed.outcome === 'unknown') {
       await step('push', { outcome: 'unknown', error: pushed.error })
       return failed({ step: 'push-unknown', detail: pushed.error })
     }
     if (pushed.outcome !== 'pushed') {
       await step('push', { outcome: pushed.outcome, error: pushed.error })
-      const undone = await checkout.undoCommit(commit, source, base)
-      await step('undo', undone === null ? { head: source } : { error: undone })
-      if (undone !== null) return failed({ step: 'undo', push: pushed.error, detail: undone })
+      const undone = await checkout.undoCommit(commit, source, base, files)
+      await step('undo', 'refusal' in undone ? { error: undone.refusal.detail } : { head: source, left: undone.left })
+      if ('refusal' in undone) {
+        const { reason, detail } = undone.refusal
+        return failed({ step: 'undo', push: pushed.error, reason, detail: reason === 'error' ? detail : null })
+      }
       return { status: 'pushRejected', error: pushed.error, operation }
     }
     await step('push', { outcome: 'pushed' })
+    await checkout.trackPushed(base, commit)
     this.options.log(`agent-queue: connected ${project.name} (operation ${operation}, commit ${commit})`)
     try {
       this.options.post(await this.connected())
@@ -455,7 +490,17 @@ export function settingsOf(form: ConnectForm, agents: readonly OrcaAgent[]): Set
     const id = form.agents[role]
     if (id === null || id === '') error(`agents.${role}`, 'agent', 'no agent chosen')
     else if (!agents.some((agent) => agent.id === id)) error(`agents.${role}`, 'agent', id)
-    else chosen[role] = id
+    else {
+      // An agent's id is any text Orca gives: it goes into .agent-queue.json, so the mask looks at it too.
+      const rules = maskRules(id)
+      if (rules !== null) error(`agents.${role}`, 'masked', rules)
+      else chosen[role] = id
+    }
+  }
+  for (const directory of directoriesOf(form.directories)) {
+    if (/^([\\/]|[A-Za-z]:)/.test(directory) || directory.split(/[\\/]/).includes('..')) {
+      error('directories', 'directory', directory)
+    }
   }
   const notBranch = branchNameProblem(form.baseBranch)
   if (notBranch !== null) error('baseBranch', 'branch-name', notBranch)
@@ -479,10 +524,7 @@ export function settingsOf(form: ConnectForm, agents: readonly OrcaAgent[]): Set
     maxInProgress,
     worktreeDependencies: {
       mode: form.worktreeMode,
-      directories: form.directories
-        .split(/[,\n]/)
-        .map((directory) => directory.trim())
-        .filter((directory) => directory !== ''),
+      directories: directoriesOf(form.directories),
     },
     afterMerge: [],
     forbiddenPatterns: [],
@@ -495,6 +537,14 @@ export function settingsOf(form: ConnectForm, agents: readonly OrcaAgent[]): Set
     return { ok: false, errors }
   }
   return { ok: true, settings: parsed.settings, taskRules }
+}
+
+// The dependency directories of the form: separated by commas or lines, blanks around them dropped.
+function directoriesOf(text: string): string[] {
+  return text
+    .split(/[,\n]/)
+    .map((directory) => directory.trim())
+    .filter((directory) => directory !== '')
 }
 
 // The field of the form a problem of .agent-queue.json belongs to.

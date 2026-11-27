@@ -160,7 +160,7 @@ export const ru: { readonly [K in MessageKey]: string } = {
     '{file}: git add изменил бы его содержимое (.gitattributes, фильтры) — коммит не совпал бы с журналом.',
   'connect.fileNotText': '{file}: его содержимое в коммите — не текст UTF-8, который плагин может сохранить как есть.',
   'connect.fileNotFile': '{file}: в коммите это не обычный файл (каталог, ссылка или подмодуль).',
-  'connect.fileUnpaired': '{file}: у маркера блока Agent Queue нет пары — неясно, что относится к блоку.',
+  'connect.fileUnpaired': '{file}: {detail} — неясно, что относится к блоку.',
   'connect.fileMasked': '{file}: в блоке правила входа оказались бы данные, которые не попадают в GitHub ({detail}).',
   'connect.failedLabels': 'Не удалось создать метки в GitHub: {detail}',
   'connect.failedChanged': 'Основной чекаут изменился во время подключения: {what}. Файлы не записаны.',
@@ -171,7 +171,7 @@ export const ru: { readonly [K in MessageKey]: string } = {
   'connect.failedFiles': 'Не удалось записать файлы: {detail}.',
   'connect.failedCommit': 'Не удалось сделать коммит: {detail}.',
   'connect.left': 'Не возвращены, потому что изменились после записи плагином: {paths}.',
-  'connect.failedVerify': 'Коммит не совпал с операцией: {what}. Пуша не было, коммит отменён.',
+  'connect.failedVerify': 'Коммит не совпал с операцией: {what}. Пуша не было, на базовую ветку он не поставлен.',
   'connect.verifyParent': 'его родитель — не коммит, с которого началось подключение',
   'connect.verifyPaths': 'он меняет не только четыре пути',
   'connect.verifyBlob': 'содержимое {file} не то, что в журнале',
@@ -180,6 +180,22 @@ export const ru: { readonly [K in MessageKey]: string } = {
     'Пуш не дал определённого ответа: {detail}. Коммит оставлен: он мог уже попасть в origin.',
   'connect.failedUndo': 'Не удалось отменить коммит: {detail}.',
   'connect.failedUndoPush': 'Пуш отклонён: {push}. Не удалось отменить коммит: {detail}.',
+  'connect.failedPushAddress': 'Адрес пуша origin изменился после проверок: пуша не было, коммит отменён.',
   'connect.failedLost':
     'Воркер ничего не знает об этом подключении (он был перезапущен). Откройте «Подключение проекта» снова.',
+  'connect.kitUnknown':
+    'Не удалось узнать, на agent-queue-kit ли проект (.agent-queue/config.json недоступен), — подключить его нельзя',
+  'connect.kitUnknownRefused': 'Не удалось узнать, на agent-queue-kit ли проект (.agent-queue/config.json недоступен).',
+  'connect.errorDirectory': 'Каталог внутри репозитория, от его корня: {detail}',
+  'connect.fileDiffers':
+    '{file}: в рабочем дереве другое содержимое, чем в коммите, — закоммитьте или отмените правку.',
+  'connect.unpairedBeginAgain': 'открывающий маркер блока Agent Queue повторяется до закрывающего',
+  'connect.unpairedEndAlone': 'у закрывающего маркера блока Agent Queue нет открывающего перед ним',
+  'connect.unpairedBeginAlone': 'у открывающего маркера блока Agent Queue нет закрывающего после него',
+  'connect.failedFilesChanged':
+    '{file} изменился в рабочем дереве прямо перед записью плагином: поверх него ничего не записано.',
+  'connect.failedCommitMoved':
+    'Базовая ветка сдвинулась во время подключения (на ней новый коммит): коммит подключения на неё не поставлен.',
+  'connect.failedUndoMoved':
+    'Пуш отклонён: {push}. Базовая ветка уже не на коммите подключения (поверх него есть работа), поэтому коммит не отменён.',
 }
