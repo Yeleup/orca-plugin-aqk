@@ -71,7 +71,8 @@ export type TerminalSendResult =
 // Typing into an Orca terminal through the CLI of this computer.
 export type TerminalInput = {
   // Finds Orca's CLI by Ф14 unless it is found already: null when it is there, otherwise why there is none. A caller
-  // looks for it before it writes anything of a send, so that a send without a CLI leaves nothing behind.
+  // looks for it before it writes anything of a send, so that it can check again after the search before writing, and
+  // record a send without a CLI as not sent without running anything.
   ready(): Promise<string | null>
   // Types `line` and Enter into the terminal `terminalId` as the request `requestId` (a UUID): one run of the CLI,
   // looked for first when it is not found yet. `check` runs once the CLI is found, right before `terminal send` starts,
