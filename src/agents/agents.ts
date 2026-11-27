@@ -75,10 +75,14 @@
 //   message is unknown, a new one is an error and nothing of it is written. A send is under way in this worker from
 //   before its record can be seen until its outcome is settled. The caller gets «taken» with the message's report file
 //   and whether the turn started, or an error with the reason and its kind: not sent, or unknown. A first send is not
-//   checked again once its files are written: from that check to its run of the CLI only its own records are written,
-//   and nothing changes its boundary meanwhile — a stop of the task waits for a send that writes its files, and the
-//   launch's records are never rewritten —, so a refusal never finds files of the message. The layer is built for one
-//   worker of the plugin per data directory — the ТЗ (Ф4) has one coordinator per computer, and Orca keeps one worker
+//   checked again once its files are written: it runs the CLI its own search found right after its records, and does
+//   not look for the CLI again (a CLI another send could not start is looked for again only by the next search), so
+//   from that check to its run of the CLI only its own records are written — no search, no other wait —, and nothing
+//   changes its boundary meanwhile — a stop of the task waits for a send that writes its files, and the launch's
+//   records are never rewritten —, so a refusal never finds files of the message. A message and a reading of the report
+//   copy the launch record the caller gives when they are called: the checks, the records and the run of the CLI use
+//   that copy, whatever the caller changes in its object afterwards. The layer is built for one worker of the plugin
+//   per data directory — the ТЗ (Ф4) has one coordinator per computer, and Orca keeps one worker
 //   of a plugin —, its restarts included, a new worker going on from the former one's records: the send queue of a
 //   launch, «a send of it runs now» and a stop's waiting for the sends hold within the worker. Two workers on one data
 //   directory at once are no mode of the plugin: for them only what Orca and the disk keep holds — the line of one
@@ -142,7 +146,7 @@ import { randomUUID } from 'node:crypto'
 import type { OrcaWorkerApi, PluginEvents } from 'orca/worker'
 import type { GithubLanguage } from '../github-texts/catalog'
 import { errorCode, errorMessage, type DirectoryEntry, type Machine } from '../platform/machine'
-import { orcaCliTerminalInput, type TerminalInput } from '../platform/orca-terminal'
+import { orcaCliTerminalInput, type TerminalCliSearch, type TerminalInput, type TerminalSendResult } from '../platform/orca-terminal'
 import { dataName, dataPath } from '../platform/paths'
 import type { Project } from '../protocol'
 import { AGENT_ROLES, SETTINGS_FILE, type AgentRole, type ProjectAgents } from '../project/settings'
@@ -534,8 +538,11 @@ export class Agents {
   // after its terminal took the line (a message), and — while the last message's outcome is not known — why: then the
   // report waits, and, unless a send of that message runs in this worker now, Orca is first asked again with the same
   // request id. Rejects when Orca's list cannot be read, and when the plugin's records of the inputs, or a start mark,
-  // cannot be read from the disk or kept there.
-  async report(launch: AgentLaunch): Promise<ReportReading> {
+  // cannot be read from the disk or kept there. The launch is copied when the report is asked for: asking Orca again —
+  // its checks, its run of the CLI, the outcome it records — and the reading use that copy, whatever the caller changes
+  // in its object meanwhile.
+  async report(given: AgentLaunch): Promise<ReportReading> {
+    const launch = launchCopy(given)
     this.know(launch)
     const asked = await this.askAgain(launch)
     let agents: ListedAgent[]
@@ -620,25 +627,29 @@ export class Agents {
   // previous message is not known, a new one is an error and nothing of it is written. While a stop of the task runs, a
   // message is an error and nothing of it is written; a stop begun once it has written its files waits for it. Orca's
   // CLI not found: the message is written and recorded as not sent, with the reason of the search. An empty message is
-  // an error.
+  // an error. The launch is copied when the message is asked for: its checks, its records and its run of the CLI all
+  // use that copy, whatever the caller changes in its object meanwhile.
   message(launch: AgentLaunch, text: string): Promise<MessageResult> {
     if (text.trim() === '') return Promise.resolve(unsent('the message is empty'))
-    const taskDir = this.taskDir(launch)
-    if (taskDir === null) return Promise.resolve(unsent(this.notOwnTerminal(launch) ?? `not a launch of the plugin: ${launch.dir}`))
-    if (this.isStopping(taskDir)) return Promise.resolve(unsent(stoppingMessages(launch)))
-    return this.oneAtATime(launch, taskDir, async () => {
-      const refused = this.mayNotSend(launch, taskDir)
+    const own = launchCopy(launch)
+    const taskDir = this.taskDir(own)
+    if (taskDir === null) return Promise.resolve(unsent(this.notOwnTerminal(own) ?? `not a launch of the plugin: ${own.dir}`))
+    if (this.isStopping(taskDir)) return Promise.resolve(unsent(stoppingMessages(own)))
+    return this.oneAtATime(own, taskDir, async () => {
+      const refused = this.mayNotSend(own, taskDir)
       if (refused !== null) return unsent(refused)
-      this.know(launch)
-      // Orca's CLI is looked for before anything of the message is written.
-      const missing = await this.terminalInput.ready()
+      this.know(own)
+      // Orca's CLI is looked for before anything of the message is written, and the CLI this search found is the one
+      // the send runs: it is not looked for again.
+      const cli = await this.terminalInput.find()
       // Checked again after the search, found or not, with nothing waited for between this check and the start of the
       // first write: a stop of the task begun meanwhile, or the terminal closed by the plugin, leaves no file of the
       // message. This is the send's last check before its run of the CLI (deliver): from here on only its own records
-      // are written, and a stop of the task waits for it.
-      const changed = this.mayNotSend(launch, taskDir)
+      // are written, then the CLI found above runs at once — no search, no other wait —, and a stop of the task waits
+      // for it.
+      const changed = this.mayNotSend(own, taskDir)
       if (changed !== null) return unsent(changed)
-      return this.send(launch, text, missing)
+      return this.send(own, text, cli)
     })
   }
 
@@ -768,8 +779,9 @@ export class Agents {
   }
 
   // Message k: reserves its number with its file, records its send — the line, a new request id, the time and its
-  // report file — and types the line (deliver); `missingCli`, why the search found no CLI, records it not sent instead.
-  private async send(launch: AgentLaunch, text: string, missingCli: string | null): Promise<MessageResult> {
+  // report file — and types the line with the CLI its search found (deliver); no CLI found, it is recorded not sent
+  // with the reason of the search instead.
+  private async send(launch: AgentLaunch, text: string, cli: TerminalCliSearch): Promise<MessageResult> {
     let k: number
     try {
       k = await this.reserveMessage(launch, text)
@@ -791,28 +803,27 @@ export class Agents {
       } catch (error) {
         return unsent(`the send of message ${k} could not be recorded: ${errorMessage(error)}`)
       }
-      return await this.deliver(launch, k, sending, 'first', missingCli)
+      return await this.deliver(launch, k, sending, { cli })
     } finally {
       this.typing.delete(key)
     }
   }
 
   // Types the recorded line of message k into the launch's terminal as its request, and records the outcome once it is
-  // known: the first send (from message), or asking again about a send whose outcome is not known (from report — the
-  // same request id makes Orca repeat the outcome, or type the line then if it never saw the request). The boundary is
-  // checked before every run of the CLI: before its search (whose `status` is a run too), and again once it is found —
-  // asking again right before `terminal send`, a first send in message(), right before its files are written. «Not
-  // taken» is recorded only on proof that the line of this request was not typed: on the first send, the CLI not found
-  // or not started, or Orca refusing the line itself; in any attempt, Orca's receipt saying the terminal did not take
-  // it.
+  // known: the first send (from message, with the CLI its search found), or asking again about a send whose outcome is
+  // not known (from report — the same request id makes Orca repeat the outcome, or type the line then if it never saw
+  // the request). The boundary is checked before every run of the CLI: before its search (whose `status` is a run too),
+  // and again once it is found — asking again right before `terminal send`, a first send in message(), right before
+  // its files are written. «Not taken» is recorded only on proof that the line of this request was not typed: on the
+  // first send, the CLI not found or not started, or Orca refusing the line itself; in any attempt, Orca's receipt
+  // saying the terminal did not take it.
   // Asking again, no refusal decides anything: the outcome stays unknown and nothing is written. A first send whose
-  // search found no CLI (`missingCli`, the reason) is recorded not taken at once: no CLI runs.
+  // search found no CLI is recorded not taken at once, with the reason of the search: no CLI runs.
   private async deliver(
     launch: AgentLaunch,
     k: number,
     sending: SendingJson,
-    attempt: 'first' | 'again',
-    missingCli: string | null = null,
+    attempt: { readonly cli: TerminalCliSearch } | 'again',
   ): Promise<MessageResult> {
     const target = `message ${k} to the agent "${launch.agent}" in terminal ${launch.terminalId}`
     const unknown = (reason: string): MessageResult => ({ ok: false, outcome: 'unknown', error: `the outcome of ${target} is unknown: ${reason}` })
@@ -824,19 +835,23 @@ export class Agents {
       }
       return unsent(`${target} was not sent: ${reason}`)
     }
-    if (attempt === 'first' && missingCli !== null) return notTaken(missingCli)
-    // The boundary. A first send was checked in message() after the search for the CLI, right before its files were
-    // written: from there to its run of the CLI only its own records are written, a stop of the task waits for it, and
-    // the launch's records do not change — so it is not checked again, and a refusal never finds files of it. Asking
-    // again is checked here, before the CLI is looked for, and once more right before `terminal send`: refused, nothing
-    // runs and the outcome stays unknown, with nothing written.
+    let sent: TerminalSendResult
     if (attempt === 'again') {
+      // Asking again is checked here, before the CLI is looked for, and once more right before `terminal send`:
+      // refused, nothing runs and the outcome stays unknown, with nothing written.
       const foreign = this.notOwnTerminal(launch)
       if (foreign !== null) return unknown(foreign)
+      sent = await this.terminalInput.send(launch.terminalId, sending.line, sending.requestId, () => this.notOwnTerminal(launch))
+    } else {
+      if (!attempt.cli.found) return notTaken(attempt.cli.reason)
+      // A first send was checked in message() after its search for the CLI, right before its files were written, and
+      // runs the CLI that search found, at once: from that check to this run only its own records are written — no
+      // search, no other wait —, a stop of the task waits for it, and the launch's records do not change; so it is
+      // not checked again, and a refusal never finds files of it.
+      sent = await attempt.cli.send(launch.terminalId, sending.line, sending.requestId)
     }
-    const check = attempt === 'again' ? () => this.notOwnTerminal(launch) : () => null
-    const sent = await this.terminalInput.send(launch.terminalId, sending.line, sending.requestId, check)
-    if (!sent.ok) return attempt === 'first' && sent.delivery === 'not-sent' ? notTaken(sent.error) : unknown(sent.error)
+    const first = attempt !== 'again'
+    if (!sent.ok) return first && sent.delivery === 'not-sent' ? notTaken(sent.error) : unknown(sent.error)
     if (!sent.accepted) return notTaken(`the terminal did not take the line: ${sent.refusedReason ?? 'Orca gave no reason'}`)
     try {
       await this.createRecord(launch.dir, outcomeName(k), { accepted: true, turnStarted: sent.turnStarted, at: this.machine.now(), error: null })
@@ -1339,6 +1354,25 @@ function notDelivered(launch: AgentLaunch, n: number, state: AgentState | null):
 // Input n in words: the task (0), or message n.
 function inputName(n: number): string {
   return n === 0 ? 'the task' : `message ${n}`
+}
+
+// A copy of the launch the caller gave, its task's identity included: what the caller changes in its objects
+// afterwards moves nothing of a send that uses the copy.
+function launchCopy(launch: AgentLaunch): AgentLaunch {
+  const project = Object.freeze({ id: launch.task.project.id, hostId: launch.task.project.hostId })
+  return Object.freeze({
+    dir: launch.dir,
+    taskFile: launch.taskFile,
+    reportFile: launch.reportFile,
+    task: Object.freeze({ project, key: launch.task.key }),
+    number: launch.number,
+    role: launch.role,
+    agent: launch.agent,
+    language: launch.language,
+    workspaceId: launch.workspaceId,
+    launchedAt: launch.launchedAt,
+    terminalId: launch.terminalId,
+  })
 }
 
 // A message that was not sent: nothing of it was typed.

@@ -3121,6 +3121,157 @@ test('Граница первой отправки решается до зап�
   await r.worker.deactivate()
 })
 
+test('Первая отправка запускает CLI, который нашла её поиск: другая отправка этого воркера не смогла запустить CLI, пока эта писала свои записи, — CLI заново не ищется, status не запускается, строка введена сразу после записи отправки, и метки closed, которую опубликовал бы на диске такой поиск, при вводе нет; следующий поиск ищет CLI заново', async () => {
+  const orca = fakeOrca()
+  // The write of the send record `held` publishes it at once and returns only when the test lets it.
+  let held: string | null = null
+  const disk = gate()
+  // The CLI cannot be started for the next `terminal send` into the terminal `unstartable`.
+  let unstartable: string | null = null
+  // While `markOnSearch` names a launch, a run of `status` publishes that launch's `closed` mark on the disk while its
+  // terminal is still open — as the existing check of the first search has it (a stop elsewhere).
+  let markOnSearch: AgentLaunch | null = null
+  // Every run of the CLI, in order: `status`, or `terminal send` with its handle and whether the `closed` mark of that
+  // terminal's launch was on the disk as it started.
+  const runs: string[] = []
+  const launches: AgentLaunch[] = []
+  const machine: Machine = {
+    ...orca.machine,
+    createText: async (path, text) => {
+      const created = await orca.machine.createText(path, text)
+      if (path === held) await disk.promise
+      return created
+    },
+    start: async (request) => {
+      if (request.args[0] === 'status') {
+        runs.push('status')
+        if (markOnSearch !== null) orca.machine.files.set(dataPath(orca.machine, markOnSearch.dir, 'closed'), `${orca.clock.now()}\n`)
+        return orca.machine.start(request)
+      }
+      const handle = request.args[request.args.indexOf('--terminal') + 1] ?? ''
+      const launch = launches.find((each) => each.terminalId === handle)
+      const closed = launch !== undefined && orca.machine.files.has(dataPath(orca.machine, launch.dir, 'closed'))
+      runs.push(`terminal send ${handle}${closed ? ' (closed on disk)' : ''}`)
+      if (handle !== unstartable) return orca.machine.start(request)
+      unstartable = null
+      const startError = { code: 'EACCES', message: 'spawn EACCES' }
+      return { code: null, signal: null, stdout: '', stderr: '', truncated: false, timedOut: false, outputError: null, stopError: null, startError }
+    },
+  }
+  const r = await mount(orca, { machine })
+  const writing = await launched(r, 155, 'implementer')
+  const failing = await launched(r, 156, 'implementer')
+  launches.push(writing, failing)
+
+  // The first send has looked for the CLI (its `status` answered), passed its last check and published its send record;
+  // the write has not returned yet.
+  held = dataPath(orca.machine, writing.dir, 'sending-1.json')
+  const sending = r.agents.message(writing, 'Замечание.')
+  await settle()
+  assert.ok(orca.machine.files.has(held))
+  assert.deepEqual(runs, ['status'])
+  // Meanwhile a send to another launch cannot start the CLI: not sent, and recorded so; the CLI found is forgotten.
+  unstartable = failing.terminalId
+  assert.deepEqual(await r.agents.message(failing, 'Замечание.'), {
+    ok: false,
+    outcome: 'not-sent',
+    error: `message 1 to the agent "codex" in terminal ${failing.terminalId} was not sent: orca terminal send: ${orca.cli}: spawn EACCES`,
+  })
+  assert.deepEqual(runs, ['status', `terminal send ${failing.terminalId}`])
+  // The first send goes on with the CLI its own search found, at once: no new search — no `status`, and no wait in which
+  // the `closed` mark appears — so its line is typed while the boundary its last check saw still holds.
+  markOnSearch = writing
+  disk.open()
+  const one = sendingOf(orca, writing, 1)
+  assert.deepEqual(await sending, { ok: true, reportFile: one.reportFile, started: true })
+  assert.deepEqual(runs, ['status', `terminal send ${failing.terminalId}`, `terminal send ${writing.terminalId}`])
+  assert.deepEqual(cliSends(orca), [sendArgs(orca, writing.terminalId, one)])
+  assert.deepEqual(orca.terminals.get(writing.terminalId)?.typed, [one.line])
+  assert.equal(orca.machine.files.has(dataPath(orca.machine, writing.dir, 'closed')), false)
+  assert.deepEqual(outcomeOf(orca, writing, 1), { accepted: true, turnStarted: true, at: orca.clock.now(), error: null })
+  assert.deepEqual(orca.terminals.get(failing.terminalId)?.typed, [])
+
+  // The next search looks for the CLI again: the next message to the other launch runs `status`, then its send.
+  markOnSearch = null
+  assert.deepEqual(await r.agents.message(failing, 'Ещё замечание.'), { ok: true, reportFile: messageFiles(orca, failing, 2).reportFile, started: true })
+  assert.deepEqual(runs.slice(3), ['status', `terminal send ${failing.terminalId}`])
+  assert.deepEqual(orca.terminals.get(failing.terminalId)?.typed, [sendingOf(orca, failing, 2).line])
+  assert.deepEqual(r.worker.refusals, [])
+  await r.worker.deactivate()
+})
+
+test('Сообщение и чтение отчёта работают на копии записи запуска, снятой при вызове: вызывающий меняет handle в своём объекте, пока удержана запись отправки, — CLI получает только проверенный handle, в терминал владельца ничего не введено; меняет каталог и handle, пока удержан ответ CLI на повторный запрос исхода, — исход и начало хода записаны в каталог проверенного запуска, у другого запуска не записано ничего', async () => {
+  const orca = fakeOrca()
+  // The write of the send record `held` publishes it at once and returns only when the test lets it.
+  let held: string | null = null
+  const disk = gate()
+  const machine: Machine = {
+    ...orca.machine,
+    createText: async (path, text) => {
+      const created = await orca.machine.createText(path, text)
+      if (path === held) await disk.promise
+      return created
+    },
+  }
+  const r = await mount(orca, { machine })
+  const launch = await launched(r, 157, 'implementer')
+  const other = await launched(r, 158, 'implementer')
+  const owner = orca.ownerTerminal(launch.workspaceId)
+  type Mutable<T> = { -readonly [K in keyof T]: T[K] }
+
+  // A first send. The caller's own object — a mutable copy of the launch — names the owner's open terminal once the
+  // send record is published, while its write is held.
+  const given: Mutable<AgentLaunch> = { ...launch }
+  held = dataPath(orca.machine, launch.dir, 'sending-1.json')
+  const sending = r.agents.message(given, 'Замечание.')
+  await settle()
+  assert.ok(orca.machine.files.has(held))
+  assert.deepEqual(cliSends(orca), [])
+  given.terminalId = owner
+  disk.open()
+  const one = sendingOf(orca, launch, 1)
+  assert.deepEqual(await sending, { ok: true, reportFile: one.reportFile, started: true })
+  assert.deepEqual(cliSends(orca), [sendArgs(orca, launch.terminalId, one)])
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [one.line])
+  assert.deepEqual(orca.terminals.get(owner)?.typed, [])
+  assert.deepEqual(outcomeOf(orca, launch, 1), { accepted: true, turnStarted: true, at: orca.clock.now(), error: null })
+
+  // Message 2 of each launch is typed and its answer lost: both outcomes unknown.
+  assert.ok((await r.agents.message(other, 'Замечание.')).ok)
+  orca.loseAnswers = 1
+  const lostHere = await r.agents.message(launch, 'Второе замечание.')
+  assert.ok(!lostHere.ok && lostHere.outcome === 'unknown', JSON.stringify(lostHere))
+  orca.loseAnswers = 1
+  const lostThere = await r.agents.message(other, 'Второе замечание.')
+  assert.ok(!lostThere.ok && lostThere.outcome === 'unknown', JSON.stringify(lostThere))
+  const two = sendingOf(orca, launch, 2)
+  const otherTwo = sendingOf(orca, other, 2)
+  // A reading of the report asks Orca again about message 2 of the launch; Orca's answer is held, and meanwhile the
+  // caller's object names the other launch's directory and the owner's terminal.
+  const asked: Mutable<AgentLaunch> = { ...launch }
+  const answer = gate()
+  orca.cliGate = answer.promise
+  const reading = r.agents.report(asked)
+  await settle()
+  assert.deepEqual(requestIds(orca, launch.terminalId), [one.requestId, two.requestId, two.requestId])
+  asked.dir = other.dir
+  asked.terminalId = owner
+  orca.cliGate = null
+  answer.open()
+  assert.deepEqual(await reading, notReady(launch, { reportFile: two.reportFile, started: true }))
+  // Orca repeated its receipt: the outcome and the start are the launch's, in its own directory.
+  assert.deepEqual(outcomeOf(orca, launch, 2), { accepted: true, turnStarted: true, at: orca.clock.now(), error: null })
+  assert.ok(orca.machine.files.has(messageFiles(orca, launch, 2).mark))
+  assert.equal(outcomeOf(orca, other, 2), undefined)
+  assert.equal(orca.machine.files.has(messageFiles(orca, other, 2).mark), false)
+  assert.deepEqual(requestIds(orca, other.terminalId), [sendingOf(orca, other, 1).requestId, otherTwo.requestId])
+  assert.deepEqual(requestIds(orca, owner), [])
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [one.line, two.line])
+  assert.deepEqual(orca.terminals.get(owner)?.typed, [])
+  assert.deepEqual(r.worker.refusals, [])
+  await r.worker.deactivate()
+})
+
 test('Ссылка на месте файла сообщения или каталога запуска: report-<k>.md — ссылка на отчёт задания, message-<k>.json — ссылка на отрицательный исход другого сообщения, каталог запуска или каталог задачи на пути к нему — ссылка на копию с подлинными записями прежнего сообщения — ошибка с причиной, а не прежний отчёт и не откат к прежнему входу', async () => {
   const orca = fakeOrca()
   const r = await mount(orca)

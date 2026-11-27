@@ -7,7 +7,9 @@
 // Orca's runtime issued — the very id `agent.launch` returns — and, for an agent, reports whether the line started a
 // turn. Since it reaches any terminal, the agents layer types only into the terminals of the agents it launched
 // (src/agents/agents.ts). The CLI is the one the plugin finds by Ф14 (src/platform/orca-cli.ts), once, and looked for
-// again after it could not be started.
+// again after it could not be started. A search hands its caller the CLI it found, pinned: the sends of that CLI run
+// that very file at once, never looking for a CLI again — a later failure to start it in another send makes only the
+// next search look again.
 //
 // `<cli> terminal send --terminal <handle> --text <line> --enter --retry-request <id> --wait-submit 30 --json` answers
 // `{ ok: true, result: { send: { handle, accepted, refusedReason?, prompt?: { requestId, stages, … } }, … } }` — the
@@ -20,7 +22,8 @@
 //
 // The caller's own check runs once the CLI is found, right before `terminal send` starts: when it refuses, nothing runs
 // and the line is not sent (the agents layer checks there that the terminal is still its own when it asks again about
-// a send; a first send it checks before writing its files).
+// a send). A first send looks for the CLI itself (`find`), checks its terminal after the search, writes its records and
+// then runs the CLI it found, with no search between that check and the run.
 //
 // The outcome of one run:
 // - any answer in which Orca itself calls the outcome unknown (`error.data.deliveryOutcome: "unknown"`, whatever else
@@ -69,12 +72,24 @@ export type TerminalSendResult =
   // lost, or Orca failed or could not be reached; the same request id asks about it again.
   | { readonly ok: false; readonly delivery: 'not-sent' | 'unknown'; readonly error: string }
 
+// The CLI one search found, pinned for its caller's attempt.
+export type TerminalCli = {
+  readonly found: true
+  // Types `line` and Enter into the terminal `terminalId` as the request `requestId` (a UUID): one run of this very CLI,
+  // started at once — nothing is looked for or waited for before it starts.
+  send(terminalId: string, line: string, requestId: string): Promise<TerminalSendResult>
+}
+
+// What a search for the CLI gives: the CLI found, pinned, or why there is none.
+export type TerminalCliSearch = TerminalCli | { readonly found: false; readonly reason: string }
+
 // Typing into an Orca terminal through the CLI of this computer.
 export type TerminalInput = {
-  // Finds Orca's CLI by Ф14 unless it is found already: null when it is there, otherwise why there is none. A caller
-  // looks for it before it writes anything of a send, so that it can check again after the search before writing, and
-  // record a send without a CLI as not sent without running anything.
-  ready(): Promise<string | null>
+  // Finds Orca's CLI by Ф14 unless it is found already: the CLI found, pinned (its sends never look for a CLI again),
+  // or why there is none. A first send looks for it before it writes anything, so that it can check again after the
+  // search before writing, record a send without a CLI as not sent without running anything, and run the CLI it found
+  // once its records are written.
+  find(): Promise<TerminalCliSearch>
   // Types `line` and Enter into the terminal `terminalId` as the request `requestId` (a UUID): one run of the CLI,
   // looked for first when it is not found yet. `check` runs once the CLI is found, right before `terminal send` starts,
   // with nothing waited for between them: a reason it returns means nothing runs and the line is not sent with that
@@ -84,28 +99,36 @@ export type TerminalInput = {
 
 // The terminal input of this computer's Orca CLI, found by Ф14 when first needed and kept while it starts.
 export function orcaCliTerminalInput(machine: Machine): TerminalInput {
-  let cli: string | null = null
-  const find = async (): Promise<string | null> => {
-    if (cli !== null) return null
+  // The CLI found, kept for the next searches.
+  let kept: string | null = null
+  const pinned = (file: string): TerminalCli => ({
+    found: true,
+    send: async (terminalId, line, requestId) => {
+      const result = await runProgram(machine, file, terminalSendArgs(terminalId, line, requestId), {
+        timeoutMs: TERMINAL_SEND_TIMEOUT_MS,
+      })
+      // A CLI that could not be started is looked for again by the next search; a send that holds it runs it still.
+      const unstarted = result.error !== null && (result.error.kind === 'not_found' || result.error.kind === 'start_failed')
+      if (unstarted && kept === file) kept = null
+      return terminalSendOutcome(result)
+    },
+  })
+  const find = async (): Promise<TerminalCliSearch> => {
+    if (kept !== null) return pinned(kept)
     const search = await findOrcaCli(machine)
-    if (!search.found) return `Orca's CLI is not found: ${search.reason}`
-    cli = search.file
-    return null
+    if (!search.found) return { found: false, reason: `Orca's CLI is not found: ${search.reason}` }
+    kept = search.file
+    return pinned(search.file)
   }
   return {
-    ready: find,
+    find,
     send: async (terminalId, line, requestId, check) => {
-      const missing = await find()
-      if (missing !== null || cli === null) return { ok: false, delivery: 'not-sent', error: missing ?? "Orca's CLI is not found" }
+      const cli = await find()
+      if (!cli.found) return { ok: false, delivery: 'not-sent', error: cli.reason }
       // Nothing waits between the caller's check and the start of `terminal send`.
       const refused = check()
       if (refused !== null) return { ok: false, delivery: 'not-sent', error: refused }
-      const result = await runProgram(machine, cli, terminalSendArgs(terminalId, line, requestId), {
-        timeoutMs: TERMINAL_SEND_TIMEOUT_MS,
-      })
-      // A CLI that could not be started is looked for again next time.
-      if (result.error !== null && (result.error.kind === 'not_found' || result.error.kind === 'start_failed')) cli = null
-      return terminalSendOutcome(result)
+      return cli.send(terminalId, line, requestId)
     },
   }
 }

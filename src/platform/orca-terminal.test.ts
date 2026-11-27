@@ -110,12 +110,12 @@ test('CLI Orca: отказ Orca в самой строке (incompatible_runtime
   assert.ok(!missing.ok && missing.error.includes(`${CLI}: no such file`), JSON.stringify(missing))
   assert.deepEqual(none.starts, [])
   // Looked for by itself, before anything of a send: the same reason, nothing run; once found, it stays found.
-  const ready = await orcaCliTerminalInput(none).ready()
-  assert.ok(ready !== null && ready.startsWith("Orca's CLI is not found: ") && ready.includes(`${CLI}: no such file`), String(ready))
+  const search = await orcaCliTerminalInput(none).find()
+  assert.ok(!search.found && search.reason.startsWith("Orca's CLI is not found: ") && search.reason.includes(`${CLI}: no such file`), JSON.stringify(search))
   const found = machineWith(() => receipt(['input_accepted']))
   const prepared = orcaCliTerminalInput(found)
-  assert.equal(await prepared.ready(), null)
-  assert.equal(await prepared.ready(), null)
+  assert.equal((await prepared.find()).found, true)
+  assert.equal((await prepared.find()).found, true)
   assert.ok((await prepared.send('term_1', 'x', REQUEST, go)).ok)
   assert.deepEqual(found.starts.map((start) => start.args.slice(0, 2).join(' ')), ['status --json', 'terminal send'])
 
@@ -136,6 +136,27 @@ test('CLI Orca: отказ Orca в самой строке (incompatible_runtime
     delivery: 'not-sent',
     error: `orca terminal send: ${CLI}: spawn EACCES`,
   })
+})
+
+test('CLI Orca: CLI, найденный поиском, закреплён за вызывающим — его отправка сразу запускает этот самый файл, без нового поиска и status, и тогда, когда другая отправка не смогла запустить CLI и сбросила найденный; следующий поиск ищет заново', async () => {
+  let present = true
+  const base = machineWith(() => receipt(['input_accepted']))
+  const flaky = { ...base, isRunnableFile: (path: string) => present && base.isRunnableFile(path) }
+  const input = orcaCliTerminalInput(flaky)
+  const pinned = await input.find()
+  assert.ok(pinned.found)
+  assert.deepEqual(base.starts.map((start) => start.args.slice(0, 2).join(' ')), ['status --json'])
+  // Another send finds the CLI gone when it is to run it: not sent, and the CLI it found is forgotten.
+  present = false
+  assert.deepEqual(await input.send('term_2', 'b', REQUEST, go), { ok: false, delivery: 'not-sent', error: `orca terminal send: ${CLI}: no such program` })
+  present = true
+  // The pinned CLI runs at once, by itself: one run of `terminal send` with that very file, no `status`.
+  const before = base.starts.length
+  assert.deepEqual(await pinned.send('term_1', 'a', REQUEST), { ok: true, accepted: true, refusedReason: null, turnStarted: false })
+  assert.deepEqual(base.starts.slice(before).map((start) => [start.file, ...start.args.slice(0, 4)]), [[CLI, 'terminal', 'send', '--terminal', 'term_1']])
+  // The next search looks for the CLI again.
+  assert.ok((await input.find()).found)
+  assert.deepEqual(base.starts.slice(before).map((start) => start.args.slice(0, 2).join(' ')), ['terminal send', 'status --json'])
 })
 
 test('CLI Orca: проверка вызывающего — после поиска CLI и его status, прямо перед terminal send: отказ — terminal send не запускается, строка не отправлена с причиной проверки', async () => {
