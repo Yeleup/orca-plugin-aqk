@@ -93,6 +93,8 @@ export type FakeGitHubOptions = {
   readonly login: string | null
   // What that user may do in the repository (GitHub's `permissions`): `write` by default.
   readonly access?: 'read' | 'write' | 'admin'
+  // The repository's default branch: `main` by default.
+  readonly defaultBranch?: string
   readonly pageSize?: number
   // How many entries of an edit or rename history come with a list (GitHub: 100); the rest is read page by page.
   readonly historyPage?: number
@@ -104,6 +106,7 @@ export class FakeGitHub {
   readonly host: string
   login: string | null
   access: 'read' | 'write' | 'admin'
+  defaultBranch: string
   readonly pageSize: number
   readonly historyPage: number
   readonly issues: FakeIssue[] = []
@@ -121,6 +124,7 @@ export class FakeGitHub {
     this.host = options.host ?? 'github.com'
     this.login = options.login
     this.access = options.access ?? 'write'
+    this.defaultBranch = options.defaultBranch ?? 'main'
     this.pageSize = options.pageSize ?? 2
     this.historyPage = options.historyPage ?? 100
     this.machine = fakeMachine({
@@ -245,7 +249,7 @@ export class FakeGitHub {
     if (call.path === `repos/${this.repository}` && call.method === 'GET') {
       return ok({
         full_name: this.repository,
-        default_branch: 'main',
+        default_branch: this.defaultBranch,
         permissions: {
           admin: this.access === 'admin',
           maintain: this.access === 'admin',
@@ -634,7 +638,8 @@ function historyOf(author: string, edits: readonly (string | null)[]): Record<st
 
 // What gh would make of its arguments: the host (--hostname, else GH_HOST, else github.com; `--repo HOST/…` for gh pr),
 // the REST method and endpoint or the GraphQL operation and variables (-f strings, -F numbers, key[]= lists).
-function readCall(request: StartRequest): FakeGhCall {
+// A start of gh as the fake reads it.
+export function readCall(request: StartRequest): FakeGhCall {
   const args = request.args
   let method = 'GET'
   let endpoint = ''

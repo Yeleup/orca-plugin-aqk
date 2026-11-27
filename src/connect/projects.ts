@@ -1,12 +1,17 @@
-// The Orca projects of this computer and whether each is connected to the queue (Ф1, point 1). A project is connected
-// when the base branch of its `origin` has the connection commit — the plugin's .agent-queue.json there, read as the
-// project's settings are read (src/project/settings.ts: from the branches of `origin` this clone knows, no fetch); a
-// file with a wrong field still counts as connected («Проверка проекта» names the field). A project on agent-queue-kit
-// — `.agent-queue/config.json` in its main checkout — is offered with its mark and never chosen: the plugin touches
-// neither its files nor its labels nor its entry rule.
+// The git projects of Orca and whether each is connected to the queue (Ф1, point 1; decision «🤖 Решение по #11:
+// вопрос», the second). The plugin connects and runs only the git projects of this computer — Orca's host `local` (or
+// none named): git, `gh`, the tests, the data directory and the journal of operations are on the worker's computer, and
+// the plugin API of Orca gives no way to run a command or read a file on the host of a project. A project of another
+// host (`ssh:…`, `runtime:…` or any other id) is listed in the wizard's step 1 as unavailable, with its host, and never
+// chosen: for it the worker starts no process and reads no file by its path — whether it is connected or on
+// agent-queue-kit is not asked; `projects.list` never names it. Folders of Orca are not projects of the queue.
 //
-// Only Orca's git projects of this computer (`project.list`: kind `git`, host `local`) count: the worker's git reaches
-// only this computer's checkouts. The project's main checkout is the project's own path.
+// A project of this computer is connected when the base branch of its `origin` has the connection commit — the
+// plugin's .agent-queue.json there, read as the project's settings are read (src/project/settings.ts: from the branches
+// of `origin` this clone knows, no fetch); a file with a wrong field still counts as connected («Проверка проекта»
+// names the field). A project on agent-queue-kit — `.agent-queue/config.json` in its main checkout — is offered with
+// its mark and never chosen: the plugin touches neither its files nor its labels nor its entry rule. The project's main
+// checkout is the project's own path.
 import type { HostApi } from 'orca/host'
 import type { Machine } from '../platform/machine'
 import { worktreeFile } from '../platform/paths'
@@ -23,15 +28,23 @@ export const KIT_CONFIG = '.agent-queue/config.json'
 
 export const LOCAL_HOST = 'local'
 
-// Orca's git projects on this computer, in Orca's order.
-export async function localProjects(host: Host): Promise<OrcaProject[]> {
+// Orca's git projects, in Orca's order: those of this computer and those of other hosts.
+async function gitProjects(host: Host): Promise<{ readonly project: OrcaProject; readonly local: boolean }[]> {
   const { projects } = await host.call('project.list')
   return projects
-    .filter((project) => project.kind === 'git' && (project.hostId ?? LOCAL_HOST) === LOCAL_HOST)
-    .map((project) => ({ id: project.id, hostId: LOCAL_HOST, name: project.name, path: project.path }))
+    .filter((project) => project.kind === 'git')
+    .map((project) => {
+      const local = (project.hostId ?? LOCAL_HOST) === LOCAL_HOST
+      return { project: { id: project.id, hostId: local ? LOCAL_HOST : (project.hostId ?? ''), name: project.name, path: project.path }, local }
+    })
 }
 
-// The project `id` on `hostId` among them, or null.
+// Orca's git projects of this computer, in Orca's order.
+export async function localProjects(host: Host): Promise<OrcaProject[]> {
+  return (await gitProjects(host)).filter((one) => one.local).map((one) => one.project)
+}
+
+// The project `id` on `hostId` among the projects of this computer, or null (a project of another host included).
 export async function findProject(host: Host, id: string, hostId: string): Promise<OrcaProject | null> {
   return (await localProjects(host)).find((project) => project.id === id && project.hostId === hostId) ?? null
 }
@@ -52,7 +65,7 @@ export function isOnKit(machine: Machine, project: OrcaProject): boolean {
   }
 }
 
-// The connected projects, as the panel's project selector shows them.
+// The connected projects of this computer, as the panel's project selector shows them.
 export async function connectedProjects(host: Host, machine: Machine): Promise<Project[]> {
   const connected: Project[] = []
   for (const project of await localProjects(host)) {
@@ -61,10 +74,15 @@ export async function connectedProjects(host: Host, machine: Machine): Promise<P
   return connected
 }
 
-// The wizard's step 1: the projects not connected, each with its GitHub repository (or none) and the kit's mark.
+// The wizard's step 1, in Orca's order: the projects of this computer not connected, each with its GitHub repository
+// (or none) and the kit's mark; the projects of other hosts, unavailable, with nothing of them looked at.
 export async function connectCandidates(host: Host, machine: Machine): Promise<ConnectCandidate[]> {
   const candidates: ConnectCandidate[] = []
-  for (const project of await localProjects(host)) {
+  for (const { project, local } of await gitProjects(host)) {
+    if (!local) {
+      candidates.push({ id: project.id, hostId: project.hostId, name: project.name, path: '', repository: null, kit: false, otherHost: true })
+      continue
+    }
     if (await isConnected(machine, project)) continue
     const repository = await originRepository(machine, project.path)
     candidates.push({
@@ -74,6 +92,7 @@ export async function connectCandidates(host: Host, machine: Machine): Promise<C
       path: project.path,
       repository: repository === null ? null : repositoryName(repository),
       kit: isOnKit(machine, project),
+      otherHost: false,
     })
   }
   return candidates

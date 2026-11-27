@@ -325,14 +325,19 @@ export class GitHub {
     )
   }
 
-  // Whether the GitHub user gh runs as may write to the repository: GitHub's `permissions` of the repository for that
-  // user — `push`, `maintain` or `admin`. A repository gh cannot see (404) or a failure of gh is a GitHubError.
-  async canWrite(): Promise<boolean> {
+  // What the GitHub user gh runs as may do in the repository, and the repository's default branch now: GitHub's
+  // `permissions` of the repository for that user — write is `push`, `maintain` or `admin` — and its `default_branch`.
+  // A repository gh cannot see (404) or a failure of gh is a GitHubError.
+  async access(): Promise<{ readonly write: boolean; readonly defaultBranch: string | null }> {
     const args = [...apiArgs(this.repository), repositoryRoot(this.repository)]
     const answer = await ghJson({ machine: this.machine, args })
     const permissions = answer.permissions
     if (!isObject(permissions)) throw shapeError(args, 'the repository without its permissions for the user of gh')
-    return permissions.push === true || permissions.maintain === true || permissions.admin === true
+    const main = answer.default_branch
+    return {
+      write: permissions.push === true || permissions.maintain === true || permissions.admin === true,
+      defaultBranch: typeof main === 'string' && main !== '' ? main : null,
+    }
   }
 
   async listPullRequests(filter: PullRequestFilter = {}): Promise<PullRequest[]> {

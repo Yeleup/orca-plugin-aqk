@@ -93,10 +93,11 @@ test('the worker starts without host calls or refusals', async () => {
 })
 
 // The connected projects are Orca's git projects of this computer whose remote base branch has the connection commit
-// (src/connect/projects.ts): the worker asks Orca for its projects. A project of another host and a folder are never
-// listed — the worker's git reaches only this computer — and with no project the list is empty. The real worker
-// module creates the data directory and the coordinator id: it runs with the temporary home.
-test('Каркас панели: воркер отвечает панели на projects.list — проекты Orca этого компьютера, подключённых среди них нет', async () => {
+// (src/connect/projects.ts): the worker asks Orca for its projects. A git project of another host is offered to the
+// wizard only as unavailable, with nothing of it looked at — the worker's git reaches only this computer —, a folder
+// not at all, and `projects.list` names neither. The real worker module creates the data directory and the coordinator
+// id: it runs with the temporary home.
+test('Каркас панели: воркер отвечает панели на projects.list — проекты Orca этого компьютера, подключённых среди них нет; git-проект другого хоста мастер называет недоступным, папку не называет', async () => {
   await withTemporaryHome(async () => {
     const empty = await mountWorker(main)
     assert.deepEqual(await empty.request('projects.list', undefined, { panel: 'agent-queue' }), { projects: [] })
@@ -118,7 +119,9 @@ test('Каркас панели: воркер отвечает панели на
     })
     const other = await mountWorker(main, { host })
     assert.deepEqual(await other.request('projects.list', undefined, { panel: 'agent-queue' }), { projects: [] })
-    assert.deepEqual(await other.request('connect.projects', undefined, { panel: 'agent-queue' }), { projects: [] })
+    assert.deepEqual(await other.request('connect.projects', undefined, { panel: 'agent-queue' }), {
+      projects: [{ id: 'remote-shop', hostId: 'ssh:build-box', name: 'shop-demo', path: '', repository: null, kit: false, otherHost: true }],
+    })
     assert.deepEqual(other.refusals, [])
     await other.deactivate()
   })

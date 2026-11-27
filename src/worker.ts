@@ -7,7 +7,7 @@
 // src/settings.ts. The MVP's tasks give it the rest of its functions.
 import type { OrcaWorkerApi } from 'orca/worker'
 import { startAgents, type Agents } from './agents/agents'
-import { Connector } from './connect/connect'
+import { Connector, type AnswerTimer } from './connect/connect'
 import { ensureCoordinatorId } from './platform/coordinator-id'
 import { errorMessage, realMachine, type Machine } from './platform/machine'
 import { dataDirectory } from './platform/paths'
@@ -24,12 +24,14 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
   await startOn(orca, realMachine())
 }
 
-// The whole worker on `machine` — what activate starts on this computer, and what tests start on their own: the
-// plugin's layers, then its answers to the panel. The connected projects are Orca's projects of this computer whose
-// remote base branch has the connection commit with .agent-queue.json (src/connect/projects.ts).
+// The whole worker on `machine` — what activate starts on this computer, and what tests start on their own (with their
+// own time for the answer window of «Подключить»): the plugin's layers, then its answers to the panel. The connected
+// projects are Orca's projects of this computer whose remote base branch has the connection commit with
+// .agent-queue.json (src/connect/projects.ts).
 export async function startOn(
   orca: OrcaWorkerApi,
   machine: Machine,
+  options: { readonly connectTimer?: AnswerTimer } = {},
 ): Promise<WorkerContext & { readonly agents: Agents; readonly connector: Connector }> {
   const plugin = await startPlugin(orca, machine)
   const connector = new Connector({
@@ -38,6 +40,7 @@ export async function startOn(
     dataDir: plugin.dataDir,
     log: (message) => orca.log(message),
     post: (projects) => orca.panels.post('projects.changed', { projects }),
+    ...(options.connectTimer === undefined ? {} : { timer: options.connectTimer }),
   })
   orca.panels.handle('projects.list', async () => ({ projects: await connector.connected() }))
   orca.panels.handle('project.openFile', (input) => openProjectFile(orca.host, input))
@@ -46,6 +49,7 @@ export async function startOn(
   orca.panels.handle('connect.checkGh', (input) => connector.checkGh(input))
   orca.panels.handle('connect.checkAgents', (input) => connector.checkAgents(input))
   orca.panels.handle('connect.connect', (input) => connector.connect(input))
+  orca.panels.handle('connect.wait', (input) => connector.wait(input))
   return { ...plugin, connector }
 }
 

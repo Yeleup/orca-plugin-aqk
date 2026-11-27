@@ -11,9 +11,11 @@
 // The list is read when the exit code is 0, the output is JSON with `ok: true`, and `result.agents` is a list of
 // entries each with a non-empty text `id`: an agent's name is its `name`, or its `id` when it has none; the order is
 // Orca's, an id that comes again counts once, and Orca's `default` is not used. Anything else is «the list is not read»
-// with its reason: the CLI is not found (the reason of the search), did not start, did not answer in time, Orca
-// refused (its `error.code` and `error.message`), or answered in another form. Nothing keeps the list: every check of
-// the connection wizard and every «Подключить» reads it again.
+// with its reason as a code, the CLI file that ran and what it said: the CLI is not found (the reason of the search),
+// did not start, did not answer in time, Orca refused (its `error.code` and `error.message`), or answered in another
+// form. The panel words the reason in its language and names the CLI by the file that ran — never a bare `orca` on
+// Linux. Nothing keeps the list: every check of the connection wizard and every «Подключить» reads it again.
+import type { AgentsFailure } from '../protocol'
 import type { Machine } from './machine'
 import { findOrcaCli } from './orca-cli'
 import { runProgram, type RunResult } from './run'
@@ -26,9 +28,9 @@ export type OrcaAgent = { readonly id: string; readonly name: string }
 
 export type OrcaAgentsReading =
   | { readonly ok: true; readonly agents: readonly OrcaAgent[] }
-  // `cli-not-found`: no CLI of Orca on this computer (`reason` — what was looked for and where); `failed`: the CLI did
-  // not give the list (`reason` — why).
-  | { readonly ok: false; readonly kind: 'cli-not-found' | 'failed'; readonly reason: string }
+  // Why the list is not read: AgentsFailure of src/protocol.ts — a code, the CLI run, and what the CLI or Orca said;
+  // the panel words it in its own language.
+  | { readonly ok: false; readonly failure: AgentsFailure }
 
 // The arguments of the one command.
 export const AGENTS_ARGS: readonly string[] = ['agent', 'installed', '--json']
@@ -36,37 +38,39 @@ export const AGENTS_ARGS: readonly string[] = ['agent', 'installed', '--json']
 // Reads the agents Orca knows on this computer: the CLI is looked for, then asked.
 export async function readOrcaAgents(machine: Machine): Promise<OrcaAgentsReading> {
   const search = await findOrcaCli(machine)
-  if (!search.found) return { ok: false, kind: 'cli-not-found', reason: search.reason }
+  if (!search.found) return { ok: false, failure: { kind: 'cli-not-found', search: search.reason } }
   const result = await runProgram(machine, search.file, AGENTS_ARGS, { timeoutMs: AGENTS_TIMEOUT_MS })
-  return orcaAgentsOutcome(result)
+  return orcaAgentsOutcome(search.file, result)
 }
 
-// What one run of `agent installed --json` gave.
-export function orcaAgentsOutcome(result: RunResult): OrcaAgentsReading {
-  const failed = (reason: string): OrcaAgentsReading => ({ ok: false, kind: 'failed', reason: `orca agent installed: ${reason}` })
-  if (result.error !== null) return failed(result.error.reason)
+// What one run of `agent installed --json` by the CLI `cli` gave.
+export function orcaAgentsOutcome(cli: string, result: RunResult): OrcaAgentsReading {
+  const failed = (kind: Exclude<AgentsFailure['kind'], 'cli-not-found'>, detail: string): OrcaAgentsReading => ({
+    ok: false,
+    failure: { kind, cli, detail },
+  })
+  if (result.error !== null) return failed(result.error.kind === 'timed_out' ? 'timed-out' : 'not-started', result.error.reason)
   let answer: unknown
   try {
     answer = JSON.parse(result.stdout)
   } catch {
     const said = (result.stderr.trim() || result.stdout.trim()).split(/\r?\n/)[0] ?? ''
-    return failed(`answered no JSON (exit ${result.code})${said ? `: ${said}` : ''}`)
+    return failed('no-json', `exit ${result.code}${said ? `: ${said}` : ''}`)
   }
   if (field(answer, 'ok') === false) {
     const error = field(answer, 'error')
     const code = field(error, 'code')
     const message = field(error, 'message')
     const said = [typeof code === 'string' ? code : null, typeof message === 'string' ? message : null].filter((part) => part !== null)
-    return failed(`Orca refused${said.length > 0 ? `: ${said.join(': ')}` : ''} (exit ${result.code})`)
+    return failed('refused', `${said.join(': ') || 'no reason'} (exit ${result.code})`)
   }
-  if (result.code !== 0) return failed(`exit ${result.code}`)
-  if (field(answer, 'ok') !== true) return failed('answered without ok: true')
+  if (result.code !== 0 || field(answer, 'ok') !== true) return failed('not-ok', `exit ${result.code}`)
   const entries = field(field(answer, 'result'), 'agents')
-  if (!Array.isArray(entries)) return failed('answered without a list of agents (result.agents)')
+  if (!Array.isArray(entries)) return failed('no-list', 'result.agents')
   const agents: OrcaAgent[] = []
   for (const entry of entries) {
     const id = field(entry, 'id')
-    if (typeof id !== 'string' || id.trim() === '') return failed('an agent of the list has no id')
+    if (typeof id !== 'string' || id.trim() === '') return failed('no-id', JSON.stringify(field(entry, 'name') ?? null))
     if (agents.some((agent) => agent.id === id)) continue
     const name = field(entry, 'name')
     agents.push({ id, name: typeof name === 'string' && name.trim() !== '' ? name : id })

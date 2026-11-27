@@ -53,3 +53,13 @@ test('правило входа: маркер без пары → проблем
     assert.equal(placed.ok, false, text)
   }
 })
+
+test('правило входа: байты вне блока не меняются — BOM, смешанные LF и CRLF, строка без перевода в конце; окончания выбираются только для своего блока', () => {
+  const mixed = '﻿# Заметки\r\nстрока с LF\nстрока с CRLF\r\n'
+  assert.deepEqual(placeEntryRule(mixed, BLOCK), { ok: true, text: `${mixed}\r\n${BLOCK.split('\n').join('\r\n')}\r\n` })
+  const open = 'строка с LF\nпоследняя строка без перевода'
+  assert.deepEqual(placeEntryRule(open, BLOCK), { ok: true, text: `${open}\n\n${BLOCK}\n` })
+  const old = `${ENTRY_RULE_BEGIN} old -->\r\nстарое правило\nещё\r\n${ENTRY_RULE_END}`
+  const replaced = placeEntryRule(`﻿до\n${old}\r\nпосле\n`, BLOCK)
+  assert.deepEqual(replaced, { ok: true, text: `﻿до\n${BLOCK.split('\n').join('\r\n')}\r\nпосле\n` })
+})

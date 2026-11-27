@@ -54,32 +54,33 @@ test('агенты Orca: CLI нет на компьютере → список �
   const reading = await readOrcaAgents(orca.machine)
   assert.equal(reading.ok, false)
   if (reading.ok) return
-  assert.equal(reading.kind, 'cli-not-found')
-  assert.match(reading.reason, /orca-ide/)
+  assert.equal(reading.failure.kind, 'cli-not-found')
+  assert.match(reading.failure.kind === 'cli-not-found' ? reading.failure.search : '', /orca-ide/)
   assert.ok(!orca.machine.starts.some((start) => start.args[0] === 'agent'), 'agent installed без CLI')
 })
 
-test('агенты Orca: CLI найден, а agent installed не дал списка (отказ Orca, не JSON, нет ответа в срок, другой вид ответа) → список не прочитан с причиной', async () => {
-  const cases: [string, (orca: ReturnType<typeof fakeOrca>) => void, RegExp][] = [
-    ['отказ Orca', (orca) => (orca.installedRefusal = { code: 'runtime_unavailable', message: 'Orca is not running' }), /Orca refused: runtime_unavailable: Orca is not running \(exit 1\)/],
-    ['не JSON', (orca) => (orca.installedAnswer = { code: 0, stdout: 'Claude, Codex\n' }), /answered no JSON \(exit 0\): Claude, Codex/],
-    ['нет ответа в срок', (orca) => (orca.installedAnswer = { timedOut: true, signal: 'SIGKILL' }), /stopped after 30000 ms without an answer/],
-    ['без списка агентов', (orca) => (orca.installedAnswer = { code: 0, stdout: JSON.stringify({ ok: true, result: {} }) }), /without a list of agents/],
+test('агенты Orca: CLI найден, а agent installed не дал списка (отказ Orca, не JSON, нет ответа в срок, другой вид ответа) → список не прочитан: код причины, файл CLI, ответ CLI или Orca', async () => {
+  const cases: [string, (orca: ReturnType<typeof fakeOrca>) => void, string, string][] = [
+    ['отказ Orca', (orca) => (orca.installedRefusal = { code: 'runtime_unavailable', message: 'Orca is not running' }), 'refused', 'runtime_unavailable: Orca is not running (exit 1)'],
+    ['не JSON', (orca) => (orca.installedAnswer = { code: 0, stdout: 'Claude, Codex\n' }), 'no-json', 'exit 0: Claude, Codex'],
+    ['нет ответа в срок', (orca) => (orca.installedAnswer = { timedOut: true, signal: 'SIGKILL' }), 'timed-out', 'stopped after 30000 ms without an answer'],
+    ['без списка агентов', (orca) => (orca.installedAnswer = { code: 0, stdout: JSON.stringify({ ok: true, result: {} }) }), 'no-list', 'result.agents'],
     [
       'агент без id',
       (orca) => (orca.installedAnswer = { code: 0, stdout: JSON.stringify({ ok: true, result: { agents: [{ id: '', name: 'Nobody' }] } }) }),
-      /an agent of the list has no id/,
+      'no-id',
+      '"Nobody"',
     ],
-    ['ok: true с кодом выхода 1', (orca) => (orca.installedAnswer = { code: 1, stdout: JSON.stringify({ ok: true, result: { agents: [] } }) }), /exit 1/],
+    ['ok: true с кодом выхода 1', (orca) => (orca.installedAnswer = { code: 1, stdout: JSON.stringify({ ok: true, result: { agents: [] } }) }), 'not-ok', 'exit 1'],
   ]
-  for (const [what, steer, reason] of cases) {
+  for (const [what, steer, kind, detail] of cases) {
     const orca = fakeOrca({ platform: 'linux' })
     steer(orca)
     const reading = await readOrcaAgents(orca.machine)
     assert.equal(reading.ok, false, what)
     if (reading.ok) continue
-    assert.equal(reading.kind, 'failed', what)
-    assert.match(reading.reason, reason, what)
+    assert.deepEqual(reading.failure, { kind, cli: orca.cli, detail }, what)
+    assert.ok(orca.cli.endsWith('/orca-ide'), `${what}: ${orca.cli}`)
   }
 })
 
@@ -97,5 +98,5 @@ test('агенты Orca: пустой список — прочитан и пу�
     truncated: false,
     error: null,
   }
-  assert.deepEqual(orcaAgentsOutcome(result), { ok: true, agents: [] })
+  assert.deepEqual(orcaAgentsOutcome('/usr/bin/orca-ide', result), { ok: true, agents: [] })
 })

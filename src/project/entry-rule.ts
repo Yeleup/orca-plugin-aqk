@@ -57,42 +57,64 @@ export function entryRuleBlock(language: GithubLanguage, repository: string): st
 
 export type PlacedEntryRule = { readonly ok: true; readonly text: string } | { readonly ok: false; readonly problem: string }
 
+// A line of a text with its own line ending ('' for a last line without one).
+type Line = { readonly body: string; readonly end: string }
+
+function linesOf(text: string): Line[] {
+  const lines: Line[] = []
+  const pattern = /([^\r\n]*)(\r\n|\n|\r|$)/g
+  let at = 0
+  while (at < text.length) {
+    pattern.lastIndex = at
+    const match = pattern.exec(text)
+    if (match === null) break
+    lines.push({ body: match[1] ?? '', end: match[2] ?? '' })
+    at = pattern.lastIndex
+  }
+  return lines
+}
+
 // The file's text with the block in it exactly once. `current` is the file's text, or null when there is no file — then
-// the file is the block alone. The file's own text stays as it is: a block of the plugin already there is replaced in
-// its place (several — the first is replaced, the others go), otherwise the block is added at the end after a blank
-// line. A marker without its pair (an opening line without its closing one after it, or a closing line without an
-// opening one before it) is a problem: what belongs to the block cannot be told, and nothing is written. The block's
-// lines end the way the file's do (CRLF when the file has it).
+// the file is the block alone. Every byte of the file outside the plugin's blocks stays as it is (a byte order mark and
+// line endings, mixed ones too): a block of the plugin already there is replaced in its place (several — the first is
+// replaced, the others go), otherwise the block is added at the end after a blank line. Only the block's own lines get
+// a line ending chosen: that of its opening marker it replaces, or that of the file's last line (its first line ending
+// when the last has none, LF in a file without any). A marker without its pair (an opening line without its closing
+// one after it, or a closing line without an opening one before it) is a problem: what belongs to the block cannot be
+// told, and nothing is written.
 export function placeEntryRule(current: string | null, block: string): PlacedEntryRule {
   if (current === null || current === '') return { ok: true, text: `${block}\n` }
-  const eol = current.includes('\r\n') ? '\r\n' : '\n'
-  const lines = current.split(/\r?\n/)
+  const lines = linesOf(current)
   const blockLines = block.split('\n')
-  const kept: string[] = []
-  let inside = false
+  const withEnding = (end: string) => blockLines.map((line) => `${line}${end}`).join('')
+  let out = ''
+  let inside: Line | null = null
   let placed = false
   for (const line of lines) {
-    const trimmed = line.trim()
+    const trimmed = line.body.trim()
     if (trimmed.startsWith(ENTRY_RULE_BEGIN)) {
-      if (inside) return { ok: false, problem: 'the opening line of the Agent Queue block comes again before its closing line' }
-      inside = true
+      if (inside !== null) return { ok: false, problem: 'the opening line of the Agent Queue block comes again before its closing line' }
+      inside = line
       continue
     }
     if (trimmed === ENTRY_RULE_END) {
-      if (!inside) return { ok: false, problem: 'the closing line of the Agent Queue block has no opening line before it' }
-      inside = false
-      if (!placed) kept.push(...blockLines)
+      if (inside === null) return { ok: false, problem: 'the closing line of the Agent Queue block has no opening line before it' }
+      // The block takes the line ending of its opening marker; its last line keeps the closing marker's own.
+      if (!placed) out += withEnding(inside.end || '\n').slice(0, -(inside.end || '\n').length) + line.end
       placed = true
+      inside = null
       continue
     }
-    if (!inside) kept.push(line)
+    if (inside === null) out += line.body + line.end
   }
-  if (inside) return { ok: false, problem: 'the opening line of the Agent Queue block has no closing line after it' }
-  if (placed) return { ok: true, text: kept.join(eol) }
-  // `lines` ends with '' when the file ends with a line break.
-  const body = lines[lines.length - 1] === '' ? lines.slice(0, -1) : lines
-  const blank = body.length > 0 && body[body.length - 1]?.trim() !== '' ? [''] : []
-  return { ok: true, text: [...body, ...blank, ...blockLines, ''].join(eol) }
+  if (inside !== null) return { ok: false, problem: 'the opening line of the Agent Queue block has no closing line after it' }
+  if (placed) return { ok: true, text: out }
+  const last = lines[lines.length - 1]
+  const eol = last?.end || lines.find((line) => line.end !== '')?.end || '\n'
+  // The file's last line ends now; a blank line, unless the file ends with one; then the block.
+  const ended = last === undefined || last.end !== '' ? current : `${current}${eol}`
+  const blank = last !== undefined && (last.end === '' || last.body.trim() !== '') ? eol : ''
+  return { ok: true, text: `${ended}${blank}${withEnding(eol)}` }
 }
 
 // The block of `text` between the plugin's markers, markers included, or null when the file has none.

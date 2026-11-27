@@ -24,47 +24,67 @@ export type OpenProjectFileAnswer = { opened: true } | { opened: false; reason: 
 
 // ── «Подключение проекта» (Ф1): the wizard's requests ─────────────────────────────────────────────────────────────
 
-/** An Orca project of this computer the wizard offers (step 1): a git project not connected yet. */
+/** A git project of Orca the wizard lists (step 1). A project of this computer (host `local`) not connected yet, with
+ *  its path and GitHub repository — or, on agent-queue-kit, marked and never chosen; a project of another host
+ *  (`otherHost`) is listed too, never chosen, with nothing of it looked at: its path is not this computer's. */
 export type ConnectCandidate = {
   id: string
   hostId: string
   name: string
-  /** The project's main checkout, as Orca gives it: shown to the owner, never written to GitHub. */
+  /** The project's main checkout, as Orca gives it: shown to the owner, never written to GitHub. Empty for a project of
+   *  another host. */
   path: string
   /** The GitHub repository of its `origin` as `owner/name` (`host/owner/name` off github.com), or null when there is
-   *  none. */
+   *  none (or the project is on another host). */
   repository: string | null
   /** On agent-queue-kit (`.agent-queue/config.json`): marked «На agent-queue-kit — переход после MVP», never chosen. */
   kit: boolean
+  /** On another host of Orca (`ssh:…`, `runtime:…`): marked with `hostId`, never chosen. */
+  otherHost: boolean
 }
+
+/** How long «Подключить» and `connect.wait` keep the panel's request before they answer `running`: within the two
+ *  minutes a panel's request may last. */
+export const CONNECT_ANSWER_MS = 90_000
 
 /** The project a check or the connection is for. */
 export type ConnectTarget = { projectId: string; hostId: string }
 
-/** Step 2, git: the project is a git repository whose `origin` is a GitHub repository. `ok` gives the form its base
- *  branches: the branches of `origin` this clone knows and the repository's default branch. */
+/** Step 2, git: the project is a git repository whose `origin` is a GitHub repository, fetched from and pushed to
+ *  alike. `ok` gives the form the branches of `origin` this clone knows and its default branch as the clone knows it. */
 export type GitCheck =
   | { status: 'ok'; repository: string; branches: string[]; defaultBranch: string }
-  | { status: 'problem'; problem: 'not-git' | 'no-github' | 'no-branches' }
+  /** `push-elsewhere`: a push of `origin` would go somewhere else than the repository fetched from
+   *  (`remote.origin.pushurl`, another `remote.origin.url`, `url.*.pushInsteadOf`). */
+  | { status: 'problem'; problem: 'not-git' | 'no-github' | 'push-elsewhere' | 'no-branches' }
   | { status: 'unchecked'; error: string }
 
-/** Step 2, gh: installed, logged in, may write to the repository. */
+/** Step 2, gh: installed, logged in, may write to the repository. `defaultBranch` — the repository's default branch as
+ *  GitHub says it now. */
 export type GhCheck =
-  | { status: 'ok'; login: string }
+  | { status: 'ok'; login: string; defaultBranch: string | null }
   | { status: 'problem'; problem: 'not-installed' | 'not-logged-in' | 'no-repository' | 'no-write' }
   | { status: 'unchecked'; error: string }
 
 /** The agents of each role the form starts with (the defaults of .agent-queue.json). */
 export type RoleAgents<T> = { implementer: T; reviewer: T; solver: T; start: T }
 
-/** Step 2, agents: the agents Orca knows on this computer (`orca agent installed`) and whether the default agents of
- *  the roles are among them. `missing` does not stop the form (the owner picks another agent there); `empty` and
+/** Why the agents Orca knows could not be read: the CLI of Orca is not found (`search` — what was looked for and
+ *  where), or the CLI `cli` (the file run) did not start, did not answer in time, was refused by Orca, answered no JSON,
+ *  answered without the list or with an agent without its id, or answered without `ok: true` and exit 0. `detail` —
+ *  what the CLI or Orca said, as it is. */
+export type AgentsFailure =
+  | { kind: 'cli-not-found'; search: string }
+  | { kind: 'not-started' | 'timed-out' | 'refused' | 'no-json' | 'no-list' | 'no-id' | 'not-ok'; cli: string; detail: string }
+
+/** Step 2, agents: the agents Orca knows on this computer (`agent installed`) and whether the default agents of the
+ *  roles are among them. `missing` does not stop the form (the owner picks another agent there); `empty` and
  *  `unchecked` do. */
 export type AgentsCheck =
   | { status: 'ok'; agents: OrcaAgent[]; defaults: RoleAgents<string> }
   | { status: 'problem'; problem: 'missing'; missing: string[]; agents: OrcaAgent[]; defaults: RoleAgents<string> }
   | { status: 'problem'; problem: 'empty' }
-  | { status: 'unchecked'; kind: 'cli-not-found' | 'failed'; reason: string }
+  | { status: 'unchecked'; failure: AgentsFailure }
 
 /** The settings form (step 3), as the owner filled it in: what «Подключить» sends. */
 export type ConnectForm = {
@@ -101,11 +121,12 @@ export type ConnectField =
   | 'directories'
 
 /** A field the owner must fix: `required` — empty; `oneLine` — a command of several lines; `agent` — no agent, or one
- *  Orca does not know; `number` — not a whole number from 1; `branch` — not a branch of `origin`; `invalid` — what the
- *  check of .agent-queue.json says (`detail`). */
+ *  Orca does not know now; `number` — not a whole number from 1; `branch-name` — not a git branch name; `no-branch` —
+ *  `origin` has no such branch now; `masked` — the mask of the plugin finds data that never goes to GitHub (`detail`
+ *  names its rules, never the text); `invalid` — what the check of .agent-queue.json says (`detail`). */
 export type FieldError = {
   field: ConnectField
-  code: 'required' | 'oneLine' | 'agent' | 'number' | 'branch' | 'invalid'
+  code: 'required' | 'oneLine' | 'agent' | 'number' | 'branch-name' | 'no-branch' | 'masked' | 'invalid'
   detail: string
 }
 
@@ -113,9 +134,11 @@ export type FieldError = {
 export type ConnectRefusal =
   | { reason: 'kit' }
   | { reason: 'busy' }
+  /** The project is connected already: the base branch of `origin` has .agent-queue.json now. */
+  | { reason: 'connected' }
   | { reason: 'git'; check: GitCheck }
   | { reason: 'gh'; check: GhCheck }
-  | { reason: 'agents'; check: AgentsCheck }
+  | { reason: 'agents'; failure: AgentsFailure }
   | { reason: 'fetch'; error: string }
   /** The main checkout is not on the base branch: `branch` — the branch it is on, null when it is on no branch. */
   | { reason: 'not-on-base'; branch: string | null; base: string }
@@ -124,20 +147,55 @@ export type ConnectRefusal =
   | { reason: 'behind'; commits: number; base: string }
   | { reason: 'ahead'; commits: number; base: string }
   | { reason: 'diverged'; ahead: number; behind: number; base: string }
-  /** One of the four files cannot take the plugin's change: not a regular file in the repository, or a marker of the
-   *  plugin's block without its pair. */
-  | { reason: 'file'; file: string; problem: string }
+  /** One of the four files cannot take the plugin's change: `present` — the commit lacks it, but the working tree has
+   *  it (an ignored file, a file made meanwhile); `ignored` — git ignores the path, its file would not be committed;
+   *  `transformed` — git would change its content when adding it (attributes, filters); `not-text` — its content in the
+   *  commit is not UTF-8 text the plugin can keep as it is; `not-file` — not a regular file in the commit;
+   *  `unpaired` — a marker of the plugin's block without its pair; `masked` — the entry rule's block would carry data
+   *  the mask hides (`rules`). */
+  | {
+      reason: 'file'
+      file: string
+      problem: 'present' | 'ignored' | 'transformed' | 'not-text' | 'not-file' | 'unpaired' | 'masked'
+      detail: string
+    }
   | { reason: 'journal'; error: string }
 
-/** The answer to «Подключить». */
+/** What changed in the main checkout after «Подключить» checked it and before it wrote its files. */
+export type CheckoutChange =
+  | { kind: 'head' }
+  | { kind: 'branch' }
+  | { kind: 'dirty'; paths: number }
+  | { kind: 'file'; file: string }
+
+/** Why «Подключить» failed once the operation had begun. `left` — paths the plugin did not put back, since they were
+ *  changed after it wrote them. */
+export type ConnectFailure =
+  | { step: 'labels'; detail: string }
+  /** The checkout changed after the checks: none of the files was written. */
+  | { step: 'changed'; change: CheckoutChange }
+  | { step: 'files' | 'commit'; detail: string; left: string[] }
+  /** The commit is not the operation's: `what` says how. No push; the plugin's own changes are undone. */
+  | { step: 'verify'; what: 'parent' | 'paths' | 'blob' | 'message'; file: string | null; left: string[] }
+  /** The push gave no certain answer: it may have reached origin; the commit stays. */
+  | { step: 'push-unknown'; detail: string }
+  /** The commit could not be undone after the push was refused: the checkout moved on, or git failed. */
+  | { step: 'undo'; push: string | null; detail: string }
+  | { step: 'unexpected'; detail: string }
+  /** The worker knows nothing of the attempt (it was restarted). */
+  | { step: 'lost' }
+
+/** The answer to «Подключить» (and to waiting for it). */
 export type ConnectResult =
   | { status: 'connected'; project: Project; operation: string; commit: string }
-  | { status: 'fields'; errors: FieldError[] }
+  /** The fields to fix; `agents` — the agents Orca knows now, when that is why a field is wrong. */
+  | { status: 'fields'; errors: FieldError[]; agents: AgentsCheck | null }
   | { status: 'refused'; refusal: ConnectRefusal }
   /** The push was rejected: the local commit is undone, the checkout is back on its commit. */
   | { status: 'pushRejected'; error: string; operation: string }
-  /** Something failed after the operation began (labels, files, commit, push, undoing the commit): `error` says what. */
-  | { status: 'failed'; error: string; operation: string }
+  | { status: 'failed'; failure: ConnectFailure; operation: string | null }
+  /** Still under way: ask again with `connect.wait`. */
+  | { status: 'running'; operation: string | null }
 
 declare module 'orca' {
   interface PluginRequests {
@@ -155,8 +213,12 @@ declare module 'orca' {
     'connect.checkGit': { input: ConnectTarget; output: GitCheck }
     'connect.checkGh': { input: ConnectTarget; output: GhCheck }
     'connect.checkAgents': { input: ConnectTarget; output: AgentsCheck }
-    /** «Подключить»: checks everything again, then connects the project (Ф1, point 4). */
+    /** «Подключить»: checks everything again, then connects the project (Ф1, point 4). The answer comes within
+     *  CONNECT_ANSWER_MS; a connection still under way then answers `running`. */
     'connect.connect': { input: ConnectTarget & { form: ConnectForm }; output: ConnectResult }
+    /** The end of the project's connection under way, within CONNECT_ANSWER_MS (`running` again otherwise); the answer
+     *  of one that ended meanwhile; `failed` with `lost` when the worker knows of none. */
+    'connect.wait': { input: ConnectTarget; output: ConnectResult }
   }
   interface PluginPanelEvents {
     /** Posted to every open panel when the connected projects change: the whole new list. */

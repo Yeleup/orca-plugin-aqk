@@ -1,12 +1,14 @@
-// «Подключение проекта» (ТЗ «Экраны», Ф1): a wizard of three steps — 1 the Orca projects of this computer not connected
-// yet (a project on agent-queue-kit is marked and cannot be chosen); 2 the checks, one after another, each with its
-// status and what to do: git and its GitHub repository (none — «Подключение невозможно: нет удалённого репозитория
-// GitHub», the form does not open), gh (no login — «gh: нет входа — выполните gh auth login»: «Подключить» is not
-// there), the agents Orca knows (a default agent it does not know does not stop the form: the owner picks another);
-// 3 the settings form with its defaults, and «Подключить». The worker checks everything again and connects
-// (src/connect/connect.ts): «Подключаю…» while it runs; a refusal names its reason and that nothing is written, with
+// «Подключение проекта» (ТЗ «Экраны», Ф1): a wizard of three steps — 1 the git projects of Orca (those of this computer
+// not connected yet; a project on agent-queue-kit and a project of another host are marked and cannot be chosen); 2 the
+// checks, one after another, each with its status and what to do: git and its GitHub repository (none — «Подключение
+// невозможно: нет удалённого репозитория GitHub», the form does not open), gh (no login — «gh: нет входа — выполните gh
+// auth login»: «Подключить» is not there), the agents Orca knows (a default agent it does not know does not stop the
+// form: the owner picks another); 3 the settings form with its defaults, and «Подключить». The worker checks everything
+// again and connects (src/connect/connect.ts): «Подключаю…» while it runs, however long — the worker answers `running`
+// within its answer window and the screen asks again; a refusal names its reason and that nothing is written, with
 // «Проверить снова»; a rejected push says the commit is undone, with «Повторить»; errors of the fields stand at their
-// fields and keep «Подключить» unavailable until the field changes. Connected — «Проверка проекта» of that project.
+// fields and keep «Подключить» unavailable until the field changes — the agents' choices are those Orca knows now.
+// Connected — «Проверка проекта» of that project, but only while the owner is still on this screen of this attempt.
 import {
   atom,
   Box,
@@ -30,7 +32,9 @@ import type { MessageKey } from '../i18n/catalog'
 import { dataRuleTemplate, taskRulesTemplate } from '../project/templates'
 import type {
   AgentsCheck,
+  AgentsFailure,
   ConnectCandidate,
+  ConnectFailure,
   ConnectField,
   ConnectForm,
   ConnectRefusal,
@@ -42,7 +46,7 @@ import type {
   RoleAgents,
 } from '../protocol'
 import { language, t } from './language'
-import { openScreen, whenOpened } from './navigation'
+import { openScreen, route, whenOpened } from './navigation'
 import { connectedProjects, selectedProject } from './queue'
 import { errorMessage, resource } from './request'
 import { ScreenFrame } from './screens'
@@ -57,9 +61,12 @@ const ROLE_LABELS: { readonly [R in Role]: MessageKey } = {
   start: 'connect.start',
 }
 
-/** How long the worker may take for a check or for «Подключить» (fetch, labels, commit, push): the longest a panel's
- *  request may wait. */
+/** How long the worker may take for a check or for «Подключить» before it answers: the longest a panel's request may
+ *  wait. «Подключить» and `connect.wait` answer `running` sooner (CONNECT_ANSWER_MS). */
 const LONG_REQUEST = { timeoutMs: 120_000 }
+
+/** How long the agents' CLI may take, in seconds (src/platform/orca-agents.ts). */
+const AGENTS_TIMEOUT_SECONDS = 30
 
 /** Step 1: the Orca projects the worker offers. */
 export const connectCandidates = resource(async () => (await plugin.request('connect.projects')).projects)
@@ -89,7 +96,7 @@ type Wizard =
 type Outcome =
   | { readonly kind: 'refused'; readonly refusal: ConnectRefusal }
   | { readonly kind: 'pushRejected'; readonly error: string }
-  | { readonly kind: 'failed'; readonly error: string }
+  | { readonly kind: 'failed'; readonly failure: ConnectFailure }
 
 /** The form as the owner fills it in: null data rule and rules for tasks follow their templates until edited. */
 type FormState = Omit<ConnectForm, 'dataRule' | 'taskRules'> & { readonly dataRule: string | null; readonly taskRules: string | null }
@@ -97,6 +104,7 @@ type FormState = Omit<ConnectForm, 'dataRule' | 'taskRules'> & { readonly dataRu
 export const wizard = atom<Wizard>({ step: 'choose' })
 const form = atom<{ readonly project: string; readonly values: FormState } | null>(null)
 const fieldErrors = atom<FieldError[]>([])
+// The attempt of the wizard that may still change it: every opening of the screen, check and «Подключить» is a new one.
 let runs = 0
 
 whenOpened('connect', startConnect)
@@ -110,16 +118,23 @@ export function startConnect(): void {
   void connectCandidates.load()
 }
 
+/** Whether attempt `mine` is still the one on screen: no later attempt, and the owner is still on «Подключение
+ *  проекта». */
+function current(mine: number): boolean {
+  return mine === runs && read(route).screen === 'connect'
+}
+
 /** «Выбрать» or «Проверить снова»: the checks of step 2, one after another. The form keeps what was filled in for the
- *  same project. */
+ *  same project; the errors of its fields go — «Подключить» checks them again. */
 async function runChecks(project: ConnectCandidate): Promise<void> {
   const mine = ++runs
   const target = { projectId: project.id, hostId: project.hostId }
   let checks: Checks = { project, git: { state: 'running' }, gh: { state: 'waiting' }, agents: { state: 'waiting' } }
   const show = (next: Checks) => {
     checks = next
-    if (mine === runs) set(wizard, { step: 'checks', ...checks })
+    if (current(mine)) set(wizard, { step: 'checks', ...checks })
   }
+  set(fieldErrors, [])
   show(checks)
   const git = await ask(() => plugin.request('connect.checkGit', target, LONG_REQUEST))
   show({ ...checks, git })
@@ -128,13 +143,11 @@ async function runChecks(project: ConnectCandidate): Promise<void> {
   const gh = await ask(() => plugin.request('connect.checkGh', target, LONG_REQUEST))
   show({ ...checks, gh, agents: { state: 'running' } })
   const agents = await ask(() => plugin.request('connect.checkAgents', target, LONG_REQUEST))
-  if (mine !== runs) return
+  if (!current(mine)) return
   const kept = read(form)
-  if (formOpens({ ...checks, agents }) && (kept === null || kept.project !== project.id)) {
-    set(form, { project: project.id, values: initialForm(git.result, agents) })
-    set(fieldErrors, [])
-  }
-  show({ ...checks, agents })
+  const done = { ...checks, agents }
+  if (formOpens(done) && (kept === null || kept.project !== project.id)) set(form, { project: project.id, values: initialForm(done) })
+  show(done)
 }
 
 async function ask<T>(request: () => Promise<T>): Promise<CheckState<T>> {
@@ -158,15 +171,24 @@ function formOpens(checks: Checks): boolean {
   )
 }
 
-function initialForm(git: GitCheck, agents: CheckState<AgentsCheck>): FormState {
-  const known = knownAgents(agents)
+/** The base branches the form offers: GitHub's default branch first, then the branches of `origin` the clone knows. */
+function baseBranches(checks: Checks): { readonly branches: readonly string[]; readonly main: string } {
+  const git = checks.git.state === 'done' && checks.git.result.status === 'ok' ? checks.git.result : null
+  const github = checks.gh.state === 'done' && checks.gh.result.status === 'ok' ? checks.gh.result.defaultBranch : null
+  const main = github ?? git?.defaultBranch ?? ''
+  return { branches: [...new Set([main, ...(git?.branches ?? [])].filter((branch) => branch !== ''))], main }
+}
+
+function initialForm(checks: Checks): FormState {
+  const known = knownAgents(checks.agents)
+  const agents = checks.agents
   const defaults = agents.state === 'done' && 'defaults' in agents.result ? agents.result.defaults : null
   const pick = (role: Role) => {
     const id = defaults?.[role]
     return id !== undefined && known.some((agent) => agent.id === id) ? id : null
   }
   return {
-    baseBranch: git.status === 'ok' ? git.defaultBranch : '',
+    baseBranch: baseBranches(checks).main,
     testCommand: '',
     testCommandWindows: '',
     agents: { implementer: pick('implementer'), reviewer: pick('reviewer'), solver: pick('solver'), start: pick('start') },
@@ -200,40 +222,36 @@ function shownTaskRules(values: FormState): string {
 }
 
 function changeForm(field: ConnectField | null, change: (values: FormState) => FormState): void {
-  const current = read(form)
-  if (current === null) return
-  set(form, { project: current.project, values: change(current.values) })
+  const filled = read(form)
+  if (filled === null) return
+  set(form, { project: filled.project, values: change(filled.values) })
   if (field !== null) set(fieldErrors, read(fieldErrors).filter((error) => error.field !== field))
 }
 
-/** «Подключить» (and «Повторить» after a rejected push): the worker checks everything again and connects. */
+/** «Подключить» (and «Повторить» after a rejected push or a failure): the worker checks everything again and connects;
+ *  while it answers `running`, the screen asks again. A late answer changes nothing once the owner left the screen or
+ *  began another attempt; the connected projects are refreshed anyway. */
 async function submit(): Promise<void> {
-  const current = read(wizard)
+  const now = read(wizard)
   const filled = read(form)
-  if (current.step === 'choose' || filled === null) return
-  const checks: Checks = { project: current.project, git: current.git, gh: current.gh, agents: current.agents }
+  if (now.step === 'choose' || filled === null) return
+  let checks: Checks = { project: now.project, git: now.git, gh: now.gh, agents: now.agents }
   const mine = ++runs
   set(wizard, { step: 'connecting', ...checks })
-  let result: ConnectResult
-  try {
-    result = await plugin.request('connect.connect', {
-      projectId: checks.project.id,
-      hostId: checks.project.hostId,
-      form: formToSend(filled.values),
-    }, LONG_REQUEST)
-  } catch (error) {
-    result = { status: 'failed', error: errorMessage(error), operation: '' }
-  }
-  if (mine !== runs) return
+  const target = { projectId: checks.project.id, hostId: checks.project.hostId }
+  let result = await answer(() => plugin.request('connect.connect', { ...target, form: formToSend(filled.values) }, LONG_REQUEST))
+  while (result.status === 'running' && current(mine)) result = await answer(() => plugin.request('connect.wait', target, LONG_REQUEST))
+  if (result.status === 'connected') void connectedProjects.load()
+  if (!current(mine) || result.status === 'running') return
   if (result.status === 'connected') {
     set(selectedProject, result.project.id)
-    void connectedProjects.load()
     set(wizard, { step: 'choose' })
     set(form, null)
     openScreen('doctor')
     return
   }
   if (result.status === 'fields') {
+    if (result.agents !== null) checks = { ...checks, agents: { state: 'done', result: result.agents } }
     set(fieldErrors, result.errors)
     set(wizard, { step: 'checks', ...checks })
     return
@@ -243,15 +261,26 @@ async function submit(): Promise<void> {
       ? { kind: 'refused', refusal: result.refusal }
       : result.status === 'pushRejected'
         ? { kind: 'pushRejected', error: result.error }
-        : { kind: 'failed', error: result.error }
+        : { kind: 'failed', failure: result.failure }
   set(wizard, { step: 'outcome', outcome, ...checks })
+}
+
+/** The worker's answer; a request that timed out is asked again as `running`, any other error is a failure. */
+async function answer(request: () => Promise<ConnectResult>): Promise<ConnectResult> {
+  try {
+    return await request()
+  } catch (error) {
+    const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined
+    if (code === 'timeout') return { status: 'running', operation: null }
+    return { status: 'failed', failure: { step: 'unexpected', detail: errorMessage(error) }, operation: null }
+  }
 }
 
 // ── Drawing ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 export function ConnectScreen() {
-  const current = read(wizard)
-  return <ScreenFrame screen="connect">{current.step === 'choose' ? <ChooseStep /> : <ProjectSteps wizard={current} />}</ScreenFrame>
+  const now = read(wizard)
+  return <ScreenFrame screen="connect">{now.step === 'choose' ? <ChooseStep /> : <ProjectSteps wizard={now} />}</ScreenFrame>
 }
 
 function Steps(props: { current: 1 | 2 | 3 }) {
@@ -269,6 +298,14 @@ function Steps(props: { current: 1 | 2 | 3 }) {
       {step(3, 'connect.step3')}
     </Row>
   )
+}
+
+/** The line under a project of step 1: why it cannot be chosen, or its path and GitHub repository. */
+function candidateLine(project: ConnectCandidate): string {
+  if (project.otherHost) return t('connect.otherHost', { host: project.hostId })
+  if (project.kit) return t('connect.kit')
+  if (project.repository === null) return t('connect.candidateNoGithub', { path: project.path })
+  return t('connect.candidateGithub', { path: project.path, repository: project.repository })
 }
 
 function ChooseStep() {
@@ -290,16 +327,17 @@ function ChooseStep() {
                 <Text weight="semibold" truncate>
                   {project.name}
                 </Text>
-                <Button key={`choose:${project.id}`} size="sm" disabled={project.kit} onPress={() => void runChecks(project)}>
+                <Button
+                  key={`choose:${project.hostId}:${project.id}`}
+                  size="sm"
+                  disabled={project.kit || project.otherHost}
+                  onPress={() => void runChecks(project)}
+                >
                   {t('connect.choose')}
                 </Button>
               </Row>
               <Text muted size="sm">
-                {project.kit
-                  ? t('connect.kit')
-                  : project.repository === null
-                    ? t('connect.candidateNoGithub', { path: project.path })
-                    : t('connect.candidateGithub', { path: project.path, repository: project.repository })}
+                {candidateLine(project)}
               </Text>
             </Box>
           ))}
@@ -312,14 +350,19 @@ function ChooseStep() {
 /** A line of step 2: its icon and text in the tone of its status. */
 type Line = { readonly key: string; readonly status: 'ok' | 'problem' | 'running' | 'waiting'; readonly text: string }
 
-function gitLine(git: CheckState<GitCheck>): Line {
+function gitLine(git: CheckState<GitCheck>, repository: string): Line {
   if (git.state === 'waiting' || git.state === 'running') return { key: 'git', status: 'running', text: t('connect.gitChecking') }
   if (git.state === 'error') return { key: 'git', status: 'problem', text: t('connect.gitUnchecked', { error: git.error }) }
   const result = git.result
   if (result.status === 'ok') return { key: 'git', status: 'ok', text: t('connect.gitOk', { repository: result.repository }) }
   if (result.status === 'unchecked') return { key: 'git', status: 'problem', text: t('connect.gitUnchecked', { error: result.error }) }
-  const texts = { 'not-git': 'connect.notGit', 'no-github': 'connect.noGithub', 'no-branches': 'connect.noBranches' } as const
-  return { key: 'git', status: 'problem', text: t(texts[result.problem]) }
+  const texts = {
+    'not-git': 'connect.notGit',
+    'no-github': 'connect.noGithub',
+    'push-elsewhere': 'connect.pushElsewhere',
+    'no-branches': 'connect.noBranches',
+  } as const
+  return { key: 'git', status: 'problem', text: t(texts[result.problem], { repository }) }
 }
 
 function ghLine(gh: CheckState<GhCheck>, repository: string): Line {
@@ -338,6 +381,28 @@ function ghLine(gh: CheckState<GhCheck>, repository: string): Line {
   return { key: 'gh', status: 'problem', text: t(texts[result.problem], { repository }) }
 }
 
+/** Why the agents of Orca could not be read, in the panel's language; the CLI is named by the file that ran. */
+function agentsFailureText(failure: AgentsFailure): string {
+  switch (failure.kind) {
+    case 'cli-not-found':
+      return t('connect.agentsCliNotFound', { detail: failure.search })
+    case 'not-started':
+      return t('connect.agentsNotStarted', { cli: failure.cli, detail: failure.detail })
+    case 'timed-out':
+      return t('connect.agentsTimedOut', { cli: failure.cli, seconds: AGENTS_TIMEOUT_SECONDS })
+    case 'refused':
+      return t('connect.agentsOrcaRefused', { detail: failure.detail })
+    case 'no-json':
+      return t('connect.agentsNoJson', { cli: failure.cli, detail: failure.detail })
+    case 'no-list':
+      return t('connect.agentsNoList', { cli: failure.cli })
+    case 'no-id':
+      return t('connect.agentsNoId', { cli: failure.cli })
+    case 'not-ok':
+      return t('connect.agentsNotOk', { cli: failure.cli, detail: failure.detail })
+  }
+}
+
 function agentsLine(agents: CheckState<AgentsCheck>): Line {
   if (agents.state === 'waiting') return { key: 'agents', status: 'waiting', text: t('connect.agentsWaiting') }
   if (agents.state === 'running') return { key: 'agents', status: 'running', text: t('connect.agentsChecking') }
@@ -347,8 +412,7 @@ function agentsLine(agents: CheckState<AgentsCheck>): Line {
     return { key: 'agents', status: 'ok', text: t('connect.agentsOk', { agents: uniqueRoles(result.defaults).join(', ') }) }
   }
   if (result.status === 'unchecked') {
-    const key = result.kind === 'cli-not-found' ? 'connect.agentsNoCli' : 'connect.agentsUnchecked'
-    return { key: 'agents', status: 'problem', text: t(key, { reason: result.reason }) }
+    return { key: 'agents', status: 'problem', text: t('connect.agentsUnchecked', { reason: agentsFailureText(result.failure) }) }
   }
   if (result.problem === 'empty') return { key: 'agents', status: 'problem', text: t('connect.agentsEmpty') }
   return { key: 'agents', status: 'problem', text: t('connect.agentsMissing', { agents: result.missing.join(', ') }) }
@@ -381,8 +445,8 @@ function ProjectSteps(props: { wizard: Exclude<Wizard, { step: 'choose' }> }) {
   const checks = props.wizard
   const git = checks.git
   const gitOk = git.state === 'done' && git.result.status === 'ok'
-  const repository = gitOk && git.state === 'done' && git.result.status === 'ok' ? git.result.repository : (checks.project.repository ?? '')
-  const lines = [gitLine(git), ...(gitOk ? [ghLine(checks.gh, repository), agentsLine(checks.agents)] : [])]
+  const repository = git.state === 'done' && git.result.status === 'ok' ? git.result.repository : (checks.project.repository ?? '')
+  const lines = [gitLine(git, repository), ...(gitOk ? [ghLine(checks.gh, repository), agentsLine(checks.agents)] : [])]
   const opens = formOpens(checks)
   if (props.wizard.step === 'connecting') {
     return (
@@ -449,7 +513,9 @@ const FIELD_ERRORS: { readonly [C in FieldError['code']]: MessageKey } = {
   oneLine: 'connect.errorOneLine',
   agent: 'connect.errorAgent',
   number: 'connect.errorNumber',
-  branch: 'connect.errorBranch',
+  'branch-name': 'connect.errorBranchName',
+  'no-branch': 'connect.errorNoBranch',
+  masked: 'connect.errorMasked',
   invalid: 'connect.errorInvalid',
 }
 const REQUIRED: { readonly [F in ConnectField]?: MessageKey } = {
@@ -469,8 +535,7 @@ function SettingsForm(props: { checks: Checks }) {
   const filled = read(form)
   if (filled === null) return null
   const values = filled.values
-  const git = props.checks.git
-  const branches = git.state === 'done' && git.result.status === 'ok' ? git.result.branches : []
+  const { branches } = baseBranches(props.checks)
   const agents = knownAgents(props.checks.agents)
   const errors = read(fieldErrors)
   const text = (field: 'testCommand' | 'testCommandWindows' | 'maxInProgress' | 'directories', label: MessageKey, placeholder?: MessageKey) => (
@@ -481,7 +546,7 @@ function SettingsForm(props: { checks: Checks }) {
         value={values[field]}
         placeholder={placeholder === undefined ? undefined : t(placeholder)}
         invalid={errorOf(field) !== undefined}
-        onChange={(value) => changeForm(field, (current) => ({ ...current, [field]: value }))}
+        onChange={(value) => changeForm(field, (now) => ({ ...now, [field]: value }))}
       />
     </Field>
   )
@@ -493,7 +558,7 @@ function SettingsForm(props: { checks: Checks }) {
           labelHidden
           options={branches.map((branch) => ({ value: branch, label: branch }))}
           value={values.baseBranch}
-          onChange={(value) => changeForm('baseBranch', (current) => ({ ...current, baseBranch: value }))}
+          onChange={(value) => changeForm('baseBranch', (now) => ({ ...now, baseBranch: value }))}
         />
       </Field>
       {text('testCommand', 'connect.testCommand')}
@@ -506,7 +571,7 @@ function SettingsForm(props: { checks: Checks }) {
             options={agents.map((agent) => ({ value: agent.id, label: agent.name }))}
             value={values.agents[role] ?? undefined}
             placeholder={t('connect.chooseAgent')}
-            onChange={(value) => changeForm(`agents.${role}`, (current) => ({ ...current, agents: { ...current.agents, [role]: value } }))}
+            onChange={(value) => changeForm(`agents.${role}`, (now) => ({ ...now, agents: { ...now.agents, [role]: value } }))}
           />
         </Field>
       ))}
@@ -519,7 +584,7 @@ function SettingsForm(props: { checks: Checks }) {
             { value: 'en', label: t('connect.languageEnglish') },
           ]}
           value={values.language}
-          onChange={(value) => changeForm('language', (current) => ({ ...current, language: value === 'ru' ? 'ru' : 'en' }))}
+          onChange={(value) => changeForm('language', (now) => ({ ...now, language: value === 'ru' ? 'ru' : 'en' }))}
         />
       </Field>
       {text('maxInProgress', 'connect.maxInProgress')}
@@ -532,7 +597,7 @@ function SettingsForm(props: { checks: Checks }) {
             { value: 'own', label: t('connect.worktreeOwn') },
           ]}
           value={values.worktreeMode}
-          onChange={(value) => changeForm('worktreeMode', (current) => ({ ...current, worktreeMode: value === 'own' ? 'own' : 'shared' }))}
+          onChange={(value) => changeForm('worktreeMode', (now) => ({ ...now, worktreeMode: value === 'own' ? 'own' : 'shared' }))}
         />
       </Field>
       {text('directories', 'connect.directories', 'connect.directoriesHint')}
@@ -543,7 +608,7 @@ function SettingsForm(props: { checks: Checks }) {
           rows={3}
           value={shownDataRule(values)}
           invalid={errorOf('dataRule') !== undefined}
-          onChange={(value) => changeForm('dataRule', (current) => ({ ...current, dataRule: value }))}
+          onChange={(value) => changeForm('dataRule', (now) => ({ ...now, dataRule: value }))}
         />
       </Field>
       <Field label={t('connect.taskRules')} error={errorOf('taskRules')} required>
@@ -553,7 +618,7 @@ function SettingsForm(props: { checks: Checks }) {
           rows={8}
           value={shownTaskRules(values)}
           invalid={errorOf('taskRules') !== undefined}
-          onChange={(value) => changeForm('taskRules', (current) => ({ ...current, taskRules: value }))}
+          onChange={(value) => changeForm('taskRules', (now) => ({ ...now, taskRules: value }))}
         />
       </Field>
       <Row>
@@ -582,14 +647,14 @@ function OutcomeView(props: { outcome: Outcome; project: ConnectCandidate }) {
       </Callout>
     )
   }
-  const message =
-    outcome.kind === 'pushRejected' ? t('connect.pushRejected', { error: outcome.error }) : t('connect.failed', { error: outcome.error })
+  const message = outcome.kind === 'pushRejected' ? t('connect.pushRejected', { error: outcome.error }) : failureText(outcome.failure)
+  const lost = outcome.kind === 'failed' && outcome.failure.step === 'lost'
   return (
     <Callout tone="danger">
       <Stack gap="sm">
         <Text>{message}</Text>
         <Row>
-          <Button tone="accent" icon="refresh" onPress={() => void submit()}>
+          <Button tone="accent" icon="refresh" onPress={() => void (lost ? startConnect() : submit())}>
             {t('state.retry')}
           </Button>
         </Row>
@@ -604,14 +669,14 @@ function refusalText(refusal: ConnectRefusal, repository: string): string {
       return t('connect.kitRefused')
     case 'busy':
       return t('connect.busy')
+    case 'connected':
+      return t('connect.connectedRefused')
     case 'git':
-      return gitLine({ state: 'done', result: refusal.check }).text
+      return gitLine({ state: 'done', result: refusal.check }, repository).text
     case 'gh':
       return ghLine({ state: 'done', result: refusal.check }, repository).text
     case 'agents':
-      return refusal.check.status === 'unchecked'
-        ? t('connect.agentsRefused', { reason: refusal.check.reason })
-        : agentsLine({ state: 'done', result: refusal.check }).text
+      return t('connect.agentsRefused', { reason: agentsFailureText(refusal.failure) })
     case 'fetch':
       return t('connect.fetchFailed', { error: refusal.error })
     case 'not-on-base':
@@ -626,9 +691,64 @@ function refusalText(refusal: ConnectRefusal, repository: string): string {
       return t('connect.ahead', { base: refusal.base, commits: refusal.commits })
     case 'diverged':
       return t('connect.diverged', { base: refusal.base, ahead: refusal.ahead, behind: refusal.behind })
-    case 'file':
-      return t('connect.fileRefused', { file: refusal.file, problem: refusal.problem })
+    case 'file': {
+      const keys = {
+        present: 'connect.filePresent',
+        ignored: 'connect.fileIgnored',
+        transformed: 'connect.fileTransformed',
+        'not-text': 'connect.fileNotText',
+        'not-file': 'connect.fileNotFile',
+        unpaired: 'connect.fileUnpaired',
+        masked: 'connect.fileMasked',
+      } as const
+      return t(keys[refusal.problem], { file: refusal.file, detail: refusal.detail })
+    }
     case 'journal':
       return t('connect.journalRefused', { error: refusal.error })
+  }
+}
+
+function failureText(failure: ConnectFailure): string {
+  const left = (paths: readonly string[]) => (paths.length > 0 ? ` ${t('connect.left', { paths: paths.join(', ') })}` : '')
+  switch (failure.step) {
+    case 'labels':
+      return t('connect.failedLabels', { detail: failure.detail })
+    case 'changed': {
+      const change = failure.change
+      const what =
+        change.kind === 'head'
+          ? t('connect.changedHead')
+          : change.kind === 'branch'
+            ? t('connect.changedBranch')
+            : change.kind === 'dirty'
+              ? t('connect.changedDirty', { paths: change.paths })
+              : t('connect.changedFile', { file: change.file })
+      return t('connect.failedChanged', { what })
+    }
+    case 'files':
+      return `${t('connect.failedFiles', { detail: failure.detail })}${left(failure.left)}`
+    case 'commit':
+      return `${t('connect.failedCommit', { detail: failure.detail })}${left(failure.left)}`
+    case 'verify': {
+      const what =
+        failure.what === 'parent'
+          ? t('connect.verifyParent')
+          : failure.what === 'paths'
+            ? t('connect.verifyPaths')
+            : failure.what === 'blob'
+              ? t('connect.verifyBlob', { file: failure.file ?? '' })
+              : t('connect.verifyMessage')
+      return `${t('connect.failedVerify', { what })}${left(failure.left)}`
+    }
+    case 'push-unknown':
+      return t('connect.failedPushUnknown', { detail: failure.detail })
+    case 'undo':
+      return failure.push === null
+        ? t('connect.failedUndo', { detail: failure.detail })
+        : t('connect.failedUndoPush', { push: failure.push, detail: failure.detail })
+    case 'unexpected':
+      return t('connect.failed', { error: failure.detail })
+    case 'lost':
+      return t('connect.failedLost')
   }
 }
