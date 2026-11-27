@@ -11,7 +11,7 @@
 import { homedir } from 'node:os'
 import { posix, win32, type PlatformPath } from 'node:path'
 import { cwd, env, execPath, platform } from 'node:process'
-import { createText, isRunnableFile, listEntries, modifiedAt, readText, removeFile } from './files'
+import { createText, isRunnableFile, listEntries, modifiedAt, readText } from './files'
 import { startProcess } from './process'
 
 export type Platform = 'linux' | 'darwin' | 'win32'
@@ -82,9 +82,6 @@ export type Machine = {
   // Creates the file with exactly this text unless the file exists, creating its directory first. True when this call
   // created it, false when it was already there; a reader never sees it half written. Throws on any other failure.
   createText(path: string, text: string): Promise<boolean>
-  // Removes the file — the name itself, a link is not followed: true when this call removed it, false when there was
-  // none. Throws on any other failure (a directory there, no access).
-  removeFile(path: string): Promise<boolean>
   start(request: StartRequest): Promise<StartOutcome>
 }
 
@@ -107,7 +104,6 @@ export function realMachine(overrides: Partial<Machine> = {}): Machine {
     modifiedAt,
     listEntries,
     createText: (path, text) => createText(path, text),
-    removeFile,
     start: startProcess,
     ...overrides,
   }

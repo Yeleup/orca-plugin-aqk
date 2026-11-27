@@ -3051,113 +3051,72 @@ test('Закрытие, которое помнит воркер, — тольк
   }
 })
 
-test('Проверка своего терминала, не прошедшая при первой отправке уже после записи файлов сообщения (ошибка чтения launch.json перед terminal send), — не отправлено с причиной проверки, terminal send не запущен, ничего не введено, файлов сообщения нет, отчёт читается по прежнему входу; диск не дал убрать запись отправки — записан исход «не отправлено»', async () => {
+test('Граница первой отправки решается до записи её файлов: проверка после поиска CLI не прошла (launch.json не читается, диск не принимает записи) — не отправлено с причиной проверки, файлов сообщения нет, ничего не введено, после восстановления диска отчёт по прежнему входу без запроса к Orca; launch.json перестал читаться уже после записи отправки — строка введена один раз, исход записан, файлов без исхода нет', async () => {
   const orca = fakeOrca()
-  // Once the send record of a message is on disk, the disk fails the n-th read of a launch record and every later one
-  // (`failFrom`), and refuses to remove files (`keep`), while the test says so.
-  let failFrom: number | null = null
-  let keep = false
-  let armed = false
-  let reads = 0
-  // Run once a send record is written, when the test sets it.
-  let onSend: (() => void) | null = null
+  // While `broken` is set, the disk fails every read of a launch record and refuses every write. `breakAfterStatus` sets
+  // it once the CLI has answered `status` (the search is over); `breakAfterSend` once a send record is written.
+  let broken = false
+  let breakAfterStatus = false
+  let breakAfterSend = false
   const machine: Machine = {
     ...orca.machine,
     createText: async (path, text) => {
+      if (broken) throw new Error('EIO: i/o error, write')
       const created = await orca.machine.createText(path, text)
-      if (failFrom !== null && /\/sending-\d+\.json$/.test(path)) {
-        armed = true
-        reads = 0
-      }
-      if (onSend !== null && /\/sending-\d+\.json$/.test(path)) {
-        onSend()
-        onSend = null
-      }
+      if (breakAfterSend && /\/sending-\d+\.json$/.test(path)) broken = true
       return created
     },
     readText: (path) => {
-      if (armed && failFrom !== null && path.endsWith('/launch.json') && ++reads >= failFrom) throw new Error('EIO: i/o error, read')
+      if (broken && path.endsWith('/launch.json')) throw new Error('EIO: i/o error, read')
       return orca.machine.readText(path)
     },
-    removeFile: async (path) => {
-      if (keep) throw new Error('EROFS: read-only file system, unlink')
-      return orca.machine.removeFile(path)
+    start: async (request) => {
+      const outcome = await orca.machine.start(request)
+      if (breakAfterStatus && request.args[0] === 'status') broken = true
+      return outcome
     },
   }
   const r = await mount(orca, { machine })
   const launch = await launched(r, 144, 'implementer')
-  // The task's other launch keeps its agents directory a real one when the launch's own is moved away.
-  await launched(r, 144, 'reviewer')
   await taskReported(r, launch, 'Отчёт на задание.\n')
   const filesOfMessages = () =>
     [...orca.machine.files.keys()].filter((path) => path.startsWith(`${launch.dir}/`) && /\/(message-\d+\.(md|json)|sending-\d+\.json|report-\d+\.md|started-[1-9]\d*)$/.test(path))
-  const unreadable = notOwn(launch.terminalId, 'the record of launch 1 of issue-144 cannot be read: EIO: i/o error, read')
 
-  // Both checks of message() pass; the send record is written; then the check fails — the one before the CLI is asked
-  // (the first read of launch.json after the record), or the one right before `terminal send` (the second): not sent,
-  // with the check's reason, no `terminal send`, nothing typed, and no file of the message left.
-  for (const from of [1, 2]) {
-    failFrom = from
-    armed = false
-    assert.deepEqual(await r.agents.message(launch, 'Замечание.'), { ok: false, outcome: 'not-sent', error: unreadable }, `failing read ${from}`)
-    assert.ok(armed, `failing read ${from}`)
-    failFrom = null
-    armed = false
-    assert.deepEqual(cliSends(orca), [], `failing read ${from}`)
-    assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [], `failing read ${from}`)
-    assert.deepEqual(filesOfMessages(), [], `failing read ${from}`)
-    // The message is no input of the agent: the report is the task's, and Orca is not asked about it.
-    assert.deepEqual(await r.agents.report(launch), { ready: true, text: 'Отчёт на задание.\n', reportFile: launch.reportFile })
-    assert.deepEqual(cliSends(orca), [], `failing read ${from}`)
-  }
+  // The check before the search passes; the disk breaks while the CLI is looked for: the check after the search — the
+  // first send's last one — refuses. Nothing of the message is written, and nothing waits on the disk to undo it.
+  breakAfterStatus = true
+  assert.deepEqual(await r.agents.message(launch, 'Замечание.'), {
+    ok: false,
+    outcome: 'not-sent',
+    error: notOwn(launch.terminalId, 'the record of launch 1 of issue-144 cannot be read: EIO: i/o error, read'),
+  })
+  assert.ok(broken)
+  breakAfterStatus = false
+  assert.deepEqual(cliSends(orca), [])
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [])
+  assert.deepEqual(filesOfMessages(), [])
+  // The disk recovers: no input was left behind — the report is the task's, and Orca is not asked about anything.
+  broken = false
+  assert.deepEqual(await r.agents.report(launch), { ready: true, text: 'Отчёт на задание.\n', reportFile: launch.reportFile })
+  assert.deepEqual(cliSends(orca), [])
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [])
 
-  // The disk reads again: the next message is message 1, its line typed once.
-  const sent = await r.agents.message(launch, 'Замечание.')
-  assert.deepEqual(sent, { ok: true, reportFile: messageFiles(orca, launch, 1).reportFile, started: true })
+  // The check passes and the files are written; the disk fails the launch record from the send record on: the first
+  // send is not checked again — its line is typed once, as its request, and its outcome recorded once the disk is back.
+  breakAfterSend = true
+  orca.loseAnswers = 1
+  const lost = await r.agents.message(launch, 'Замечание.')
+  assert.ok(!lost.ok && lost.outcome === 'unknown', JSON.stringify(lost))
+  breakAfterSend = false
   const one = sendingOf(orca, launch, 1)
   assert.deepEqual(cliSends(orca), [sendArgs(orca, launch.terminalId, one)])
   assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [one.line])
-
-  // The check fails once message 2 is written, and the disk refuses to remove its send record: the refusal is recorded
-  // as its outcome — not taken, nothing typed — and the answer is «not sent» with the check's reason.
-  failFrom = 1
-  keep = true
-  const target = `message 2 to the agent "codex" in terminal ${launch.terminalId}`
-  assert.deepEqual(await r.agents.message(launch, 'Ещё замечание.'), { ok: false, outcome: 'not-sent', error: `${target} was not sent: ${unreadable}` })
-  failFrom = null
-  keep = false
-  assert.ok(orca.machine.files.has(messageFiles(orca, launch, 2).messageFile))
-  assert.deepEqual(outcomeOf(orca, launch, 2), { accepted: false, turnStarted: false, at: orca.clock.now(), error: unreadable })
-  assert.equal(cliSends(orca).length, 1)
+  broken = false
+  // Asked again with the disk back: Orca repeats the receipt by the same id, the line stays typed once.
+  assert.deepEqual(await r.agents.report(launch), notReady(launch, { reportFile: one.reportFile, started: true, state: 'done', listed: true }))
+  assert.deepEqual(requestIds(orca, launch.terminalId), [one.requestId, one.requestId])
   assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [one.line])
-  // Message 2 not taken, the last input is message 1.
-  assert.equal((await r.agents.report(launch)).reportFile, messageFiles(orca, launch, 1).reportFile)
-
-  // Once the send record of message 3 is written, the launch's directory is moved away and a link to another directory,
-  // which has a file of that name, put in its place: the check refuses, and nothing is removed through the link —
-  // neither that file nor the moved records.
-  const decoy = dataPath(orca.machine, r.dataDir, 'decoy')
-  const movedAway = dataPath(orca.machine, r.dataDir, 'moved-away')
-  orca.machine.files.set(`${decoy}/sending-3.json`, '{}\n')
-  onSend = () => {
-    for (const [path, text] of [...orca.machine.files]) {
-      if (!path.startsWith(`${launch.dir}/`)) continue
-      orca.machine.files.set(`${movedAway}${path.slice(launch.dir.length)}`, text)
-      orca.machine.files.delete(path)
-    }
-    orca.machine.links.set(launch.dir, decoy)
-  }
-  const linkInPlace = `${launch.dir} is a link or a file, not the directory of launch 1 of issue-144`
-  assert.deepEqual(await r.agents.message(launch, 'Третье замечание.'), {
-    ok: false,
-    outcome: 'not-sent',
-    error: `${notOwn(launch.terminalId, linkInPlace)}; nothing of message 3 is removed: ${linkInPlace}: its records are not read`,
-  })
-  assert.equal(orca.machine.files.get(`${decoy}/sending-3.json`), '{}\n')
-  for (const name of ['message-3.md', 'sending-3.json']) assert.ok(orca.machine.files.has(`${movedAway}/${name}`), name)
-  assert.equal(orca.machine.files.has(`${movedAway}/message-3.json`), false)
-  assert.equal(cliSends(orca).length, 1)
-  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [one.line])
+  assert.deepEqual(outcomeOf(orca, launch, 1), { accepted: true, turnStarted: true, at: orca.clock.now(), error: null })
   assert.deepEqual(r.worker.refusals, [])
   await r.worker.deactivate()
 })

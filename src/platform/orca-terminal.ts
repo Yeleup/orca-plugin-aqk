@@ -19,7 +19,8 @@
 // and on such an Orca the plugin's messages do not reach agents.
 //
 // The caller's own check runs once the CLI is found, right before `terminal send` starts: when it refuses, nothing runs
-// and the line is not sent (the agents layer checks there that the terminal is still its own).
+// and the line is not sent (the agents layer checks there that the terminal is still its own when it asks again about
+// a send; a first send it checks before writing its files).
 //
 // The outcome of one run:
 // - any answer in which Orca itself calls the outcome unknown (`error.data.deliveryOutcome: "unknown"`, whatever else

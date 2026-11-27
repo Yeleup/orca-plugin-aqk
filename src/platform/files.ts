@@ -1,6 +1,6 @@
 // The file operations of the real machine: whether a file can be run, reading a text file and the time of its last
-// write, the entries of a directory, creating a file only if it is absent, in a way no reader ever sees half written,
-// and removing a file.
+// write, the entries of a directory, and creating a file only if it is absent, in a way no reader ever sees half
+// written.
 import { randomUUID } from 'node:crypto'
 import { accessSync, constants, linkSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
@@ -88,17 +88,5 @@ export async function createText(path: string, text: string, ops: PublishOps = N
     } catch {
       // Already gone.
     }
-  }
-}
-
-// Removes the file `path` — the name itself: a link there is removed, never what it points to. True when this call
-// removed it, false when there was none; throws on any other failure (a directory there, no access).
-export async function removeFile(path: string): Promise<boolean> {
-  try {
-    unlinkSync(path)
-    return true
-  } catch (error) {
-    if (errorCode(error) === 'ENOENT') return false
-    throw error
   }
 }

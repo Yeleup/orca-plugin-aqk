@@ -51,44 +51,43 @@
 //   worktree and the focus of Orca's window never move for a message (`terminal.focus`, `workspace.open`). Each run of
 //   the CLI carries the request id of the message, a UUID of the plugin: the same id again makes Orca repeat the
 //   outcome, or type the line then if it never saw the request, never twice. Only into the terminal of an agent the
-//   plugin launched: before every run of the CLI — the first send and every asking again, before the search for the CLI
-//   (its `status` is a run too) and again right before `terminal send` — one check: the launch's directory is the real
-//   directory of its task and number in the data directory (no link or file on the way or in its place), its record
-//   (launch.json) a regular file there naming this terminal, and the plugin has not closed it — its `closed` mark, or a
-//   close of this very terminal Orca confirmed to this worker while the disk has not taken its mark (tried again at the
-//   next check; another terminal in the same launch directory, a new launch of the same number once the task's data was
-//   removed, is not refused by it); otherwise the CLI does not run. A worker restarted before that mark is on disk does
-//   not know the close: the terminal passes the check, the CLI runs and Orca refuses the closed handle
+//   plugin launched: before every run of the CLI — the first send and every asking again — one check, before the search
+//   for the CLI (its `status` is a run too) and again after it: for a first send right before its files are written,
+//   for asking again right before `terminal send`. It holds when the launch's directory is the real directory of its
+//   task and number in the data directory (no link or file on the way or in its place), its record (launch.json) a
+//   regular file there naming this terminal, and the plugin has not closed it — its `closed` mark, or a close of this
+//   very terminal Orca confirmed to this worker while the disk has not taken its mark (tried again at the next check;
+//   another terminal in the same launch directory, a new launch of the same number once the task's data was removed, is
+//   not refused by it); otherwise the CLI does not run. A worker restarted before that mark is on disk does not know
+//   the close: the terminal passes the check, the CLI runs and Orca refuses the closed handle
 //   (`terminal_handle_stale`), nothing typed — not taken on a first send, the outcome by Orca's answer on asking again
 //   —, and the next stop of the task writes the mark. A first send looks for the CLI first, checks again after the
-//   search, found or not, and only then writes the message's files: the check failing leaves no file of the message —
-//   also when the check right before `terminal send` fails once the files of a first send are written (its launch.json
-//   not read, say): the CLI does not run, and the files are withdrawn before the answer, the send record first (so the
-//   message is no input), then a start mark a turn left meanwhile and the text, only from the launch's real directory,
-//   the disk refusing to remove the send record recording the refusal as the outcome instead; no CLI found and the
-//   check holding, the message is written and its send recorded, and it gets its outcome at once — not taken, with the
-//   reason of the search — and no `terminal send` runs. An empty message is an error, and nothing is written. The send
-//   is recorded (sending-<k>.json) before the line is typed; its outcome (message-<k>.json) once it is known. «Not
-//   sent» only on proof that the line of this request was not typed: the CLI not found or not started, or Orca refusing
-//   the line itself (in the form of Orca's refusal, with no receipt beside it) on the first send; a receipt saying the
-//   terminal did not take it, in any attempt; the check failing on the first send. Anything else is unknown, also every
-//   refusal of asking again: nothing is recorded, the message stays the last input, and the next reading of the report
-//   asks Orca again with the same id, unless a send of it runs in this worker now. The sends of one launch and the
-//   askings again run one at a time, in the order of their numbers; while the outcome of a message is unknown, a new
-//   one is an error and nothing of it is written. A send is under way in this worker from before its record can be seen
-//   until its outcome is settled. The caller gets «taken» with the message's report file and whether the turn started,
-//   or an error with the reason and its kind: not sent, or unknown. A stop of the task waits for a send that writes its
-//   files. The layer is built for one worker of the plugin per data directory — the ТЗ (Ф4) has one coordinator per
-//   computer, and Orca keeps one worker of a plugin —, its restarts included, a new worker going on from the former
-//   one's records: the send queue of a launch, «a send of it runs now» and a stop's waiting for the sends hold within
-//   the worker, so once the files are written the check right before `terminal send` does not change. Two workers on
-//   one data directory at once are no mode of the plugin: for them only what Orca and the disk keep holds — the line of
-//   one request is typed at most once (its request id), and only into the terminal of its launch —, while the order of
-//   the numbers, the refusal of a new message while an outcome is unknown, the recording of outcomes and the stop are
-//   not coordinated between them. The files of a message (its records, its report, its start mark) are read only as
-//   regular files of the launch's directory: a link or a directory in their place is an error, never another file's
-//   text nor a fall back to an earlier input; a send record is asked about again only with this message's line and
-//   report file and a UUID of the plugin.
+//   search, found or not, and only then writes the message's files: the check failing leaves no file of the message; no
+//   CLI found and the check holding, the message is written and its send recorded, and it gets its outcome at once —
+//   not taken, with the reason of the search — and no `terminal send` runs. An empty message is an error, and nothing
+//   is written. The send is recorded (sending-<k>.json) before the line is typed; its outcome (message-<k>.json) once
+//   it is known. «Not sent» only on proof that the line of this request was not typed: the CLI not found or not
+//   started, or Orca refusing the line itself (in the form of Orca's refusal, with no receipt beside it) on the first
+//   send; a receipt saying the terminal did not take it, in any attempt; the check failing on the first send. Anything
+//   else is unknown, also every refusal of asking again: nothing is recorded, the message stays the last input, and the
+//   next reading of the report asks Orca again with the same id, unless a send of it runs in this worker now. The sends
+//   of one launch and the askings again run one at a time, in the order of their numbers; while the outcome of a
+//   message is unknown, a new one is an error and nothing of it is written. A send is under way in this worker from
+//   before its record can be seen until its outcome is settled. The caller gets «taken» with the message's report file
+//   and whether the turn started, or an error with the reason and its kind: not sent, or unknown. A first send is not
+//   checked again once its files are written: from that check to its run of the CLI only its own records are written,
+//   and nothing changes its boundary meanwhile — a stop of the task waits for a send that writes its files, and the
+//   launch's records are never rewritten —, so a refusal never finds files of the message. The layer is built for one
+//   worker of the plugin per data directory — the ТЗ (Ф4) has one coordinator per computer, and Orca keeps one worker
+//   of a plugin —, its restarts included, a new worker going on from the former one's records: the send queue of a
+//   launch, «a send of it runs now» and a stop's waiting for the sends hold within the worker. Two workers on one data
+//   directory at once are no mode of the plugin: for them only what Orca and the disk keep holds — the line of one
+//   request is typed at most once (its request id), and only into the terminal of its launch —, while the order of the
+//   numbers, the refusal of a new message while an outcome is unknown, the recording of outcomes and the stop are not
+//   coordinated between them. The files of a message (its records, its report, its start mark) are read only as regular
+//   files of the launch's directory: a link or a directory in their place is an error, never another file's text nor a
+//   fall back to an earlier input; a send record is asked about again only with this message's line and report file and
+//   a UUID of the plugin.
 // - report: on the plugin's last input to the agent — the last message whose send is recorded and is not proven unsent,
 //   else the task. While that message's outcome is not known, the reading says why and waits — its start still kept on
 //   disk when its report file is there or a turn began after its send. The records of the messages and their reports
@@ -132,8 +131,7 @@
 // - started-0 — the agent has started on its task, started-<k> — on message k (the time the plugin saw it);
 // - closed — the plugin has closed the agent's terminal.
 // Every file is created once and never rewritten, so the records survive a restart of the worker: a new worker stops
-// the agents an earlier one launched. The only files the plugin removes are those of a first send of a message the
-// check of its own terminal refused once they were written (message, above). A stop reads each launch's records by themselves: a launch whose task file is
+// the agents an earlier one launched. A stop reads each launch's records by themselves: a launch whose task file is
 // gone is still stopped, one the plugin has closed (its `closed` mark is in its directory) is done whatever its other
 // records say, and one whose records cannot be read is reported with the reason while the others are stopped.
 // Launches are the real directories with a number for a name: a link (or a junction) or a file there is none — its
@@ -636,7 +634,8 @@ export class Agents {
       const missing = await this.terminalInput.ready()
       // Checked again after the search, found or not, with nothing waited for between this check and the start of the
       // first write: a stop of the task begun meanwhile, or the terminal closed by the plugin, leaves no file of the
-      // message.
+      // message. This is the send's last check before its run of the CLI (deliver): from here on only its own records
+      // are written, and a stop of the task waits for it.
       const changed = this.mayNotSend(launch, taskDir)
       if (changed !== null) return unsent(changed)
       return this.send(launch, text, missing)
@@ -801,13 +800,13 @@ export class Agents {
   // Types the recorded line of message k into the launch's terminal as its request, and records the outcome once it is
   // known: the first send (from message), or asking again about a send whose outcome is not known (from report — the
   // same request id makes Orca repeat the outcome, or type the line then if it never saw the request). The boundary is
-  // checked before every run of the CLI: before its search (whose `status` is a run too), and again once it is found,
-  // right before `terminal send`. «Not taken» is recorded only on proof that the line of this request was not
-  // typed: on the first send, the CLI not found or not started, or Orca refusing the line itself; in any attempt,
-  // Orca's receipt saying the terminal did not take it. The boundary failing on the first send is «not sent» too, but
-  // its files are withdrawn instead (withdraw). Asking again, no refusal decides anything: the outcome stays unknown and
-  // nothing is written. A first send whose search found no CLI (`missingCli`, the reason) is recorded not taken at
-  // once: no CLI runs.
+  // checked before every run of the CLI: before its search (whose `status` is a run too), and again once it is found —
+  // asking again right before `terminal send`, a first send in message(), right before its files are written. «Not
+  // taken» is recorded only on proof that the line of this request was not typed: on the first send, the CLI not found
+  // or not started, or Orca refusing the line itself; in any attempt, Orca's receipt saying the terminal did not take
+  // it.
+  // Asking again, no refusal decides anything: the outcome stays unknown and nothing is written. A first send whose
+  // search found no CLI (`missingCli`, the reason) is recorded not taken at once: no CLI runs.
   private async deliver(
     launch: AgentLaunch,
     k: number,
@@ -826,17 +825,17 @@ export class Agents {
       return unsent(`${target} was not sent: ${reason}`)
     }
     if (attempt === 'first' && missingCli !== null) return notTaken(missingCli)
-    // The boundary refusing a first send once its files are written: nothing is typed, and its files are withdrawn.
-    const refusedFirst = (reason: string) => this.withdraw(launch, k, reason, notTaken)
-    const foreign = this.notOwnTerminal(launch)
-    if (foreign !== null) return attempt === 'first' ? refusedFirst(foreign) : unknown(foreign)
-    // The check right before `terminal send`: its refusal is the boundary's, not Orca's.
-    const boundary: { refused: string | null } = { refused: null }
-    const sent = await this.terminalInput.send(launch.terminalId, sending.line, sending.requestId, () => {
-      boundary.refused = this.notOwnTerminal(launch)
-      return boundary.refused
-    })
-    if (!sent.ok && boundary.refused !== null) return attempt === 'first' ? refusedFirst(boundary.refused) : unknown(boundary.refused)
+    // The boundary. A first send was checked in message() after the search for the CLI, right before its files were
+    // written: from there to its run of the CLI only its own records are written, a stop of the task waits for it, and
+    // the launch's records do not change — so it is not checked again, and a refusal never finds files of it. Asking
+    // again is checked here, before the CLI is looked for, and once more right before `terminal send`: refused, nothing
+    // runs and the outcome stays unknown, with nothing written.
+    if (attempt === 'again') {
+      const foreign = this.notOwnTerminal(launch)
+      if (foreign !== null) return unknown(foreign)
+    }
+    const check = attempt === 'again' ? () => this.notOwnTerminal(launch) : () => null
+    const sent = await this.terminalInput.send(launch.terminalId, sending.line, sending.requestId, check)
     if (!sent.ok) return attempt === 'first' && sent.delivery === 'not-sent' ? notTaken(sent.error) : unknown(sent.error)
     if (!sent.accepted) return notTaken(`the terminal did not take the line: ${sent.refusedReason ?? 'Orca gave no reason'}`)
     try {
@@ -847,37 +846,6 @@ export class Agents {
     // The start Orca saw, kept as a mark too; when the disk refuses it, a reading of the report keeps it or says why.
     if (sent.turnStarted) await this.keepStarted(launch, k).catch(() => undefined)
     return { ok: true, reportFile: sending.reportFile, started: sent.turnStarted }
-  }
-
-  // A first send of message k whose boundary check failed once its files were written — the check right before
-  // `terminal send`, after the ones in message(): nothing was typed, and the message leaves no file, as when the check
-  // fails before. Its send record goes first, so that it is no input of the agent, then a start mark a turn may have
-  // left meanwhile, then its text; all before the answer, while the send still counts as under way in this worker.
-  // Files are removed only from the launch's real directory — through a link in its place they would be another
-  // place's: when it is not one, nothing is removed and the answer says so. When the disk refuses to remove the send
-  // record, the refusal is recorded as the outcome instead (not taken; unknown when that fails too).
-  private async withdraw(
-    launch: AgentLaunch,
-    k: number,
-    reason: string,
-    notTaken: (reason: string) => Promise<MessageResult>,
-  ): Promise<MessageResult> {
-    let elsewhere: string | null
-    try {
-      elsewhere = this.notLaunchDirectory(launch)
-    } catch (error) {
-      elsewhere = errorMessage(error)
-    }
-    if (elsewhere !== null) return unsent(`${reason}; nothing of message ${k} is removed: ${elsewhere}`)
-    try {
-      await this.machine.removeFile(dataPath(this.machine, launch.dir, sendingName(k)))
-    } catch {
-      return notTaken(reason)
-    }
-    for (const name of [startedName(k), messageFileName(k)]) {
-      await this.machine.removeFile(dataPath(this.machine, launch.dir, name)).catch(() => false)
-    }
-    return unsent(reason)
   }
 
   // The last message's outcome not known and no send of it running in this worker now: Orca is asked again with its
@@ -1029,7 +997,8 @@ export class Agents {
   }
 
   // The boundary of every line typed through Orca's CLI, checked before each run of it (the first send and every
-  // asking again, before the search for the CLI and right before `terminal send`): the launch is the plugin's — its
+  // asking again: before the search for the CLI, and again after it — right before a first send's files are written,
+  // right before `terminal send` when asking again): the launch is the plugin's — its
   // directory is the one of its task and number in the data directory, reached through real directories only (a link
   // or a file on the way, or a link in place of the launch's directory, is none of the plugin's launches), its record
   // of Orca's answer (launch.json) a regular file there naming this very terminal — and the plugin has not closed it
