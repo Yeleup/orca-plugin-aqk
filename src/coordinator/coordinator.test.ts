@@ -583,8 +583,9 @@ test('GitHub не прочитан → проверка проекта — ош�
   assert.ok(a.logs.some((line) => line.includes('the queue was not checked')), JSON.stringify(a.logs))
 })
 
-test('текст заявки и «Задачу ведёт» — на языке проекта, id координатора и отсчёт — поля координатора', async () => {
-  const w = world({ language: 'en' })
+test('текст заявки — на языке проекта, id координатора и отсчёт — поля координатора: маска их не трогает', async () => {
+  // A forbidden-data pattern that matches the start of A's id: in a plain text it would be hidden.
+  const w = world({ language: 'en', forbiddenPatterns: ['0a1b2c3d'] })
   w.github.addIssue({ number: 7, user: OWNER, labels: ['agent-queue'] })
   const a = w.computer(A)
   await a.coordinator.checkProject(PROJECT)
