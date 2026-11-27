@@ -188,6 +188,9 @@ export function fakeMachine(options: FakeMachineOptions): FakeMachine {
       files.set(resolve(path), text)
       return true
     },
+    replaceText: async (path, text) => {
+      files.set(find(path) ?? resolve(path), text)
+    },
     start: async (request) => {
       starts.push(request)
       const answer = options.answer?.(request) ?? {}

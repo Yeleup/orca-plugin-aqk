@@ -55,6 +55,7 @@ declare module 'node:fs' {
     options?: { encoding?: 'utf8'; flag?: string; mode?: number },
   ): void
   export function linkSync(existingPath: string, newPath: string): void
+  export function renameSync(oldPath: string, newPath: string): void
   export function openSync(path: string, flags: 'w' | 'a'): number
   export function writeSync(fd: number, data: Uint8Array, offset?: number, length?: number): number
   export function closeSync(fd: number): void

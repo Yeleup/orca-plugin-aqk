@@ -20,8 +20,17 @@ export type Route = { screen: ScreenName }
 
 export const route = atom<Route>({ screen: 'queue' })
 
+// What a screen starts each time it is opened (its first request), by screen: a screen registers it once.
+const openers = new Map<ScreenName, () => void>()
+
+/** Runs `start` each time `screen` is opened. */
+export function whenOpened(screen: ScreenName, start: () => void): void {
+  openers.set(screen, start)
+}
+
 export function openScreen(screen: ScreenName): void {
   set(route, { screen })
+  openers.get(screen)?.()
 }
 
 /** «Назад»: back to «Очередь». */

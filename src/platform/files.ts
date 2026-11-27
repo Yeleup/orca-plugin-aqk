@@ -1,8 +1,19 @@
 // The file operations of the real machine: whether a file can be run, reading a text file and the time of its last
-// write, the entries of a directory, and creating a file only if it is absent, in a way no reader ever sees half
-// written.
+// write, the entries of a directory, creating a file only if it is absent, in a way no reader ever sees half written,
+// and replacing a file whole.
 import { randomUUID } from 'node:crypto'
-import { accessSync, constants, linkSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import {
+  accessSync,
+  constants,
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { dirname } from 'node:path'
 import { errorCode } from './errors'
 import type { DirectoryEntry, Platform } from './machine'
@@ -88,5 +99,23 @@ export async function createText(path: string, text: string, ops: PublishOps = N
     } catch {
       // Already gone.
     }
+  }
+}
+
+// Writes `path` with exactly `text`, replacing the file when it exists: the text is written whole to a temporary file
+// beside it, which then takes the target's name (a rename within one directory), so a reader sees the old text or the
+// new one. The directory must exist. Used for the files of a project's main checkout the connection writes.
+export function replaceText(path: string, text: string): void {
+  const temporary = `${path}.${randomUUID()}.tmp`
+  writeFileSync(temporary, text, { encoding: 'utf8', flag: 'wx' })
+  try {
+    renameSync(temporary, path)
+  } catch (error) {
+    try {
+      unlinkSync(temporary)
+    } catch {
+      // Already gone.
+    }
+    throw error
   }
 }

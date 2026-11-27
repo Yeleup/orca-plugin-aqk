@@ -10,6 +10,11 @@ import { realMachine } from '../platform/machine'
 import { runProgram } from '../platform/run'
 
 export type TestRepository = {
+  // The temporary directory that holds both.
+  readonly root: string
+  // The environment of the test's own git commands: an empty global configuration of its own, no system one, and an
+  // invented author and committer.
+  readonly env: Readonly<Record<string, string>>
   // The bare repository `origin`.
   readonly origin: string
   // The clone: the project's main checkout.
@@ -68,6 +73,8 @@ export async function withRepository(
     writeFileSync(file, text)
   }
   const repo: TestRepository = {
+    root,
+    env,
     origin,
     checkout,
     git,

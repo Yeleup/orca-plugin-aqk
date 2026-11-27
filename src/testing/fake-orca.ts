@@ -23,7 +23,11 @@
 // answer, stopped at its timeout; `cliGate` — the line is typed at once and the answer held back; `cliHoldNext` — the
 // next send waits before Orca handles it; `sendDurationMs` — the time a send takes after the line is typed;
 // `statusGate` — the answer of `status` held back. While `cliPresent` is false (`cli: false`) the computer has no Orca
-// CLI.
+// CLI. `agent installed --json` answers as Orca's CLI does with the agents of `installedAgents` (by default Claude and
+// Codex), `{ ok: true, result: { agents: [{ id, name, default }] } }`; `installedRefusal` — Orca refuses it
+// (`{ ok: false, error }`, exit 1); `installedAnswer` — the answer as given (no JSON, a timeout …). The CLI sits at a
+// known path of Ф14 under the fake home (FAKE_HOME of the system), or under `home` when the test gives one (a real
+// temporary directory, for a computer that runs real git).
 import { hostError, mockHost, type MockHost } from 'orca/testing'
 import type { Platform } from '../platform/machine'
 import { FAKE_HOME, fakeClock, fakeMachine, orcaStatusAnswer, type FakeAnswer, type FakeClock, type FakeMachine } from './fake-machine'
@@ -45,6 +49,15 @@ export type FakeTerminal = {
 
 // An error of Orca's CLI (`{ ok: false, error }`).
 export type FakeCliError = { readonly code: string; readonly message: string; readonly data?: Record<string, unknown> }
+
+// An agent as `agent installed --json` lists it.
+export type FakeInstalledAgent = { readonly id: string; readonly name?: string; readonly default?: boolean }
+
+// The agents `agent installed` lists unless the test says otherwise.
+export const FAKE_INSTALLED_AGENTS: readonly FakeInstalledAgent[] = [
+  { id: 'claude', name: 'Claude', default: true },
+  { id: 'codex', name: 'Codex', default: false },
+]
 
 export type FakeOrca = {
   readonly host: MockHost
@@ -72,6 +85,12 @@ export type FakeOrca = {
   turnStarts: boolean
   // Whether the computer has Orca's CLI.
   cliPresent: boolean
+  // The agents `agent installed --json` lists, in Orca's order.
+  installedAgents: FakeInstalledAgent[]
+  // While set, Orca refuses `agent installed` with this error (exit 1).
+  installedRefusal: FakeCliError | null
+  // While set, `agent installed` answers this as it is.
+  installedAnswer: FakeAnswer | null
   // Orca's refusals of the next CLI sends, in order: each types nothing and leaves its request unseen.
   readonly cliRefusals: FakeCliError[]
   // The next CLI sends' answers as they are, in order: each types nothing and leaves its request unseen.
@@ -100,19 +119,24 @@ export type FakeOrca = {
 }
 
 // Where each system keeps Orca's CLI the plugin finds on the fake computer: a known path of src/platform/orca-cli.ts.
-function cliPath(platform: Platform): string {
-  const home = FAKE_HOME[platform]
+function cliPath(platform: Platform, home: string): string {
   if (platform === 'win32') return `${home}\\AppData\\Local\\Programs\\Orca\\resources\\bin\\orca.exe`
   if (platform === 'darwin') return '/usr/local/bin/orca'
   return `${home}/.local/bin/orca-ide`
 }
 
 export function fakeOrca(
-  options: { readonly platform?: Platform; readonly results?: Record<string, unknown>; readonly cli?: boolean } = {},
+  options: {
+    readonly platform?: Platform
+    readonly results?: Record<string, unknown>
+    readonly cli?: boolean
+    // The home directory the CLI's known path is under; FAKE_HOME of the system by default.
+    readonly home?: string
+  } = {},
 ): FakeOrca {
   const platform = options.platform ?? 'linux'
   const clock = fakeClock()
-  const cli = cliPath(platform)
+  const cli = cliPath(platform, options.home ?? FAKE_HOME[platform])
   const terminals = new Map<string, FakeTerminal>()
   const listed = new Map<string, { readonly state: FakeAgentState; readonly stateStartedAt: number }>()
   let opened = 0
@@ -125,6 +149,14 @@ export function fakeOrca(
     if (request.file !== cli) return { startError: { code: 'ENOENT', message: `spawn ${request.file} ENOENT` } }
     const [command, sub] = request.args
     if (command === 'status') return orcaStatusAnswer('1.4.274')
+    if (command === 'agent' && sub === 'installed') {
+      if (fake.installedAnswer !== null) return fake.installedAnswer
+      if (fake.installedRefusal !== null) {
+        return { code: 1, stdout: JSON.stringify({ id: `cli-${++answered}`, ok: false, error: fake.installedRefusal }) }
+      }
+      const agents = fake.installedAgents.map((agent) => ({ id: agent.id, name: agent.name ?? agent.id, default: agent.default ?? false }))
+      return { code: 0, stdout: JSON.stringify({ id: `cli-${++answered}`, ok: true, result: { agents } }) }
+    }
     if (command !== 'terminal' || sub !== 'send') {
       return { code: 1, stdout: JSON.stringify({ id: 'cli-0', ok: false, error: { code: 'invalid_argument', message: 'unknown command' } }) }
     }
@@ -267,6 +299,9 @@ export function fakeOrca(
     listError: null,
     turnStarts: true,
     cliPresent: options.cli !== false,
+    installedAgents: [...FAKE_INSTALLED_AGENTS],
+    installedRefusal: null,
+    installedAnswer: null,
     cliRefusals: [],
     cliAnswers: [],
     loseAnswers: 0,

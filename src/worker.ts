@@ -1,15 +1,17 @@
 // The plugin's worker. Orca transpiles this file when it loads it: no build step. It answers the panel's
-// plugin.request (src/protocol.ts). On start it settles the common layer of the three systems (src/platform/): the
-// plugin's data directory on this computer and the coordinator id kept there; then the layer of the agents
-// (src/agents/), which hears Orca's agent.status.changed. The plugin's settings (interval, switches) it reads with
-// readSettings(orca.settings) from src/settings.ts. The MVP's tasks give it the rest of its functions.
+// plugin.request (src/protocol.ts): the connected projects, the files of «Настройки проекта», and the wizard
+// «Подключение проекта» (src/connect/), which posts `projects.changed` to open panels once a project is connected. On
+// start it settles the common layer of the three systems (src/platform/): the plugin's data directory on this computer
+// and the coordinator id kept there; then the layer of the agents (src/agents/), which hears Orca's
+// agent.status.changed. The plugin's settings (interval, switches) it reads with readSettings(orca.settings) from
+// src/settings.ts. The MVP's tasks give it the rest of its functions.
 import type { OrcaWorkerApi } from 'orca/worker'
 import { startAgents, type Agents } from './agents/agents'
+import { Connector } from './connect/connect'
 import { ensureCoordinatorId } from './platform/coordinator-id'
 import { errorMessage, realMachine, type Machine } from './platform/machine'
 import { dataDirectory } from './platform/paths'
 import { openProjectFile } from './project-files'
-import type { Project } from './protocol'
 
 export type WorkerContext = {
   readonly machine: Machine
@@ -18,17 +20,33 @@ export type WorkerContext = {
   readonly coordinatorId: string | null
 }
 
-// The projects connected to the queue. None yet: connecting a project is the task `connect` (docs/mvp/plan.md), which
-// gives this its source — the Orca projects whose remote base branch has the connect commit with .agent-queue.json —
-// and posts `projects.changed` to open panels when the list changes.
-async function connectedProjects(): Promise<Project[]> {
-  return []
+export default async function activate(orca: OrcaWorkerApi): Promise<void> {
+  await startOn(orca, realMachine())
 }
 
-export default async function activate(orca: OrcaWorkerApi): Promise<void> {
-  await startPlugin(orca, realMachine())
-  orca.panels.handle('projects.list', async () => ({ projects: await connectedProjects() }))
+// The whole worker on `machine` — what activate starts on this computer, and what tests start on their own: the
+// plugin's layers, then its answers to the panel. The connected projects are Orca's projects of this computer whose
+// remote base branch has the connection commit with .agent-queue.json (src/connect/projects.ts).
+export async function startOn(
+  orca: OrcaWorkerApi,
+  machine: Machine,
+): Promise<WorkerContext & { readonly agents: Agents; readonly connector: Connector }> {
+  const plugin = await startPlugin(orca, machine)
+  const connector = new Connector({
+    host: orca.host,
+    machine,
+    dataDir: plugin.dataDir,
+    log: (message) => orca.log(message),
+    post: (projects) => orca.panels.post('projects.changed', { projects }),
+  })
+  orca.panels.handle('projects.list', async () => ({ projects: await connector.connected() }))
   orca.panels.handle('project.openFile', (input) => openProjectFile(orca.host, input))
+  orca.panels.handle('connect.projects', async () => ({ projects: await connector.candidates() }))
+  orca.panels.handle('connect.checkGit', (input) => connector.checkGit(input))
+  orca.panels.handle('connect.checkGh', (input) => connector.checkGh(input))
+  orca.panels.handle('connect.checkAgents', (input) => connector.checkAgents(input))
+  orca.panels.handle('connect.connect', (input) => connector.connect(input))
+  return { ...plugin, connector }
 }
 
 // The worker as activate starts it on `machine`: the common layer of the three systems, then the layer of the agents of

@@ -37,6 +37,7 @@ import {
   isObject,
   repositoryPath,
   repositoryRef,
+  repositoryRoot,
   repositorySlug,
   runGh,
   type Repository,
@@ -322,6 +323,16 @@ export class GitHub {
         description: typeof item.description === 'string' ? item.description : '',
       })),
     )
+  }
+
+  // Whether the GitHub user gh runs as may write to the repository: GitHub's `permissions` of the repository for that
+  // user — `push`, `maintain` or `admin`. A repository gh cannot see (404) or a failure of gh is a GitHubError.
+  async canWrite(): Promise<boolean> {
+    const args = [...apiArgs(this.repository), repositoryRoot(this.repository)]
+    const answer = await ghJson({ machine: this.machine, args })
+    const permissions = answer.permissions
+    if (!isObject(permissions)) throw shapeError(args, 'the repository without its permissions for the user of gh')
+    return permissions.push === true || permissions.maintain === true || permissions.admin === true
   }
 
   async listPullRequests(filter: PullRequestFilter = {}): Promise<PullRequest[]> {

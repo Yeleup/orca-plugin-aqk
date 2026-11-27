@@ -2,7 +2,7 @@
 // directory and the coordinator id of this computer. The real worker module runs with its home directory and the data
 // variables of each system (XDG_DATA_HOME, LOCALAPPDATA) pointed into a temporary directory: the real data directory of
 // this computer is never touched, and no system folder is looked up.
-import { assert, mountWorker, test } from 'orca/testing'
+import { assert, mockHost, mountWorker, test } from 'orca/testing'
 import { readFileSync, statSync } from 'node:fs'
 import { hostname, userInfo } from 'node:os'
 import { join } from 'node:path'
@@ -92,16 +92,35 @@ test('the worker starts without host calls or refusals', async () => {
   await worker.deactivate()
 })
 
-// Connecting projects is a later task (`connect`): until then the worker knows of none. The real worker module creates
-// the data directory and the coordinator id: it runs with the temporary home.
-test('Каркас панели: воркер отвечает панели на projects.list — подключённых проектов пока нет', async () => {
+// The connected projects are Orca's git projects of this computer whose remote base branch has the connection commit
+// (src/connect/projects.ts): the worker asks Orca for its projects. A project of another host and a folder are never
+// listed — the worker's git reaches only this computer — and with no project the list is empty. The real worker
+// module creates the data directory and the coordinator id: it runs with the temporary home.
+test('Каркас панели: воркер отвечает панели на projects.list — проекты Orca этого компьютера, подключённых среди них нет', async () => {
   await withTemporaryHome(async () => {
-    const worker = await mountWorker(main)
-    assert.deepEqual(await worker.request('projects.list', undefined, { panel: 'agent-queue' }), { projects: [] })
-    assert.deepEqual(worker.host.calls, [])
-    assert.deepEqual(worker.refusals, [])
-    assert.deepEqual(worker.posts, [])
-    await worker.deactivate()
+    const empty = await mountWorker(main)
+    assert.deepEqual(await empty.request('projects.list', undefined, { panel: 'agent-queue' }), { projects: [] })
+    assert.deepEqual(empty.host.calls, [{ method: 'project.list', params: undefined }])
+    assert.deepEqual(empty.refusals, [])
+    assert.deepEqual(empty.posts, [])
+    await empty.deactivate()
+
+    const host = mockHost({
+      results: {
+        'project.list': {
+          projects: [
+            { id: 'remote-shop', name: 'shop-demo', kind: 'git', hostId: 'ssh:build-box', path: '/work/shop-demo' },
+            { id: 'notes', name: 'notes', kind: 'folder', hostId: 'local', path: '/work/notes' },
+          ],
+          truncated: false,
+        },
+      },
+    })
+    const other = await mountWorker(main, { host })
+    assert.deepEqual(await other.request('projects.list', undefined, { panel: 'agent-queue' }), { projects: [] })
+    assert.deepEqual(await other.request('connect.projects', undefined, { panel: 'agent-queue' }), { projects: [] })
+    assert.deepEqual(other.refusals, [])
+    await other.deactivate()
   })
 })
 
