@@ -1827,7 +1827,11 @@ test('начатое освобождение (п. 4): POST освобожден
     w.github.setLabel(7, WORKING, true)
     const restarted = w.computer(A, { machine: a.machine })
     const written = restarted.writes().length
+    const reads = () => a.machine.starts.map(readCall).filter(isRead('AqComments', 7)).length
+    const before = reads()
     await restarted.coordinator.checkProject(PROJECT)
+    // The release goes first: the reading of the check and the check of the release's own write, nothing else.
+    assert.equal(reads(), before + 2)
     assert.deepEqual(w.thread(7), ['claim A 1', 'release A 1'])
     assert.deepEqual(restarted.writes().slice(written), ['POST issues/7/comments'])
     assert.deepEqual(restarted.lost.map((task) => [task.count, task.reason]), [[1, 'released-by-owner']])
@@ -2032,8 +2036,12 @@ test('два воркера одного журнала: освобождени�
   assert.deepEqual(w.thread(7), ['claim A 1'])
   // The label comes back; A's wait ends.
   w.github.setLabel(7, WORKING, true)
+  const reads = () => a.machine.starts.map(readCall).filter(isRead('AqComments', 7)).length
+  const before = reads()
   waitOfA.release()
   assert.deepEqual((await checkA).claimed, { kind: 'released', issue: 7, count: 1 })
+  // Right after the re-read the release goes first: the re-read and the check of the release's own write, nothing else.
+  assert.equal(reads(), before + 2)
   assert.deepEqual(w.thread(7), ['claim A 1', 'release A 1'])
   assert.deepEqual([a.started.length, second.started.length], [0, 0])
 })
@@ -2116,4 +2124,96 @@ test('правила выбора (п. 7, долгий допуск): допус
     { issue: 2, reason: 'an MVP task in work already' },
   ])
   assert.deepEqual(seen, [{ last: 1, marks: ['claim'] }])
+})
+
+// ── Round 6 of the review ───────────────────────────────────────────────────────────────────────────────────────────
+
+test('старый проход с задержанным POST и новый проход через другой объект Machine того же журнала (повторная активация): попытки заявки не перемешиваются — принятая заявка завершается по профилю своей попытки', async () => {
+  const none = { on: [], off: [] }
+  const w = world()
+  w.github.addIssue({ number: 7, user: OWNER, labels: ['agent-queue'] })
+  const old = w.computer(A)
+  // The new activation's computer: another Machine object on the same files (the same journal).
+  const fresh = w.computer(A, { machine: { ...old.machine } })
+  assert.notEqual(fresh.machine, old.machine)
+  const post = holdCall(old.machine, isCommentOn(7))
+  const byOld = old.coordinator.checkProject(PROJECT)
+  await post.reached
+  w.github.fail(isCommentOn(7), BAD_GATEWAY)
+  const byFresh = fresh.coordinator.claimTask(PROJECT, 7, { admit: () => null, labels: none, recovery: 'caller' })
+  await settle()
+  post.release()
+  const [checked, called] = await Promise.all([byOld, byFresh])
+  const claims = w.github.comments.filter((one) => parseBody(one.body).mark?.kind === 'claim')
+  assert.equal(claims.length, 1)
+  const oldLeads = checked.claimed?.kind === 'leads'
+  const freshLeads = called.kind === 'leads'
+  assert.ok(oldLeads !== freshLeads, JSON.stringify([checked.claimed, called]))
+  if (oldLeads) {
+    assert.deepEqual(w.labels(7), ['agent-queue', WORKING])
+  } else {
+    assert.deepEqual(w.labels(7), ['agent-queue'])
+    const written = old.writes().length
+    await old.coordinator.checkProject(PROJECT)
+    assert.equal(old.writes().length, written)
+    assert.equal(old.leading.length, 0)
+  }
+})
+
+test('освобождение, решённое перед подтверждением права (другим координатором того же журнала): ни запуска агентов, ни шага этапа, ни записи по задаче — только освобождение', async () => {
+  // While the completion asks the switch right before confirming its right — after the re-read and its check of
+  // `releasing` —, the owner takes `working` off, the other coordinator of the journal decides the release (its POST is
+  // refused), and the label comes back.
+  const interfere = async (w: ReturnType<typeof world>, machine: FakeMachine) => {
+    w.github.setLabel(7, WORKING, false)
+    const other = w.computer(A, { machine: { ...machine } })
+    w.github.fail(isCommentOn(7), BAD_GATEWAY)
+    await other.coordinator.checkProject(PROJECT)
+    assert.deepEqual(w.thread(7), ['claim A 1'])
+    w.github.setLabel(7, WORKING, true)
+    return other
+  }
+  // The start.
+  {
+    const w = world()
+    w.github.addIssue({ number: 7, user: OWNER, labels: ['agent-queue'] })
+    const a = w.computer(A)
+    let other: Computer | null = null
+    const enabled = async () => {
+      if (other === null && w.clock.now() >= START + REREAD_AFTER_MS) other = await interfere(w, a.machine)
+      return true
+    }
+    const result = await a.coordinator.checkProject(PROJECT, { enabled })
+    assert.ok(other)
+    assert.deepEqual(result.claimed, { kind: 'released', issue: 7, count: 1 })
+    assert.deepEqual(w.thread(7), ['claim A 1', 'release A 1'])
+    assert.deepEqual(a.started, [])
+    // Refused at the confirmation itself: no lead was recorded, so there is no local handling of a lost count either.
+    assert.equal(a.lost.length, 0)
+    await a.coordinator.checkProject(PROJECT)
+    assert.equal(a.lost.length, 0)
+  }
+  // The next step of the stage, and a write of the stage's code through its right.
+  {
+    const { w, a } = await leaderOf7()
+    const taskA = a.started[0]
+    assert.ok(taskA)
+    let calls = 0
+    let refused: unknown = null
+    const enabled = async () => {
+      // The first ask is before the task; the second right before the next step of the stage.
+      if (++calls === 2) {
+        await interfere(w, a.machine)
+        refused = await taskA.right.act(() => taskA.github.addLabels(7, [BLOCKED]))
+      }
+      return true
+    }
+    const result = await a.coordinator.checkProject(PROJECT, { enabled })
+    assert.deepEqual(refused, { ok: false, releasing: true })
+    assert.deepEqual(result.led, [])
+    assert.equal(a.leading.length, 0)
+    assert.deepEqual(w.thread(7), ['claim A 1', 'release A 1'])
+    assert.deepEqual(w.labels(7), ['agent-queue', WORKING])
+    assert.deepEqual(a.lost.map((task) => [task.count, task.reason]), [[1, 'released-by-owner']])
+  }
 })

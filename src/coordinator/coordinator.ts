@@ -63,7 +63,7 @@ import {
   type StageLabels,
 } from './claims'
 import { ClaimJournal, type JournalRecord } from './journal'
-import { fresh, Right, TaskGate, type Refused, type RightCheck } from './right'
+import { fresh, Right, TaskGate, type Refused, type Releasing, type RightCheck } from './right'
 
 // A project connected to the queue, as the coordinator needs it: the panel's project (Orca's id and host, its name),
 // its main checkout — the settings are read from origin/<base branch> through it — and its GitHub repository.
@@ -600,6 +600,7 @@ export class Coordinator {
       const brought = await this.bringLabels(pass, right, issue, profile)
       if (brought === 'off') return this.incomplete(project, number, count, SWITCHED_OFF)
       if (brought === 'refused') return { kind: 'yielded', issue: number, count, leader: null }
+      if (brought === 'releasing') return this.releaseClaim(pass, issue, count, right)
       issue = brought
     } catch (error) {
       return this.incomplete(project, number, count, `the labels of the stage were not set: ${errorMessage(error)}`)
@@ -607,12 +608,14 @@ export class Coordinator {
     // Switched off meanwhile: no agents start; the claim is completed when the coordinator is on again.
     if (!(await this.isOn(pass.enabled))) return this.incomplete(project, number, count, SWITCHED_OFF)
     // The start is an action on the task: the right is confirmed by a fresh read of the claims first.
-    let confirmed: RightCheck | Refused
+    let confirmed: RightCheck | Refused | Releasing
     try {
       confirmed = await right.confirm()
     } catch (error) {
       return this.incomplete(project, number, count, `the right was not confirmed: ${errorMessage(error)}`)
     }
+    // A release decided meanwhile (by another coordinator of this journal): only the release goes on.
+    if ('releasing' in confirmed) return this.releaseClaim(pass, issue, count, right)
     if ('ok' in confirmed) return { kind: 'yielded', issue: number, count, leader: confirmed.leader }
     const lead = await this.recordLed(pass, number, count)
     if (lead === 'failed') {
@@ -629,12 +632,28 @@ export class Coordinator {
       } catch (error) {
         return this.incomplete(project, number, count, `the right was not confirmed: ${errorMessage(error)}`)
       }
+      // The lead is recorded now: a release decided meanwhile is written with the local handling of the count.
+      if ('releasing' in confirmed) return this.releaseLed(pass, issue, count, right)
       if ('ok' in confirmed) return { kind: 'yielded', issue: number, count, leader: confirmed.leader }
     }
+    // The journal is read once more, synchronously, right before the start: a release decided since the confirmation
+    // is written instead (with the local handling: the lead is recorded).
+    if (this.has(repository, number, count, 'releasing')) return this.releaseLed(pass, issue, count, right)
     this.log(`${project.name} #${number}: leads count ${count}`)
     const led = this.ledTask(pass, issue, confirmed.claims, count, right)
     await this.callHook('started', project, number, () => this.hooks.started?.(led))
     return { kind: 'leads', issue: number, count }
+  }
+
+  // The release of a count whose lead is recorded but whose agents were not started: with the local handling of the
+  // count; `released`, or `incomplete` when it was not written (the next check writes it).
+  private async releaseLed(pass: Pass, issue: Issue, count: number, right: Right): Promise<ClaimOutcome> {
+    try {
+      if (await this.release(pass, issue, count, right, true)) return { kind: 'released', issue: issue.number, count }
+      return this.incomplete(pass.project, issue.number, count, 'the release was not written')
+    } catch (error) {
+      return this.incomplete(pass.project, issue.number, count, `the release was not written: ${errorMessage(error)}`)
+    }
   }
 
   // The release of a count whose claim was not complete: no agents were started, so no local handling; `released`, or
@@ -689,26 +708,27 @@ export class Coordinator {
   }
 
   // The labels of the stage of the count `right` stands for, each write through the right; the issue as it is after
-  // them — `refused` when another coordinator leads, `off` when the coordinator was switched off.
+  // them — `refused` when another coordinator leads, `off` when the coordinator was switched off, `releasing` when the
+  // release of the count is decided (only the release goes on).
   private async bringLabels(
     pass: Pass,
     right: Right,
     issue: Issue,
     profile: StageLabels,
-  ): Promise<Issue | 'refused' | 'off'> {
+  ): Promise<Issue | 'refused' | 'off' | 'releasing'> {
     const { github, project } = pass
     let labels = [...issue.labels]
     for (const label of profile.on) {
       if (hasLabel(labels, label)) continue
       const set = await right.act(() => github.addLabels(issue.number, [label]))
-      if (!set.ok) return 'off' in set ? 'off' : 'refused'
+      if (!set.ok) return notWritten(set)
       labels = set.value
       this.log(`${project.name} #${issue.number}: ${label} set: the labels of count ${right.count}`)
     }
     for (const label of profile.off) {
       if (!hasLabel(labels, label)) continue
       const removed = await right.act(() => github.removeLabel(issue.number, label))
-      if (!removed.ok) return 'off' in removed ? 'off' : 'refused'
+      if (!removed.ok) return notWritten(removed)
       labels = labels.filter((one) => one.toLowerCase() !== label.toLowerCase())
       this.log(`${project.name} #${issue.number}: ${label} taken off: count ${right.count} is in work`)
     }
@@ -759,10 +779,11 @@ export class Coordinator {
       return completed.kind === 'leads' ? 'leads' : completed.kind === 'released' ? 'released' : 'none'
     }
     const right = this.right(pass, number, count)
-    // A release decided already comes before everything else of the count, whatever the label is now.
-    if (this.has(repository, number, count, 'releasing')) {
-      return (await this.release(pass, task.issue, count, right, true)) ? 'released' : 'none'
-    }
+    // A release decided — already, or while this check went on (an action refused for it) — is the only thing that
+    // goes on, whatever the label is now.
+    const releaseNow = async (issue: Issue) =>
+      (await this.release(pass, issue, count, right, true)) ? ('released' as const) : ('none' as const)
+    if (this.has(repository, number, count, 'releasing')) return releaseNow(task.issue)
     const profile = this.keptStage(repository, number, count) ?? ACTIVE_LABELS
     let issue = task.issue
     if (profile.on.includes(WORKING)) {
@@ -777,29 +798,31 @@ export class Coordinator {
       } else if (!this.has(repository, number, count, 'labelled')) {
         // Never on for this count (the write after the claim failed): it is set now.
         const set = await right.act(() => github.addLabels(number, [WORKING]))
-        if (!set.ok) return 'none'
+        if (!set.ok) return 'releasing' in set ? releaseNow(issue) : 'none'
         await this.record(repository, number, count, 'labelled')
         issue = { ...issue, labels: set.value }
       } else {
         const origin = await this.removedBy(pass, claims, number, count)
         // Not known now: nothing is done on the task in this check — the next one decides.
         if (origin === 'unknown') return 'none'
-        if (origin === 'manual') {
-          return (await this.release(pass, issue, count, right, true)) ? 'released' : 'none'
-        }
+        if (origin === 'manual') return releaseNow(issue)
         // A former leader's late write: the label of its stage is set again, no comment.
         const set = await right.act(() => github.addLabels(number, [WORKING]))
-        if (!set.ok) return 'none'
+        if (!set.ok) return 'releasing' in set ? releaseNow(issue) : 'none'
         issue = { ...issue, labels: set.value }
         this.log(`${project.name} #${number}: ${WORKING} was taken off by a late write of a former leader; set again`)
       }
     }
     const brought = await this.bringLabels(pass, right, issue, profile)
+    if (brought === 'releasing') return releaseNow(issue)
     if (typeof brought === 'string') return brought === 'off' ? 'leads' : 'none'
     // The stage goes on only while the coordinator is on, and on a fresh confirmation of the right.
     if (!(await this.isOn(pass.enabled))) return 'leads'
     const confirmed = await right.confirm()
+    if ('releasing' in confirmed) return releaseNow(brought)
     if ('ok' in confirmed) return 'none'
+    // The journal once more, synchronously, right before the next step of the stage.
+    if (this.has(repository, number, count, 'releasing')) return releaseNow(brought)
     const led = this.ledTask(pass, brought, confirmed.claims, count, right)
     await this.callHook('leading', project, number, () => this.hooks.leading?.(led))
     return 'leads'
@@ -853,15 +876,20 @@ export class Coordinator {
   // again; then, for a count it led (`hook`), the local handling of the count. True when the release is on GitHub.
   private async release(pass: Pass, issue: Issue, count: number, right: Right, hook: boolean): Promise<boolean> {
     const { github, settings, project } = pass
-    if (!(await this.record(project.repository, issue.number, count, 'releasing'))) return false
-    const released = await right.act(() =>
-      github.comment(issue.number, {
-        mark: { kind: 'release', coordinator: this.id, claim: count },
-        text: githubSegments(settings.language, 'claim.released', {
-          coordinator: field.coordinator(this.id),
-          claim: field.claim(count),
+    // The decision is recorded in a step of the task's queue: an action admitted after it sees it (right.ts).
+    const gate = this.gate(pass, issue.number)
+    const decided = await gate.run(() => this.record(project.repository, issue.number, count, 'releasing'))
+    if (!decided) return false
+    const released = await right.act(
+      () =>
+        github.comment(issue.number, {
+          mark: { kind: 'release', coordinator: this.id, claim: count },
+          text: githubSegments(settings.language, 'claim.released', {
+            coordinator: field.coordinator(this.id),
+            claim: field.claim(count),
+          }),
         }),
-      }),
+      { release: true },
     )
     if (!released.ok) return false
     this.log(`${project.name} #${issue.number}: ${WORKING} was taken off by the owner; count ${count} released`)
@@ -1051,6 +1079,7 @@ export class Coordinator {
       coordinatorId: this.id,
       now: () => this.machine.now(),
       gate: this.gate(pass, issue),
+      releasing: () => this.has(pass.project.repository, issue, count, 'releasing'),
       ...(pass.enabled ? { enabled: pass.enabled } : {}),
     })
   }
@@ -1127,17 +1156,20 @@ export class Coordinator {
   }
 }
 
-// The queues of the tasks of each computer (the worker's Machine) and data directory: every coordinator on them takes
-// the queues from here, so two coordinators of one journal (an old one still checking while a new one starts) never
-// interleave their steps of one task — the reading, the choice of a claim's profile, its POST and its record are one
-// step. Two worker processes on one data directory are no mode of the plugin (README «Агенты»).
+// The queues of the tasks of each journal in this worker — its disk (Machine.disk: the real file system, or the files of
+// a fake computer) and its data directory: every coordinator on that journal takes the queues from here, whatever
+// Machine object it was given, so two coordinators of one journal (an old pass still running while a new activation
+// starts) never interleave their steps of one task — the reading, the choice of a claim's profile, its POST and its
+// record are one step, and so are the record of a release decision and the admission of an action. Two worker
+// processes on one data directory are no mode of the plugin (README «Агенты»).
 const GATES = new WeakMap<object, Map<string, Map<string, TaskGate>>>()
 
 function gatesOf(machine: Machine, dataDir: string): Map<string, TaskGate> {
-  let byDir = GATES.get(machine)
+  const disk = machine.disk ?? machine
+  let byDir = GATES.get(disk)
   if (byDir === undefined) {
     byDir = new Map()
-    GATES.set(machine, byDir)
+    GATES.set(disk, byDir)
   }
   let gates = byDir.get(dataDir)
   if (gates === undefined) {
@@ -1145,6 +1177,13 @@ function gatesOf(machine: Machine, dataDir: string): Map<string, TaskGate> {
     byDir.set(dataDir, gates)
   }
   return gates
+}
+
+// Why a write through the right did not go out.
+function notWritten(result: Refused | { readonly off: true } | Releasing): 'refused' | 'off' | 'releasing' {
+  if ('releasing' in result) return 'releasing'
+  if ('off' in result) return 'off'
+  return 'refused'
 }
 
 // The reason a claim gives when the coordinator was switched off before it was written.

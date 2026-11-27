@@ -32,7 +32,9 @@ export type RightCheck = {
 export type Refused = { readonly ok: false; readonly leader: string | null; readonly last: number }
 // The action did not write: the coordinator of this computer is off.
 export type SwitchedOff = { readonly ok: false; readonly off: true }
-export type Acted<T> = { readonly ok: true; readonly value: T } | Refused | SwitchedOff
+// The action did not write: the release of the count is decided (the journal's `releasing`); only the release goes on.
+export type Releasing = { readonly ok: false; readonly releasing: true }
+export type Acted<T> = { readonly ok: true; readonly value: T } | Refused | SwitchedOff | Releasing
 
 // A check of the right whose read of the claims took longer than RIGHT_VALID_MS: nothing is written or started on it.
 export class RightExpired extends Error {
@@ -51,6 +53,8 @@ export type WriteOptions = {
   // Allow the write on the count this coordinator released itself — the label writes that finish its own release (a
   // block, a deferral). Without it a released count writes nothing.
   readonly released?: boolean
+  // The write is the release the journal's `releasing` decided: the one write that decision admits.
+  readonly release?: boolean
 }
 
 // The checks and writes of one task on one coordinator, one at a time, and what they know: how many writes went out (a
@@ -89,6 +93,10 @@ export class Right {
       readonly gate: TaskGate
       // Whether the coordinator of this computer is still on: asked right before every write; off — nothing written.
       readonly enabled?: () => Promise<boolean>
+      // Whether the release of the count is decided (the journal's `releasing`, read synchronously): then no action of
+      // the count is admitted but the release itself. Asked in the same step of the task's queue as the read of the
+      // claims, and that decision is recorded in a step of the same queue.
+      readonly releasing?: () => boolean
     },
   ) {}
 
@@ -126,12 +134,13 @@ export class Right {
   // the agents (the hooks): the check, or the refusal when this coordinator does not lead its active count. Throws
   // RightExpired when the read took longer than RIGHT_VALID_MS. The caller calls the action synchronously after it, or
   // confirms again when RIGHT_VALID_MS has passed since `at`.
-  confirm(): Promise<RightCheck | Refused> {
+  confirm(): Promise<RightCheck | Refused | Releasing> {
     return this.options.gate.run(async () => {
       const lost = this.options.gate.lost.get(this.options.count)
       if (lost !== undefined) return lost
       const current = await this.check()
       if (!current.mine || !current.active) return this.refuse(current)
+      if (this.options.releasing?.()) return { ok: false, releasing: true }
       if (!fresh(current.at, this.options.now())) throw new RightExpired()
       return current
     })
@@ -146,8 +155,8 @@ export class Right {
   }
 
   // In order: a count lost for good; the switch; the check — the given one when it still holds, otherwise read now; the
-  // leader of an active count (or of its own released one, with `released`); the age of the check, synchronously; the
-  // write.
+  // leader of an active count (or of its own released one, with `released`); a release decided (only the release
+  // itself goes on); the age of the check, synchronously; the write.
   private async admitted<T>(given: RightCheck | null, write: () => Promise<T>, options: WriteOptions): Promise<Acted<T>> {
     const gate = this.options.gate
     const lost = gate.lost.get(this.options.count)
@@ -160,6 +169,7 @@ export class Right {
       current = await this.check()
     }
     if (!current.mine || (!current.active && !options.released)) return this.refuse(current)
+    if (!options.release && this.options.releasing?.()) return { ok: false, releasing: true }
     if (!fresh(current.at, this.options.now())) throw new RightExpired()
     const record = this.made.get(current)
     if (record) record.used = true

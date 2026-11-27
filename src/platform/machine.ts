@@ -83,7 +83,14 @@ export type Machine = {
   // created it, false when it was already there; a reader never sees it half written. Throws on any other failure.
   createText(path: string, text: string): Promise<boolean>
   start(request: StartRequest): Promise<StartOutcome>
+  // The file system the machine works on: two machines with the same disk see the same files at the same paths (every
+  // real machine of the worker has the same one). What shares state by the files — the coordinator's queues of a
+  // journal — keys it by this.
+  readonly disk?: object
 }
+
+// The disk of every real machine.
+const REAL_DISK = Object.freeze({ name: 'the real file system' })
 
 // The rules of this system. Orca runs on macOS, Windows and Linux; any other POSIX system follows Linux's rules.
 export function realPlatform(name: string = platform): Platform {
@@ -105,6 +112,7 @@ export function realMachine(overrides: Partial<Machine> = {}): Machine {
     listEntries,
     createText: (path, text) => createText(path, text),
     start: startProcess,
+    disk: REAL_DISK,
     ...overrides,
   }
 }
