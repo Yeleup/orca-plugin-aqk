@@ -1,12 +1,15 @@
 // The right to act on a task (TZ Ф4, «Право на действие»): before every action on a task — a comment, a label, and,
 // with the next tasks, an agent's launch or message, a PR, a merge, the removal of a worktree — the coordinator re-reads
-// the claims. A check holds RIGHT_VALID_MS: an action whose write comes later than that after its check (a sleep of the
-// computer, a long call) re-reads before the write. Not the leader of its count — the action writes nothing, and no
-// later action of this right writes anything either: the count is lost for good once a newer one exists.
+// the claims. A check holds RIGHT_VALID_MS, and it admits one write: a write whose check is older than that (a sleep of
+// the computer, a long call), whose check already admitted a write, or after whose check another write on the task went
+// out, re-reads first. Not the leader of its count — the action writes nothing, and no later action of that count
+// writes anything either: the count is lost for good once a newer one exists.
 //
-// GitHub gives no conditional write, so the window between the check and the write stays: after a takeover the former
-// leader manages at most the one write whose check came before it. That is why the leader of a new count takes its
-// stage only from the comments of its own count (claims.ts, stageOf) and brings the labels to its stage itself.
+// On one coordinator the checks and writes of one task go one at a time (TaskGate), whichever `Right` they come
+// through: two actions started together cannot both pass a check made before a takeover. GitHub gives no conditional
+// write, so the window between a check and its write stays: after a takeover the former leader manages at most the one
+// write whose check came before it. That is why the leader of a new count takes its stage only from the comments of its
+// own count (claims.ts, stageOf) and brings the labels to its stage itself.
 import type { GitHub } from '../github/github'
 import { readClaims, RIGHT_VALID_MS, type Claims } from './claims'
 
@@ -31,8 +34,29 @@ export type WriteOptions = {
   readonly released?: boolean
 }
 
+// The checks and writes of one task on one coordinator, one at a time, and what they know: how many writes went out (a
+// check older than the last write is made again) and the counts lost for good.
+export class TaskGate {
+  private chain: Promise<unknown> = Promise.resolve()
+  writes = 0
+  readonly lost = new Map<number, Refused>()
+
+  // Runs `step` after every step started before it has ended.
+  run<T>(step: () => Promise<T>): Promise<T> {
+    const result = this.chain.then(step)
+    this.chain = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    return result
+  }
+}
+
+type Made = { readonly writes: number; used: boolean }
+
 export class Right {
-  private lostTo: Refused | null = null
+  // What each check of this right knew when it was made: the writes on the task before it, and whether it admitted one.
+  private readonly made = new WeakMap<RightCheck, Made>()
 
   constructor(
     private readonly options: {
@@ -42,6 +66,8 @@ export class Right {
       readonly count: number
       readonly coordinatorId: string
       readonly now: () => number
+      // The task's gate of this coordinator: shared by every Right of the task.
+      readonly gate: TaskGate
     },
   ) {}
 
@@ -55,30 +81,55 @@ export class Right {
 
   // A check: the task's claims read now.
   async check(): Promise<RightCheck> {
+    const writes = this.options.gate.writes
     const claims = readClaims(await this.options.github.listComments(this.options.issue))
     const mine = claims.last === this.options.count && claims.leader === this.options.coordinatorId
-    return { at: this.options.now(), mine, active: claims.active, claims }
+    const check = { at: this.options.now(), mine, active: claims.active, claims }
+    this.made.set(check, { writes, used: false })
+    return check
   }
 
-  // The write of an action whose check is `check`: made again first when it is older than RIGHT_VALID_MS. Refused —
-  // nothing written — when this coordinator does not lead the count.
-  async write<T>(check: RightCheck, write: () => Promise<T>, options: WriteOptions = {}): Promise<Acted<T>> {
-    if (this.lostTo !== null) return this.lostTo
-    let current = check
-    if (this.options.now() - current.at > RIGHT_VALID_MS) current = await this.check()
+  // The write of an action whose check is `check`. The check is made again first when it is older than RIGHT_VALID_MS,
+  // admitted a write already, is not this right's, or another write on the task went out after it. Refused — nothing
+  // written — when this coordinator does not lead the count.
+  write<T>(check: RightCheck, write: () => Promise<T>, options: WriteOptions = {}): Promise<Acted<T>> {
+    return this.options.gate.run(() => this.admitted(check, write, options))
+  }
+
+  // One action that is only a write: its check now, then the write, with no other step of the task between them.
+  act<T>(write: () => Promise<T>, options: WriteOptions = {}): Promise<Acted<T>> {
+    return this.options.gate.run(async () => this.admitted(await this.freshCheck(), write, options))
+  }
+
+  private async freshCheck(): Promise<RightCheck | Refused> {
+    const lost = this.options.gate.lost.get(this.options.count)
+    return lost ?? this.check()
+  }
+
+  private async admitted<T>(
+    given: RightCheck | Refused,
+    write: () => Promise<T>,
+    options: WriteOptions,
+  ): Promise<Acted<T>> {
+    const gate = this.options.gate
+    const lost = gate.lost.get(this.options.count)
+    if (lost !== undefined) return lost
+    if ('ok' in given) return given
+    let current = given
+    const made = this.made.get(current)
+    if (made === undefined || made.used || made.writes !== gate.writes || this.options.now() - current.at > RIGHT_VALID_MS) {
+      current = await this.check()
+    }
     if (!current.mine || (!current.active && !options.released)) {
       const refused: Refused = { ok: false, leader: current.claims.leader, last: current.claims.last }
       if (current.claims.last > this.options.count || (current.claims.last === this.options.count && !current.mine)) {
-        this.lostTo = refused
+        gate.lost.set(this.options.count, refused)
       }
       return refused
     }
+    const record = this.made.get(current)
+    if (record) record.used = true
+    gate.writes++
     return { ok: true, value: await write() }
-  }
-
-  // One action that is only a write: its check now, then the write.
-  async act<T>(write: () => Promise<T>, options: WriteOptions = {}): Promise<Acted<T>> {
-    if (this.lostTo !== null) return this.lostTo
-    return this.write(await this.check(), write, options)
   }
 }

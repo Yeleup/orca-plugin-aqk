@@ -9,10 +9,13 @@
 // - the active claim is the claim of the last count with no release comment of that count after it — a block, a
 //   deferral or a release (RELEASE_KINDS), written by the leader of that count. A comment of another count releases
 //   nothing: a comment the former leader writes after a takeover names its own count;
+// - the progress of a count is the service comments of its leader with its number, from its claim on: a comment of an
+//   earlier count of the same coordinator is no progress of the new one;
 // - `agent-queue:working` is only a reflection for the panel and the filter: who leads, and whether a task is taken, is
 //   decided by the claims alone.
-import type { Comment, Issue } from '../github/github'
 import type { Stage } from '../github/check'
+import { GH_TIMEOUT_MS } from '../github/gh'
+import type { Comment, Issue } from '../github/github'
 import type { PluginLabel } from '../github/labels'
 import { parseBody, type Mark, type MarkKind } from '../github/mark'
 
@@ -31,7 +34,7 @@ export const RELEASE_KINDS = ['block', 'deferred', 'release'] as const satisfies
 export type ReleaseKind = (typeof RELEASE_KINDS)[number]
 
 // How long the protocol waits (TZ Ф4).
-// The claimant re-reads the comments this long after its claim and its label.
+// The claimant re-reads the comments this long after its label is on.
 export const REREAD_AFTER_MS = 60_000
 // A check of the right to act holds this long; an older one is made again before a write.
 export const RIGHT_VALID_MS = 30_000
@@ -40,6 +43,10 @@ export const RIGHT_VALID_MS = 30_000
 export const UNSETTLED_MS = 10 * 60_000
 // A deferral (Ф10, «Отложено до <время + 1 ч>») holds this long from its comment.
 export const DEFERRAL_MS = 60 * 60_000
+// How long after a claim a write of a former leader may still land: one admitted by a check made before the claim is
+// sent within RIGHT_VALID_MS and ends with its gh call (GH_TIMEOUT_MS at most), with a minute to spare. Until then a
+// label that disappears may be that write; after it, only a person changes the labels.
+export const LATE_WRITE_MS = RIGHT_VALID_MS + GH_TIMEOUT_MS + 60_000
 
 // A comment of the owner with a service mark, in GitHub's order.
 export type MarkedComment = {
@@ -67,7 +74,8 @@ export type Claims = {
   readonly claimants: readonly string[]
   // The release of the last count by its leader, or null.
   readonly release: Release | null
-  // The latest comment with a mark of the last count's leader since its claim (its progress), or its claim.
+  // The progress of the last count: its leader's latest service comment of that count since its claim (the claim at
+  // the least).
   readonly leaderLastAt: number | null
   // The last count is claimed and not released.
   readonly active: boolean
@@ -88,9 +96,10 @@ export function markedComments(comments: readonly Comment[]): MarkedComment[] {
 
 export function readClaims(comments: readonly Comment[]): Claims {
   const marked = markedComments(comments)
-  const claims = marked.filter((one) => isClaimKind(one.mark.kind) && one.mark.claim !== undefined)
-  const last = claims.reduce((highest, one) => Math.max(highest, one.mark.claim ?? 0), 0)
-  if (last === 0) {
+  const last = marked.reduce((highest, one) => (isClaim(one) ? Math.max(highest, one.mark.claim ?? 0) : highest), 0)
+  const ofLast = claimsOfCount(marked, last)
+  const first = ofLast[0]
+  if (first === undefined) {
     return {
       last: 0,
       leader: null,
@@ -104,19 +113,18 @@ export function readClaims(comments: readonly Comment[]): Claims {
       marked,
     }
   }
-  const ofLast = claims.filter((one) => one.mark.claim === last)
-  const first = ofLast[0] as MarkedComment
   const leader = first.mark.coordinator ?? null
   const claimants: string[] = []
   for (const one of ofLast) {
     if (one.mark.coordinator && !claimants.includes(one.mark.coordinator)) claimants.push(one.mark.coordinator)
   }
-  const after = marked.filter((one) => one.index > first.index && one.mark.coordinator === leader)
-  const releasing = after.find((one) => isReleaseKind(one.mark.kind) && one.mark.claim === last)
+  // The leader's comments of this count since its claim: its progress, and what may end it.
+  const own = marked.filter((one) => one.index > first.index && one.mark.coordinator === leader && one.mark.claim === last)
+  const releasing = own.find((one) => isReleaseKind(one.mark.kind))
   const release = releasing
     ? { kind: releasing.mark.kind as ReleaseKind, at: releasing.at, index: releasing.index }
     : null
-  const leaderLastAt = after.reduce((latest, one) => Math.max(latest, one.at), first.at)
+  const leaderLastAt = own.reduce((latest, one) => Math.max(latest, one.at), first.at)
   return {
     last,
     leader,
@@ -129,6 +137,32 @@ export function readClaims(comments: readonly Comment[]): Claims {
     active: release === null,
     marked,
   }
+}
+
+// The claims (and takeovers) of count `count`, in GitHub's order.
+export function claimsOfCount(marked: readonly MarkedComment[], count: number): MarkedComment[] {
+  return marked.filter((one) => isClaim(one) && one.mark.claim === count)
+}
+
+// The first claim of `coordinator` of count `count`, or undefined.
+export function claimOf(claims: Claims, count: number, coordinator: string): MarkedComment | undefined {
+  return claimsOfCount(claims.marked, count).find((one) => one.mark.coordinator === coordinator)
+}
+
+// What a decision about a task was made on: its last count, whether that count was active, and its progress. A claim
+// made for that decision goes on only when a fresh reading of the task shows the same (Coordinator.claimTask).
+export type Expectation = { readonly last: number; readonly active: boolean; readonly progressAt: number | null }
+
+export function expectationOf(claims: Claims): Expectation {
+  return { last: claims.last, active: claims.active, progressAt: claims.leaderLastAt }
+}
+
+// Why the fresh claims do not match the decision's, or null when they do.
+export function changedSince(expected: Expectation, claims: Claims): string | null {
+  if (claims.last !== expected.last) return `the last count is ${claims.last}, not ${expected.last}`
+  if (claims.active !== expected.active) return `count ${claims.last} is ${claims.active ? 'active' : 'released'} now`
+  if (claims.leaderLastAt !== expected.progressAt) return `count ${claims.last} has new progress`
+  return null
 }
 
 // Why a task cannot be claimed now (with a new count), by its claims and its `working` label — or null when it can.
@@ -169,12 +203,13 @@ export function stageOf(claims: Claims, count: number, leader: string): Stage | 
   return stage
 }
 
-// The plugin's labels of a task whose count is active, at any stage of its work: `working` on, `blocked` and `split`
-// off — a block and a split end the count. The leader brings the labels to this before its step.
-export const ACTIVE_LABELS: { readonly on: readonly PluginLabel[]; readonly off: readonly PluginLabel[] } = {
-  on: [WORKING],
-  off: [BLOCKED, SPLIT],
-}
+// The plugin's labels of a claimed target while its count is active: `on` — set (the first of them right after the
+// claim), `off` — taken off. The leader brings the labels to this before its step.
+export type StageLabels = { readonly on: readonly PluginLabel[]; readonly off: readonly PluginLabel[] }
+
+// A task of the queue at any stage of its work: `working` on, `blocked` and `split` off — a block and a split end a
+// count.
+export const ACTIVE_LABELS: StageLabels = { on: [WORKING], off: [BLOCKED, SPLIT] }
 
 export function hasLabel(labels: readonly string[], label: string): boolean {
   return labels.some((one) => one.toLowerCase() === label.toLowerCase())
@@ -190,4 +225,8 @@ export function isClaimKind(kind: MarkKind): kind is ClaimKind {
 
 export function isReleaseKind(kind: MarkKind): kind is ReleaseKind {
   return (RELEASE_KINDS as readonly string[]).includes(kind)
+}
+
+function isClaim(one: MarkedComment): boolean {
+  return isClaimKind(one.mark.kind) && one.mark.claim !== undefined
 }

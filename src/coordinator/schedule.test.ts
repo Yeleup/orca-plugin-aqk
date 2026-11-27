@@ -7,8 +7,8 @@ import { parseRepository } from '../github/gh'
 import { PLUGIN_LABELS } from '../github/labels'
 import { parseBody } from '../github/mark'
 import { parseProjectSettings } from '../project/settings'
-import { FakeGitHub } from '../testing/fake-github'
-import { fakeClock, type FakeClock } from '../testing/fake-machine'
+import { FAKE_GH, FakeGitHub, readCall } from '../testing/fake-github'
+import { fakeClock, fakeMachine, type FakeClock } from '../testing/fake-machine'
 import { fakeSleep } from '../testing/hold'
 import { startCoordinator, startPlugin } from '../worker'
 import type { QueueProject } from './coordinator'
@@ -159,4 +159,67 @@ test('интервал проверки очереди изменён → сле
   run.queue.stop()
   assert.deepEqual(run.pending(), [])
   await run.worker.deactivate()
+})
+
+test('координатор выключен во время проверки очереди → следующий проект не проверяется и новой заявки нет, агенты не запускаются; заявка, уже записанная в первом, остаётся', async () => {
+  const clock = fakeClock(Date.UTC(2026, 2, 2, 10, 0, 0))
+  const first = new FakeGitHub({ repository: REPO, login: OWNER, clock, pageSize: 50 })
+  const second = new FakeGitHub({ repository: 'acme/second-shop', login: OWNER, clock, pageSize: 50 })
+  for (const github of [first, second]) {
+    for (const label of PLUGIN_LABELS) github.addLabel(label)
+    github.addIssue({ number: 7, user: OWNER, labels: ['agent-queue'] })
+  }
+  // One computer whose gh reaches both repositories.
+  const toSecond = (call: ReturnType<typeof readCall>) =>
+    call.path.startsWith('repos/acme/second-shop/') || call.variables.name === 'second-shop'
+  const machine = fakeMachine({
+    platform: 'linux',
+    env: { PATH: '/usr/bin' },
+    executables: [FAKE_GH],
+    clock,
+    answer: (request) => (toSecond(readCall(request)) ? second : first).answer(request),
+  })
+  const parsed = parseProjectSettings(
+    JSON.stringify({ version: 1, testCommand: 'make test', language: 'ru', dataRule: 'No customer data in GitHub.' }),
+    'main',
+  )
+  assert.ok(parsed.ok)
+  const fake = fakeTimers(clock)
+  let api: OrcaWorkerApi | undefined
+  let queue: QueueCheck | undefined
+  const started: string[] = []
+  const projects: QueueProject[] = [
+    PROJECT,
+    { ...PROJECT, id: 'example-org/second-shop', name: 'second-shop', repository: parseRepository('acme/second-shop') },
+  ]
+  const worker = await mountWorker(
+    {
+      default: async (orca: OrcaWorkerApi) => {
+        api = orca
+        const plugin = await startPlugin(orca, machine, {
+          readSettings: async () => ({ ok: true, settings: parsed.settings }),
+          // The owner switches the coordinator off while the first project's claim waits its 60 seconds.
+          sleep: async (ms) => {
+            await orca.settings.set('coordinatorEnabled', false)
+            clock.advance(ms)
+          },
+          hooks: { started: (task) => void started.push(`${task.project.name} #${task.issue.number}`) },
+        })
+        queue = startCoordinator(orca, plugin, { projects: async () => projects, timers: fake.timers })
+      },
+    },
+    { host: mockHost({ settings: { queueCheckInterval: 5, coordinatorEnabled: true } }) },
+  )
+  assert.ok(api && queue)
+  const q = queue
+  await fake.advance(5 * MINUTE, () => q.idle())
+  // The first project's claim, written already, stays with its label, its agents do not start; the second project is
+  // not read at all.
+  assert.deepEqual(started, [])
+  assert.equal(first.comments.length, 1)
+  assert.deepEqual(first.issues[0]?.labels, ['agent-queue', 'agent-queue:working'])
+  assert.deepEqual(second.comments, [])
+  assert.equal(machine.starts.map(readCall).filter(toSecond).length, 0)
+  q.stop()
+  await worker.deactivate()
 })

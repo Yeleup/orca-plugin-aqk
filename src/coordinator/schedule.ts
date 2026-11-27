@@ -1,7 +1,9 @@
 // The periodic check of the queue (TZ Ф4, the introduction): while Orca is open — the worker runs — and the coordinator
 // of this computer is on (`coordinatorEnabled`), once per interval (`queueCheckInterval`, minutes, 5 by default) the
 // coordinator checks the queue of every connected project (Coordinator.checkQueue). With the coordinator off a check
-// does nothing: the coordinator of this computer takes and leads no task. Whether a project's queue is stopped is the
+// does nothing: the coordinator of this computer takes and leads no task. The switch is read again before each project
+// and each new claim: turned off during a check, no further project is checked and nothing new is claimed (a write
+// already sent may finish). Whether a project's queue is stopped is the
 // coordinator's own question (CoordinatorOptions.queueStopped).
 //
 // - The plugin's settings are read at every check, so a change counts from the next one; a change of the interval
@@ -104,12 +106,13 @@ export function startQueueCheck(options: QueueCheckOptions): QueueCheck {
     })
   }
 
-  // One check; it never throws: whatever fails is in the log, and the next check is planned as ever.
+  // One check; it never throws: whatever fails is in the log, and the next check is planned as ever. The switch is read
+  // before it and again before each project and each new claim: switched off meanwhile, the check ends there.
   const check = async () => {
     try {
-      const settings = await readSettings(options.settings)
-      if (!settings.coordinator || options.coordinator === null) return
-      await options.coordinator.checkQueue(await options.projects())
+      const enabled = async () => (await readSettings(options.settings)).coordinator
+      if (!(await enabled()) || options.coordinator === null) return
+      await options.coordinator.checkQueue(await options.projects(), { enabled })
     } catch (error) {
       log(errorMessage(error))
     }
