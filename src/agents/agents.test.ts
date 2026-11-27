@@ -1034,7 +1034,8 @@ test('В каталоге запусков задачи запуски — то�
     error: notOwn(foreign.terminalId, `${agents12}/8/launch.json is a link or a directory, not the record of launch 8 of issue-12`),
   })
   // Asking again through the link: the send of message 1 recorded as a send through the link would have recorded it,
-  // with no outcome — the reading of the report waits with the reason, no CLI runs, nothing is typed or recorded.
+  // with no outcome — the reading of the report is an error naming the link (no record is read through it), no CLI
+  // runs, nothing is typed or recorded.
   const linkedFiles = messageFiles(orca, throughLink, 1)
   const linkedSend: Sending = {
     line: messageLine('ru', linkedFiles.messageFile, linkedFiles.reportFile),
@@ -1044,8 +1045,8 @@ test('В каталоге запусков задачи запуски — то�
   }
   orca.machine.files.set(`${foreign.dir}/message-1.md`, 'Продолжайте')
   orca.machine.files.set(`${foreign.dir}/sending-1.json`, JSON.stringify(linkedSend))
-  const waiting = await r.agents.report(throughLink)
-  assert.ok(!waiting.ready && waiting.unresolved === `the outcome of message 1 to the agent "codex" in terminal ${foreign.terminalId} is unknown: ${notLaunch7}`, JSON.stringify(waiting))
+  const notRead7 = `${agents12}/7 is a link or a file, not the directory of launch 7 of issue-12: its records are not read`
+  await assert.rejects(r.agents.report(throughLink), (error) => error instanceof Error && error.message === notRead7)
   assert.deepEqual(cliSends(orca), [])
   assert.deepEqual(orca.machine.starts, [])
   assert.deepEqual(orca.terminals.get(foreign.terminalId)?.typed, [])
@@ -3050,7 +3051,118 @@ test('Закрытие, которое помнит воркер, — тольк
   }
 })
 
-test('Ссылка на месте файла сообщения: report-<k>.md — ссылка на отчёт задания, message-<k>.json — ссылка на отрицательный исход другого сообщения — ошибка с причиной, а не прежний отчёт и не откат к прежнему входу', async () => {
+test('Проверка своего терминала, не прошедшая при первой отправке уже после записи файлов сообщения (ошибка чтения launch.json перед terminal send), — не отправлено с причиной проверки, terminal send не запущен, ничего не введено, файлов сообщения нет, отчёт читается по прежнему входу; диск не дал убрать запись отправки — записан исход «не отправлено»', async () => {
+  const orca = fakeOrca()
+  // Once the send record of a message is on disk, the disk fails the n-th read of a launch record and every later one
+  // (`failFrom`), and refuses to remove files (`keep`), while the test says so.
+  let failFrom: number | null = null
+  let keep = false
+  let armed = false
+  let reads = 0
+  // Run once a send record is written, when the test sets it.
+  let onSend: (() => void) | null = null
+  const machine: Machine = {
+    ...orca.machine,
+    createText: async (path, text) => {
+      const created = await orca.machine.createText(path, text)
+      if (failFrom !== null && /\/sending-\d+\.json$/.test(path)) {
+        armed = true
+        reads = 0
+      }
+      if (onSend !== null && /\/sending-\d+\.json$/.test(path)) {
+        onSend()
+        onSend = null
+      }
+      return created
+    },
+    readText: (path) => {
+      if (armed && failFrom !== null && path.endsWith('/launch.json') && ++reads >= failFrom) throw new Error('EIO: i/o error, read')
+      return orca.machine.readText(path)
+    },
+    removeFile: async (path) => {
+      if (keep) throw new Error('EROFS: read-only file system, unlink')
+      return orca.machine.removeFile(path)
+    },
+  }
+  const r = await mount(orca, { machine })
+  const launch = await launched(r, 144, 'implementer')
+  // The task's other launch keeps its agents directory a real one when the launch's own is moved away.
+  await launched(r, 144, 'reviewer')
+  await taskReported(r, launch, 'Отчёт на задание.\n')
+  const filesOfMessages = () =>
+    [...orca.machine.files.keys()].filter((path) => path.startsWith(`${launch.dir}/`) && /\/(message-\d+\.(md|json)|sending-\d+\.json|report-\d+\.md|started-[1-9]\d*)$/.test(path))
+  const unreadable = notOwn(launch.terminalId, 'the record of launch 1 of issue-144 cannot be read: EIO: i/o error, read')
+
+  // Both checks of message() pass; the send record is written; then the check fails — the one before the CLI is asked
+  // (the first read of launch.json after the record), or the one right before `terminal send` (the second): not sent,
+  // with the check's reason, no `terminal send`, nothing typed, and no file of the message left.
+  for (const from of [1, 2]) {
+    failFrom = from
+    armed = false
+    assert.deepEqual(await r.agents.message(launch, 'Замечание.'), { ok: false, outcome: 'not-sent', error: unreadable }, `failing read ${from}`)
+    assert.ok(armed, `failing read ${from}`)
+    failFrom = null
+    armed = false
+    assert.deepEqual(cliSends(orca), [], `failing read ${from}`)
+    assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [], `failing read ${from}`)
+    assert.deepEqual(filesOfMessages(), [], `failing read ${from}`)
+    // The message is no input of the agent: the report is the task's, and Orca is not asked about it.
+    assert.deepEqual(await r.agents.report(launch), { ready: true, text: 'Отчёт на задание.\n', reportFile: launch.reportFile })
+    assert.deepEqual(cliSends(orca), [], `failing read ${from}`)
+  }
+
+  // The disk reads again: the next message is message 1, its line typed once.
+  const sent = await r.agents.message(launch, 'Замечание.')
+  assert.deepEqual(sent, { ok: true, reportFile: messageFiles(orca, launch, 1).reportFile, started: true })
+  const one = sendingOf(orca, launch, 1)
+  assert.deepEqual(cliSends(orca), [sendArgs(orca, launch.terminalId, one)])
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [one.line])
+
+  // The check fails once message 2 is written, and the disk refuses to remove its send record: the refusal is recorded
+  // as its outcome — not taken, nothing typed — and the answer is «not sent» with the check's reason.
+  failFrom = 1
+  keep = true
+  const target = `message 2 to the agent "codex" in terminal ${launch.terminalId}`
+  assert.deepEqual(await r.agents.message(launch, 'Ещё замечание.'), { ok: false, outcome: 'not-sent', error: `${target} was not sent: ${unreadable}` })
+  failFrom = null
+  keep = false
+  assert.ok(orca.machine.files.has(messageFiles(orca, launch, 2).messageFile))
+  assert.deepEqual(outcomeOf(orca, launch, 2), { accepted: false, turnStarted: false, at: orca.clock.now(), error: unreadable })
+  assert.equal(cliSends(orca).length, 1)
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [one.line])
+  // Message 2 not taken, the last input is message 1.
+  assert.equal((await r.agents.report(launch)).reportFile, messageFiles(orca, launch, 1).reportFile)
+
+  // Once the send record of message 3 is written, the launch's directory is moved away and a link to another directory,
+  // which has a file of that name, put in its place: the check refuses, and nothing is removed through the link —
+  // neither that file nor the moved records.
+  const decoy = dataPath(orca.machine, r.dataDir, 'decoy')
+  const movedAway = dataPath(orca.machine, r.dataDir, 'moved-away')
+  orca.machine.files.set(`${decoy}/sending-3.json`, '{}\n')
+  onSend = () => {
+    for (const [path, text] of [...orca.machine.files]) {
+      if (!path.startsWith(`${launch.dir}/`)) continue
+      orca.machine.files.set(`${movedAway}${path.slice(launch.dir.length)}`, text)
+      orca.machine.files.delete(path)
+    }
+    orca.machine.links.set(launch.dir, decoy)
+  }
+  const linkInPlace = `${launch.dir} is a link or a file, not the directory of launch 1 of issue-144`
+  assert.deepEqual(await r.agents.message(launch, 'Третье замечание.'), {
+    ok: false,
+    outcome: 'not-sent',
+    error: `${notOwn(launch.terminalId, linkInPlace)}; nothing of message 3 is removed: ${linkInPlace}: its records are not read`,
+  })
+  assert.equal(orca.machine.files.get(`${decoy}/sending-3.json`), '{}\n')
+  for (const name of ['message-3.md', 'sending-3.json']) assert.ok(orca.machine.files.has(`${movedAway}/${name}`), name)
+  assert.equal(orca.machine.files.has(`${movedAway}/message-3.json`), false)
+  assert.equal(cliSends(orca).length, 1)
+  assert.deepEqual(orca.terminals.get(launch.terminalId)?.typed, [one.line])
+  assert.deepEqual(r.worker.refusals, [])
+  await r.worker.deactivate()
+})
+
+test('Ссылка на месте файла сообщения или каталога запуска: report-<k>.md — ссылка на отчёт задания, message-<k>.json — ссылка на отрицательный исход другого сообщения, каталог запуска или каталог задачи на пути к нему — ссылка на копию с подлинными записями прежнего сообщения — ошибка с причиной, а не прежний отчёт и не откат к прежнему входу', async () => {
   const orca = fakeOrca()
   const r = await mount(orca)
 
@@ -3083,6 +3195,67 @@ test('Ссылка на месте файла сообщения: report-<k>.md 
   await assert.rejects(r.agents.report(dropped), (error) => error instanceof Error && error.message === notARecord)
   assert.deepEqual(await r.agents.message(dropped, 'Замечание 3.'), { ok: false, outcome: 'not-sent', error: notARecord })
   assert.equal(cliSends(orca).length, runs)
+
+  // The report on message 1 is ready; a copy of the task's directory is saved then — the launch's genuine records of
+  // message 1 only; message 2 is taken. The launch's directory is moved away and a link to its saved copy put in its
+  // place, then the same for the task's directory on the way to it: with a new «done», reading the report is an error
+  // naming the link — not the report on message 1 —, and a new message is refused with no CLI run.
+  const copied = await launched(r, 145, 'implementer')
+  // The task's other launch keeps its agents directory a real one with the launch's own moved away.
+  await launched(r, 145, 'reviewer')
+  await taskReported(r, copied, 'Отчёт на задание.\n')
+  const first = await r.agents.message(copied, 'Замечание 1.')
+  assert.ok(first.ok, JSON.stringify(first))
+  orca.clock.advance(60_000)
+  orca.finishTurn({ terminalId: copied.terminalId, reportFile: first.reportFile }, 'Отчёт на замечание 1.\n')
+  assert.deepEqual(await r.agents.report(copied), { ready: true, text: 'Отчёт на замечание 1.\n', reportFile: first.reportFile })
+  const taskDir = parent(parent(copied.dir))
+  const saved = dataPath(orca.machine, r.dataDir, 'saved-copy')
+  const move = (from: string, to: string, keepFrom = false) => {
+    for (const [path, text] of [...orca.machine.files]) {
+      if (!path.startsWith(`${from}/`)) continue
+      orca.machine.files.set(`${to}${path.slice(from.length)}`, text)
+      if (!keepFrom) orca.machine.files.delete(path)
+    }
+  }
+  move(taskDir, saved, true)
+  orca.clock.advance(5_000)
+  const taken = await r.agents.message(copied, 'Замечание 2.')
+  assert.ok(taken.ok, JSON.stringify(taken))
+  const sends = cliSends(orca).length
+  const elsewhere = dataPath(orca.machine, r.dataDir, 'moved-away')
+  const replaced = [
+    {
+      at: copied.dir,
+      to: `${saved}${copied.dir.slice(taskDir.length)}`,
+      reading: `${copied.dir} is a link or a file, not the directory of launch 1 of issue-145: its records are not read`,
+      sending: notOwn(copied.terminalId, `${copied.dir} is a link or a file, not the directory of launch 1 of issue-145`),
+    },
+    {
+      at: taskDir,
+      to: saved,
+      reading: `${taskDir} is a link or a file, not a directory: the plugin reads no launches through it`,
+      sending: notOwn(
+        copied.terminalId,
+        `the records of launch 1 of issue-145 cannot be read: ${taskDir} is a link or a file, not a directory: the plugin reads no launches through it`,
+      ),
+    },
+  ]
+  for (const link of replaced) {
+    move(link.at, elsewhere)
+    orca.machine.links.set(link.at, link.to)
+    assert.equal(orca.machine.readText(dataPath(orca.machine, copied.dir, 'report-1.md')), 'Отчёт на замечание 1.\n')
+    assert.equal(orca.machine.readText(dataPath(orca.machine, copied.dir, 'sending-2.json')), null)
+    orca.clock.advance(60_000)
+    orca.list(copied.terminalId, 'done', orca.clock.now())
+    await assert.rejects(r.agents.report(copied), (error) => error instanceof Error && error.message === link.reading)
+    assert.deepEqual(await r.agents.message(copied, 'Замечание 3.'), { ok: false, outcome: 'not-sent', error: link.sending })
+    assert.equal(cliSends(orca).length, sends)
+    // Put back as it was: the report owed is the one on message 2.
+    orca.machine.links.delete(link.at)
+    move(elsewhere, link.at)
+    assert.equal((await r.agents.report(copied)).reportFile, taken.ok ? taken.reportFile : '')
+  }
   assert.deepEqual(r.worker.refusals, [])
   await r.worker.deactivate()
 })

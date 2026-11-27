@@ -188,6 +188,12 @@ export function fakeMachine(options: FakeMachineOptions): FakeMachine {
       files.set(resolve(path), text)
       return true
     },
+    removeFile: async (path) => {
+      const key = find(path)
+      if (key === undefined) return false
+      files.delete(key)
+      return true
+    },
     start: async (request) => {
       starts.push(request)
       const answer = options.answer?.(request) ?? {}

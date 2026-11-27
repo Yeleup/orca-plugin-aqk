@@ -1,12 +1,13 @@
 // Creating a file only if absent (the coordinator id's file), on the real disk: the finished text gets its name by a
 // hard link only, so an existing file is never replaced; without hard links nothing is created. The entries of a
-// directory, on the real disk. The time of a file's last write, on the real disk and on the fake computer.
+// directory, and removing a file, on the real disk. The time of a file's last write, on the real disk and on the fake
+// computer.
 import { assert, test } from 'orca/testing'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fakeMachine } from '../testing/fake-machine'
-import { createText, listEntries } from './files'
+import { createText, listEntries, removeFile } from './files'
 import { realMachine } from './machine'
 
 async function withTempDir(body: (dir: string) => Promise<void>): Promise<void> {
@@ -64,6 +65,20 @@ test('записи каталога: настоящий каталог, файл
     ])
     // A file, not a directory: an error, not «no directory».
     assert.throws(() => listEntries(join(agents, 'notes.md')))
+  })
+})
+
+test('удаление файла: файл удалён — true, его другие соседи на месте; файла нет — false; каталог на его месте — ошибка, каталог остаётся', async () => {
+  await withTempDir(async (dir) => {
+    const path = join(dir, 'agents', '1', 'sending-1.json')
+    await createText(path, '{}\n')
+    await createText(join(dir, 'agents', '1', 'message-1.md'), 'text\n')
+    assert.equal(await removeFile(path), true)
+    assert.equal(existsSync(path), false)
+    assert.deepEqual(readdirSync(join(dir, 'agents', '1')), ['message-1.md'])
+    assert.equal(await removeFile(path), false)
+    await assert.rejects(removeFile(join(dir, 'agents', '1')))
+    assert.equal(statSync(join(dir, 'agents', '1')).isDirectory(), true)
   })
 })
 
