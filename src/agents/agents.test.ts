@@ -35,8 +35,10 @@ import { implementerTask, launchPrompt, messageLine, reviewerTask } from './task
 
 const PROJECT: ProjectRef = { id: 'Example-Org/Sample-Shop', hostId: 'local' }
 const DATA_RULE = 'Никаких данных покупателей: имён, телефонов, адресов, токенов и ключей.'
-// Agents of the settings other than the defaults: each role gets the agent of its own field.
-const AGENTS: ProjectAgents = { implementer: 'codex', reviewer: 'claude', solver: 'gemini', start: 'opencode' }
+// Agents of the settings other than the defaults: each role gets the agent of its own field. All four are in Orca's
+// catalog of agents from the manifest's minimum version (`engines.orca`) to the installed one: the fake host refuses an
+// agent outside the catalog, as Orca does.
+const AGENTS: ProjectAgents = { implementer: 'codex', reviewer: 'claude', solver: 'copilot', start: 'opencode' }
 
 type Rig = {
   readonly orca: FakeOrca
@@ -261,7 +263,7 @@ test('Запуски решателя и агента старта берут а
     task: { project: PROJECT, key: 'issue-12' },
     number: 2,
     role: 'solver',
-    agent: 'gemini',
+    agent: 'copilot',
     language: 'ru',
     workspaceId: 'workspace-issue-12',
     launchedAt: t0 + 60_000,
@@ -273,7 +275,7 @@ test('Запуски решателя и агента старта берут а
   assert.equal(orca.machine.files.get(solverFiles.reportFile), undefined)
   assert.deepEqual(json(orca, `${second}/launching.json`), {
     role: 'solver',
-    agent: 'gemini',
+    agent: 'copilot',
     language: 'ru',
     workspaceId: 'workspace-issue-12',
     launchedAt: t0 + 60_000,
@@ -308,7 +310,7 @@ test('Запуски решателя и агента старта берут а
     },
     {
       method: 'agent.launch',
-      params: { workspaceId: 'workspace-issue-12', agent: 'gemini', prompt: launchPrompt('ru', solverFiles.taskFile, solverFiles.reportFile) },
+      params: { workspaceId: 'workspace-issue-12', agent: 'copilot', prompt: launchPrompt('ru', solverFiles.taskFile, solverFiles.reportFile) },
     },
     {
       method: 'agent.launch',
@@ -324,7 +326,7 @@ test('Запуски решателя и агента старта берут а
     r.agents.launches(issueTask(PROJECT, 12)).map((record) => [record.number, record.role, record.agent, record.outcome, record.terminalId]),
     [
       [1, 'implementer', 'codex', 'launched', 'terminal-1'],
-      [2, 'solver', 'gemini', 'launched', 'terminal-2'],
+      [2, 'solver', 'copilot', 'launched', 'terminal-2'],
     ],
   )
   assert.deepEqual(r.worker.refusals, [])
@@ -844,7 +846,7 @@ test('Записи запуска читаются каждая сама по с
     [
       [1, 'launched', 'terminal-1', 'codex'],
       [2, 'unreadable', null, 'claude'],
-      [3, 'launched', 'terminal-3', 'gemini'],
+      [3, 'launched', 'terminal-3', 'copilot'],
     ],
   )
   assert.deepEqual(await restarted.agents.stop(task), {
