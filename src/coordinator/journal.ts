@@ -100,14 +100,18 @@ export class ClaimJournal {
   }
 
   // The profile of a claim attempt, written right before its POST: a new file `profile-<k>` with the next number, unless
-  // the last one holds the same profile. Throws when the disk refuses it.
+  // the last one holds the same profile. A number taken meanwhile (the file is there already) is read again: the last
+  // profile is compared once more and the attempt takes the next number, until the last file is this attempt's
+  // profile. Throws when the disk refuses it.
   async writeProfile(repository: Repository, issue: number, count: number, profile: ClaimProfile): Promise<void> {
     const text = JSON.stringify({ recovery: profile.recovery, on: [...profile.on], off: [...profile.off] })
-    const last = this.profileNumbers(repository, issue, count).at(-1)
-    if (last !== undefined && this.machine.readText(this.profileFile(repository, issue, count, last))?.trim() === text) {
-      return
+    for (;;) {
+      const last = this.profileNumbers(repository, issue, count).at(-1)
+      if (last !== undefined && this.machine.readText(this.profileFile(repository, issue, count, last))?.trim() === text) {
+        return
+      }
+      if (await this.machine.createText(this.profileFile(repository, issue, count, (last ?? 0) + 1), `${text}\n`)) return
     }
-    await this.machine.createText(this.profileFile(repository, issue, count, (last ?? 0) + 1), `${text}\n`)
   }
 
   // The profile of the count — of its last claim attempt —, or null when there is none (or it cannot be read).

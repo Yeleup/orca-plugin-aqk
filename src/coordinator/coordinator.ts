@@ -254,8 +254,9 @@ export class Coordinator {
   private readonly journal: ClaimJournal
   private readonly hooks: CoordinatorHooks
   private readonly options: CoordinatorOptions
-  // The checks and writes of each task, one at a time on this coordinator (right.ts).
-  private readonly gates = new Map<string, TaskGate>()
+  // The checks and writes of each task, one at a time (right.ts) — for every coordinator of this worker on the same
+  // computer and data directory: they share the journal, so they share the queue of each task too.
+  private readonly gates: Map<string, TaskGate>
   // The completions of claims under way, by task and count: one at a time.
   private readonly completions = new Map<string, Promise<ClaimOutcome>>()
 
@@ -265,6 +266,7 @@ export class Coordinator {
     this.machine = options.machine
     this.journal = new ClaimJournal(options.machine, options.dataDir)
     this.hooks = options.hooks ?? {}
+    this.gates = gatesOf(options.machine, options.dataDir)
   }
 
   // One check of the queue: every project in turn, while the coordinator is on.
@@ -460,8 +462,9 @@ export class Coordinator {
         // The reading the count was taken from must hold right before the POST: an older one is read again once.
         if (!fresh(target.readAt, this.machine.now())) {
           const at = this.machine.now()
-          const again = readClaims(await github.listComments(number))
-          seen?.({ ...target, claims: again, readAt: at, now: at })
+          const comments = await github.listComments(number)
+          const again = readClaims(comments)
+          seen?.({ ...target, comments, claims: again, readAt: at, now: at })
           const changed = changedSince(expectationOf(claims), again)
           if (changed !== null) {
             return { done: { kind: 'changed', issue: number, reason: `changed during the admission: ${changed}` } }
@@ -495,15 +498,22 @@ export class Coordinator {
   // The completion of a claim of this coordinator — right after it, and later when it was not complete (a failed label,
   // a failed re-read, a restart of the worker). One completion of a count at a time on this coordinator: a second one
   // asked while it runs gets its outcome.
-  private completeClaim(pass: Pass, number: number, count: number, requested: StageLabels): Promise<ClaimOutcome> {
+  // The completion is shared by the repository, task and count, so a call of another connected copy of the repository
+  // can join it: each caller gets the outcome for its own project — `leads` only for the project kept in `led`.
+  private async completeClaim(pass: Pass, number: number, count: number, requested: StageLabels): Promise<ClaimOutcome> {
     const key = `${this.gateKey(pass, number)}:${count}`
-    const running = this.completions.get(key)
-    if (running !== undefined) return running
-    const completion = this.runCompletion(pass, number, count, requested).finally(() => {
-      this.completions.delete(key)
-    })
-    this.completions.set(key, completion)
-    return completion
+    let completion = this.completions.get(key)
+    if (completion === undefined) {
+      completion = this.runCompletion(pass, number, count, requested).finally(() => {
+        this.completions.delete(key)
+      })
+      this.completions.set(key, completion)
+    }
+    const outcome = await completion
+    if (outcome.kind === 'leads' && this.ownerOf(pass, number, count) !== 'mine') {
+      return { kind: 'not-free', issue: number, reason: LED_ELSEWHERE }
+    }
+    return outcome
   }
 
   // The completion: with the labels kept with the claim (its profile; `requested` when none is kept) —
@@ -578,6 +588,8 @@ export class Coordinator {
     }
     let issue = target.issue
     try {
+      // A release decided while it waited (by another worker of this journal) comes first here too.
+      if (this.has(repository, number, count, 'releasing')) return this.releaseClaim(pass, issue, count, right)
       if (label === WORKING && !hasLabel(issue.labels, WORKING)) {
         // Gone while it waited (or since a restart).
         const origin = await this.removedBy(pass, target.claims, number, count)
@@ -1113,6 +1125,26 @@ export class Coordinator {
   private log(line: string): void {
     this.options.log?.(`agent-queue: coordinator: ${line}`)
   }
+}
+
+// The queues of the tasks of each computer (the worker's Machine) and data directory: every coordinator on them takes
+// the queues from here, so two coordinators of one journal (an old one still checking while a new one starts) never
+// interleave their steps of one task — the reading, the choice of a claim's profile, its POST and its record are one
+// step. Two worker processes on one data directory are no mode of the plugin (README «Агенты»).
+const GATES = new WeakMap<object, Map<string, Map<string, TaskGate>>>()
+
+function gatesOf(machine: Machine, dataDir: string): Map<string, TaskGate> {
+  let byDir = GATES.get(machine)
+  if (byDir === undefined) {
+    byDir = new Map()
+    GATES.set(machine, byDir)
+  }
+  let gates = byDir.get(dataDir)
+  if (gates === undefined) {
+    gates = new Map()
+    byDir.set(dataDir, gates)
+  }
+  return gates
 }
 
 // The reason a claim gives when the coordinator was switched off before it was written.

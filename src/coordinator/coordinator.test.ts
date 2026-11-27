@@ -15,8 +15,10 @@ import { FakeGitHub, readCall } from '../testing/fake-github'
 import { fakeClock, type FakeMachine } from '../testing/fake-machine'
 import { fakeSleep, holdCall, isCommentOn, isLabelOn, isRead, isUnlabelOn, isWrite } from '../testing/hold'
 import { DEFERRAL_MS, expectationOf, readClaims, REREAD_AFTER_MS, UNSETTLED_MS } from './claims'
+import { ClaimJournal } from './journal'
 import {
   Coordinator,
+  LED_ELSEWHERE,
   type ChoiceRule,
   type CoordinatorHooks,
   type LedTask,
@@ -1846,7 +1848,11 @@ test('начатое освобождение (п. 4): POST освобожден
     waitOfA.release()
     assert.equal((await check).claimed?.kind, 'incomplete')
     w.github.setLabel(7, WORKING, true)
+    // The release goes first: one reading of the task, no wait and no re-read before it.
+    const reads = () => a.machine.starts.map(readCall).filter(isRead('AqIssue', 7)).length
+    const before = reads()
     const result = await a.coordinator.checkProject(PROJECT)
+    assert.equal(reads(), before + 1)
     assert.deepEqual(result.led, [])
     assert.deepEqual(w.thread(7), ['claim A 1', 'release A 1'])
     assert.deepEqual(a.started, [])
@@ -1956,4 +1962,158 @@ test('правила выбора (п. 7): перед каждым кандид�
   assert.deepEqual(seen, [{ inWork: [1], last: 1 }])
   assert.deepEqual(result.skipped.at(-1), { issue: 2, reason: 'an MVP task in work already' })
   assert.deepEqual(w.thread(2), [])
+})
+
+// ── Round 5 of the review ───────────────────────────────────────────────────────────────────────────────────────────
+
+// Lets the promises and the timers of the fake computers run for a while.
+async function settle(turns = 20): Promise<void> {
+  for (let turn = 0; turn < turns; turn++) await new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+// Holds the first creation of a file whose path matches `name` on `machine` until released (the file is not there
+// meanwhile).
+function holdFile(machine: FakeMachine, name: RegExp) {
+  let arrived: () => void = () => {}
+  let go: () => void = () => {}
+  const reached = new Promise<void>((resolve) => {
+    arrived = resolve
+  })
+  const released = new Promise<void>((resolve) => {
+    go = resolve
+  })
+  const create = machine.createText.bind(machine)
+  let armed = true
+  machine.createText = async (path: string, text: string) => {
+    if (armed && name.test(path)) {
+      armed = false
+      arrived()
+      await released
+    }
+    return create(path, text)
+  }
+  return { reached, release: () => go() }
+}
+
+test('две копии одного репозитория (вызов второй во время ожидания первой): проверка и claimTask второй копии присоединяются к завершению первой → у второй not-free, задача не в её списке ведомых; запуск один', async () => {
+  const copy: QueueProject = { ...PROJECT, id: 'example-org/demo-shop-copy', name: 'demo-shop-copy' }
+  const w = world()
+  w.github.addIssue({ number: 7, user: OWNER, labels: ['agent-queue'] })
+  const a = w.computer(A)
+  const waitOfFirst = a.sleep.hold()
+  const first = a.coordinator.checkProject(PROJECT)
+  await waitOfFirst.reached
+  const secondCheck = a.coordinator.checkProject(copy)
+  const secondCall = a.coordinator.claimTask(copy, 7)
+  await settle()
+  waitOfFirst.release()
+  const [byFirst, bySecond, called] = await Promise.all([first, secondCheck, secondCall])
+  assert.deepEqual(byFirst.claimed, { kind: 'leads', issue: 7, count: 1 })
+  assert.deepEqual(bySecond.led, [])
+  assert.deepEqual(bySecond.inWork, [7])
+  assert.deepEqual(called, { kind: 'not-free', issue: 7, reason: LED_ELSEWHERE })
+  assert.deepEqual(a.started.map((task) => task.project.id), [PROJECT.id])
+  assert.deepEqual(w.thread(7), ['claim A 1'])
+})
+
+test('два воркера одного журнала: освобождение, решённое во время ожидания другого (его POST отклонён, метка вернулась), идёт первым и после ожидания → освобождение, агенты не запускаются', async () => {
+  const w = world()
+  w.github.addIssue({ number: 7, user: OWNER, labels: ['agent-queue'] })
+  const a = w.computer(A)
+  const waitOfA = a.sleep.hold()
+  const checkA = a.coordinator.checkProject(PROJECT)
+  await waitOfA.reached
+  // The owner takes `working` off while A waits; the second worker of the same journal completes the same claim,
+  // decides the owner's removal and records `releasing`, but its release is refused.
+  w.github.setLabel(7, WORKING, false)
+  const second = w.computer(A, { machine: a.machine })
+  w.github.fail(isCommentOn(7), BAD_GATEWAY)
+  assert.equal((await second.coordinator.checkProject(PROJECT)).claimed, null)
+  assert.deepEqual(w.thread(7), ['claim A 1'])
+  // The label comes back; A's wait ends.
+  w.github.setLabel(7, WORKING, true)
+  waitOfA.release()
+  assert.deepEqual((await checkA).claimed, { kind: 'released', issue: 7, count: 1 })
+  assert.deepEqual(w.thread(7), ['claim A 1', 'release A 1'])
+  assert.deepEqual([a.started.length, second.started.length], [0, 0])
+})
+
+test('два воркера одного журнала: одновременные попытки заявки с разными профилями, POST одной отклонён → принятая заявка завершается по профилю своей попытки', async () => {
+  const none = { on: [], off: [] }
+  const w = world()
+  w.github.addIssue({ number: 7, user: OWNER, labels: ['agent-queue'] })
+  const queue = w.computer(A)
+  const caller = w.computer(A, { machine: queue.machine })
+  // The queue's attempt chose its profile and its POST waits on the way; meanwhile the caller's attempt runs as far
+  // as it can, and the next claim POST GitHub gets is refused.
+  const post = holdCall(queue.machine, isCommentOn(7))
+  const byQueue = queue.coordinator.checkProject(PROJECT)
+  await post.reached
+  w.github.fail(isCommentOn(7), BAD_GATEWAY)
+  const byCaller = caller.coordinator.claimTask(PROJECT, 7, { admit: () => null, labels: none, recovery: 'caller' })
+  await settle()
+  post.release()
+  const [checked, called] = await Promise.all([byQueue, byCaller])
+  const claims = w.github.comments.filter((one) => parseBody(one.body).mark?.kind === 'claim')
+  assert.equal(claims.length, 1)
+  const queueLeads = checked.claimed?.kind === 'leads'
+  const callerLeads = called.kind === 'leads'
+  assert.ok(queueLeads !== callerLeads, JSON.stringify([checked.claimed, called]))
+  // The accepted claim goes on by the profile of its own attempt.
+  if (queueLeads) {
+    assert.deepEqual(w.labels(7), ['agent-queue', WORKING])
+    assert.deepEqual(queue.started.map((task) => task.count), [1])
+  } else {
+    assert.deepEqual(w.labels(7), ['agent-queue'])
+    const written = queue.writes().length
+    await queue.coordinator.checkProject(PROJECT)
+    assert.equal(queue.writes().length, written)
+    assert.equal(queue.leading.length, 0)
+  }
+})
+
+test('журнал заявок: номер файла профиля, занятый в это время другой попыткой, — профиль перечитывается и попытка берёт следующий номер со своим профилем', async () => {
+  const w = world()
+  const machine = w.github.computer()
+  const journal = new ClaimJournal(machine, dataDirectory(machine))
+  const queue = { recovery: 'queue' as const, on: [WORKING], off: [BLOCKED] }
+  const caller = { recovery: 'caller' as const, on: [], off: [] }
+  const held = holdFile(machine, /profile-1$/)
+  const first = journal.writeProfile(PROJECT.repository, 7, 1, queue)
+  await held.reached
+  await journal.writeProfile(PROJECT.repository, 7, 1, caller)
+  assert.deepEqual(journal.profile(PROJECT.repository, 7, 1), caller)
+  held.release()
+  await first
+  assert.deepEqual(journal.profile(PROJECT.repository, 7, 1), queue)
+})
+
+test('правила выбора (п. 7, долгий допуск): допуск первого кандидата дольше 30 секунд, его взял другой → правило второго видит перечитанные заявки и комментарии первого вместе', async () => {
+  const w = world({ maxInProgress: 2 })
+  w.github.addIssue({ number: 1, user: OWNER, labels: ['agent-queue'] })
+  w.github.addIssue({ number: 2, user: OWNER, labels: ['agent-queue'] })
+  const seen: { last: number | undefined; marks: string[] }[] = []
+  const rule: ChoiceRule = (task, context) => {
+    if (context.phase !== 'claim') return null
+    if (task.issue.number === 1) {
+      // A long admission; X claims #1 meanwhile.
+      w.clock.advance(31_000)
+      w.mark(1, { kind: 'claim', coordinator: X, claim: 1 })
+      return null
+    }
+    const first = context.tasks.find((one) => one.issue.number === 1)
+    seen.push({
+      last: first?.claims.last,
+      marks: (first?.comments ?? []).map((one) => parseBody(one.body).mark?.kind ?? 'text'),
+    })
+    return context.inWork.includes(1) ? 'an MVP task in work already' : null
+  }
+  const a = w.computer(A, { rules: [rule] })
+  const result = await a.coordinator.checkProject(PROJECT)
+  assert.equal(result.claimed, null)
+  assert.deepEqual(result.skipped, [
+    { issue: 1, reason: 'changed during the admission: the last count is 1, not 0' },
+    { issue: 2, reason: 'an MVP task in work already' },
+  ])
+  assert.deepEqual(seen, [{ last: 1, marks: ['claim'] }])
 })
